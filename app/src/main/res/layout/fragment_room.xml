@@ -1,0 +1,231 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#090A0C">
+
+    <!-- Header bar -->
+    <RelativeLayout
+        android:id="@+id/layout_room_header"
+        android:layout_width="match_parent"
+        android:layout_height="64dp"
+        android:background="#12141A"
+        android:paddingHorizontal="16dp"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <ImageButton
+            android:id="@+id/btn_back"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_centerVertical="true"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:src="@drawable/ic_back"
+            android:contentDescription="Back Button" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_centerInParent="true"
+            android:orientation="vertical"
+            android:gravity="center">
+
+            <TextView
+                android:id="@+id/tv_channel_title"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="CH-19 ALPHA"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="В ЭФИРЕ • ШИФРОВАНИЕ"
+                android:textColor="#10B981"
+                android:textSize="10sp"
+                android:textStyle="bold" />
+
+        </LinearLayout>
+
+        <ImageView
+            android:id="@+id/iv_encrypted_shield"
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:layout_alignParentEnd="true"
+            android:layout_centerVertical="true"
+            android:src="@drawable/ic_shield"
+            android:contentDescription="Shield Encrypted Icon" />
+
+    </RelativeLayout>
+
+    <!-- Subheader with channel members list -->
+    <LinearLayout
+        android:id="@+id/layout_members_bar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="#0C0D10"
+        android:paddingVertical="10dp"
+        android:paddingHorizontal="16dp"
+        android:orientation="vertical"
+        app:layout_constraintTop_toBottomOf="@id/layout_room_header"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="РАДИОУЗЛЫ В СЕТИ"
+            android:textColor="#4B5261"
+            android:textSize="9sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.05"
+            android:layout_marginBottom="6dp" />
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/rv_members"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            tools:listitem="@layout/item_member" />
+
+    </LinearLayout>
+
+    <!-- Message Board area -->
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/rv_messages"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:padding="16dp"
+        android:clipToPadding="false"
+        app:layout_constraintTop_toBottomOf="@id/layout_members_bar"
+        app:layout_constraintBottom_toTopOf="@id/layout_walkie_talkie_control"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        tools:listitem="@layout/item_message_other" />
+
+    <!-- Push To Talk Widget container -->
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:id="@+id/layout_walkie_talkie_control"
+        android:layout_width="match_parent"
+        android:layout_height="220dp"
+        android:background="#12141A"
+        app:layout_constraintBottom_toTopOf="@id/layout_chat_input"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <!-- Outer decorative transmission waves -->
+        <View
+            android:id="@+id/view_wave_3"
+            android:layout_width="180dp"
+            android:layout_height="180dp"
+            android:background="@drawable/bg_wave_ring"
+            android:visibility="gone"
+            app:layout_constraintBottom_toBottomOf="@id/btn_push_to_talk"
+            app:layout_constraintEnd_toEndOf="@id/btn_push_to_talk"
+            app:layout_constraintStart_toStartOf="@id/btn_push_to_talk"
+            app:layout_constraintTop_toTopOf="@id/btn_push_to_talk" />
+
+        <View
+            android:id="@+id/view_wave_2"
+            android:layout_width="150dp"
+            android:layout_height="150dp"
+            android:background="@drawable/bg_wave_ring"
+            android:visibility="gone"
+            app:layout_constraintBottom_toBottomOf="@id/btn_push_to_talk"
+            app:layout_constraintEnd_toEndOf="@id/btn_push_to_talk"
+            app:layout_constraintStart_toStartOf="@id/btn_push_to_talk"
+            app:layout_constraintTop_toTopOf="@id/btn_push_to_talk" />
+
+        <View
+            android:id="@+id/view_wave_1"
+            android:layout_width="120dp"
+            android:layout_height="120dp"
+            android:background="@drawable/bg_wave_ring"
+            android:visibility="gone"
+            app:layout_constraintBottom_toBottomOf="@id/btn_push_to_talk"
+            app:layout_constraintEnd_toEndOf="@id/btn_push_to_talk"
+            app:layout_constraintStart_toStartOf="@id/btn_push_to_talk"
+            app:layout_constraintTop_toTopOf="@id/btn_push_to_talk" />
+
+        <!-- Circular PTT Button -->
+        <FrameLayout
+            android:id="@+id/btn_push_to_talk"
+            android:layout_width="100dp"
+            android:layout_height="100dp"
+            android:background="@drawable/bg_ptt_button"
+            android:elevation="6dp"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent"
+            app:layout_constraintVertical_bias="0.4">
+
+            <ImageView
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:layout_gravity="center"
+                android:src="@drawable/ic_mic"
+                app:tint="#090A0C" />
+
+        </FrameLayout>
+
+        <!-- Status indicator text -->
+        <TextView
+            android:id="@+id/tv_transmission_status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="УДЕРЖИВАЙТЕ ДЛЯ СВЯЗИ"
+            android:textColor="#FFFFFF"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.08"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/btn_push_to_talk" />
+
+    </androidx.constraintlayout.widget.ConstraintLayout>
+
+    <!-- Bottom Chat message typing bar -->
+    <LinearLayout
+        android:id="@+id/layout_chat_input"
+        android:layout_width="match_parent"
+        android:layout_height="64dp"
+        android:background="#090A0C"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingHorizontal="16dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <EditText
+            android:id="@+id/et_message"
+            android:layout_width="0dp"
+            android:layout_height="44dp"
+            android:layout_weight="1"
+            android:background="@drawable/bg_input_styled"
+            android:hint="Текстовое сообщение..."
+            android:textColorHint="#4B5261"
+            android:textColor="#FFFFFF"
+            android:paddingHorizontal="16dp"
+            android:textSize="13sp"
+            android:inputType="textShortMessage" />
+
+        <ImageButton
+            android:id="@+id/btn_send"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:layout_marginStart="10dp"
+            android:background="@drawable/bg_btn_send"
+            android:src="@drawable/ic_send"
+            android:contentDescription="Send Message Button" />
+
+    </LinearLayout>
+
+</androidx.constraintlayout.widget.ConstraintLayout>

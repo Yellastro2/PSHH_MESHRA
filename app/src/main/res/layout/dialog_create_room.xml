@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@drawable/bg_dialog_styled"
+    android:orientation="vertical"
+    android:padding="24dp"
+    android:layout_margin="16dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Создать новый радиоканал"
+        android:textColor="#FFFFFF"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="6dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Другие позывные смогут подключиться к вам"
+        android:textColor="#94A3B8"
+        android:textSize="12sp"
+        android:layout_marginBottom="20dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="НАЗВАНИЕ КАНАЛА (РАДИОЧАСТОТА)"
+        android:textColor="#94A3B8"
+        android:textSize="11sp"
+        android:textStyle="bold"
+        android:letterSpacing="0.05"
+        android:layout_marginBottom="8dp" />
+
+    <EditText
+        android:id="@+id/et_room_name"
+        android:layout_width="match_parent"
+        android:layout_height="50dp"
+        android:background="@drawable/bg_input_styled"
+        android:hint="Например, BRAVO-9"
+        android:textColorHint="#4B5261"
+        android:textColor="#FFFFFF"
+        android:paddingHorizontal="16dp"
+        android:maxLength="20"
+        android:inputType="textCapCharacters"
+        android:textSize="14sp" />
+
+    <TextView
+        android:id="@+id/tv_error"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:textColor="#F43F5E"
+        android:textSize="11sp"
+        android:layout_marginTop="6dp"
+        android:visibility="gone" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:orientation="horizontal"
+        android:gravity="end">
+
+        <Button
+            android:id="@+id/btn_cancel"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:background="?attr/selectableItemBackground"
+            android:text="Отмена"
+            android:textColor="#94A3B8"
+            android:textSize="13sp"
+            android:layout_marginEnd="12dp" />
+
+        <Button
+            android:id="@+id/btn_create"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:background="@drawable/bg_btn_green_padded"
+            android:text="Создать"
+            android:textColor="#090A0C"
+            android:textSize="13sp"
+            android:textStyle="bold"
+            android:paddingHorizontal="24dp" />
+
+    </LinearLayout>
+
+</LinearLayout>

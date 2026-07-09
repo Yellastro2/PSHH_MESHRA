@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:background="@drawable/bg_member_item_styled"
+    android:orientation="horizontal"
+    android:gravity="center_vertical"
+    android:paddingHorizontal="12dp"
+    android:paddingVertical="8dp"
+    android:layout_marginEnd="8dp">
+
+    <View
+        android:id="@+id/view_talking_indicator"
+        android:layout_width="8dp"
+        android:layout_height="8dp"
+        android:background="@drawable/bg_dot_idle"
+        android:layout_marginEnd="8dp" />
+
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/tv_member_name"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Max"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tv_member_status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Вы • Хост"
+            android:textColor="#94A3B8"
+            android:textSize="10sp" />
+
+    </LinearLayout>
+
+    <ImageView
+        android:id="@+id/iv_muted_icon"
+        android:layout_width="12dp"
+        android:layout_height="12dp"
+        android:layout_marginStart="8dp"
+        android:src="@drawable/ic_mute"
+        android:visibility="gone"
+        android:contentDescription="Mute Icon" />
+
+</LinearLayout>
