@@ -8,11 +8,13 @@ import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.core.location.LocationManagerCompat
+import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.nearby.connection.AdvertisingOptions
 import com.google.android.gms.nearby.connection.ConnectionInfo
 import com.google.android.gms.nearby.connection.ConnectionLifecycleCallback
 import com.google.android.gms.nearby.connection.ConnectionResolution
 import com.google.android.gms.nearby.connection.ConnectionsClient
+import com.google.android.gms.nearby.connection.ConnectionsStatusCodes
 import com.google.android.gms.nearby.connection.DiscoveredEndpointInfo
 import com.google.android.gms.nearby.connection.DiscoveryOptions
 import com.google.android.gms.nearby.connection.EndpointDiscoveryCallback
@@ -24,14 +26,17 @@ import com.yellastro.btration.data.wire.WireCodec
 import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.RoomInfo
 import com.yellastro.btration.domain.model.WirePacket
+import com.yellastro.btration.domain.model.WirePacketType
+import com.yellastro.btration.voice.VoiceStreamCodec
 import java.io.FilterInputStream
 import java.io.InputStream
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 
 /**
- * Тонкая обертка над Nearby Connections: discovery, advertising, connection callbacks, byte payload и stream payload.
+ * Тонкая обертка над Nearby Connections с короткой рекламой комнат, прямыми endpoint-ами, cleanup, payload и voice stream.
  */
 class NearbyTransport(
     private val context: Context,
@@ -41,6 +46,7 @@ class NearbyTransport(
     private val serviceId: String = DEFAULT_SERVICE_ID,
 ) {
     private val endpointRegistry = NearbyEndpointRegistry()
+    private val connectedEndpointIds = ConcurrentHashMap.newKeySet<String>()
     private val _events = MutableSharedFlow<NearbyEvent>(extraBufferCapacity = EVENT_BUFFER_CAPACITY)
 
     /**
@@ -59,18 +65,34 @@ class NearbyTransport(
                 }
         }
 
+        /**
+         * Запоминает успешный handshake либо запускает recovery для полуподключенного endpoint.
+         */
         override fun onConnectionResult(endpointId: String, resolution: ConnectionResolution) {
             Log.i(
                 TAG,
                 "[onConnectionResult] Результат соединения endpointId=$endpointId statusCode=${resolution.status.statusCode} success=${resolution.status.isSuccess}",
             )
+            if (!resolution.status.isSuccess && resolution.status.statusCode in RECOVERABLE_CONNECTION_STATUS_CODES) {
+                val cause = ApiException(resolution.status)
+                Log.w(TAG, "[onConnectionResult] Сбрасываем полуподключенный endpoint после statusCode=${resolution.status.statusCode} endpointId=$endpointId", cause)
+                disconnectEndpoint(endpointId, forgetRegistryEntry = true)
+                emitEvent(NearbyEvent.ConnectionRecoveryRequired(endpointId, cause))
+                return
+            }
+            if (resolution.status.isSuccess) {
+                connectedEndpointIds.add(endpointId)
+            }
             emitEvent(NearbyEvent.ConnectionResult(endpointId, resolution))
         }
 
+        /**
+         * Снимает только состояние active connection, сохраняя discovery-связки для повторного входа.
+         */
         override fun onDisconnected(endpointId: String) {
             val peerId = endpointRegistry.getPeerId(endpointId)
             Log.i(TAG, "[onDisconnected] Nearby endpoint отключился endpointId=$endpointId peerId=${peerId?.value}")
-            endpointRegistry.removeEndpoint(endpointId)
+            connectedEndpointIds.remove(endpointId)
             emitEvent(NearbyEvent.Disconnected(endpointId, peerId))
         }
     }
@@ -218,13 +240,14 @@ class NearbyTransport(
     }
 
     /**
-     * Запускает advertising комнаты через короткую endpointName-визитку.
+     * Запускает advertising комнаты через короткую endpointName-визитку после сброса старой рекламы и endpoint-ов.
      */
     fun startAdvertising(room: RoomInfo) {
         Log.i(
             TAG,
             "[startAdvertising] Запускаем advertising roomId=${room.roomId.value} roomName=${room.name} hostPeerId=${room.host.peerId.value} serviceId=$serviceId strategy=$strategy",
         )
+        stopAllEndpointsAndClearState(reason = "prepare_start_advertising")
         val missingPermissions = missingPermissionsForAdvertising()
         if (missingPermissions.isNotEmpty()) {
             Log.w(TAG, "[startAdvertising] Advertising не стартует, нет permissions: ${missingPermissions.joinToString()}")
@@ -270,18 +293,73 @@ class NearbyTransport(
     }
 
     /**
-     * Запрашивает Nearby-соединение с найденным endpointId.
+     * Полностью останавливает локальное Nearby-состояние: discovery, advertising, все endpoint-ы и registry.
+     */
+    fun stopAllEndpointsAndClearState(reason: String) {
+        Log.i(TAG, "[stopAllEndpointsAndClearState] Полностью сбрасываем Nearby reason=$reason")
+        connectionsClient.stopDiscovery()
+        connectionsClient.stopAdvertising()
+        connectionsClient.stopAllEndpoints()
+        connectedEndpointIds.clear()
+        endpointRegistry.clear()
+    }
+
+    /**
+     * Запрашивает Nearby-соединение либо сообщает о пригодном для повторного использования активном endpoint.
      */
     fun connectToEndpoint(endpointId: String) {
+        if (endpointId in connectedEndpointIds) {
+            Log.i(TAG, "[connectToEndpoint] Endpoint уже подключен, переиспользуем endpointId=$endpointId")
+            emitEvent(NearbyEvent.ConnectionReused(endpointId))
+            return
+        }
         Log.i(TAG, "[connectToEndpoint] Запрашиваем соединение endpointId=$endpointId")
         connectionsClient.requestConnection(context.packageName, endpointId, connectionLifecycleCallback)
             .addOnSuccessListener {
                 Log.i(TAG, "[connectToEndpoint] Запрос соединения отправлен endpointId=$endpointId")
             }
             .addOnFailureListener { cause ->
+                if (cause is ApiException && cause.statusCode == ConnectionsStatusCodes.STATUS_ALREADY_CONNECTED_TO_ENDPOINT) {
+                    connectedEndpointIds.add(endpointId)
+                    Log.i(TAG, "[connectToEndpoint] Nearby подтвердил существующее соединение endpointId=$endpointId")
+                    emitEvent(NearbyEvent.ConnectionReused(endpointId))
+                    return@addOnFailureListener
+                }
+                if (cause is ApiException && cause.statusCode in RECOVERABLE_CONNECTION_STATUS_CODES) {
+                    Log.w(TAG, "[connectToEndpoint] Сбрасываем полуподключенный endpoint после statusCode=${cause.statusCode} endpointId=$endpointId", cause)
+                    disconnectEndpoint(endpointId, forgetRegistryEntry = true)
+                    emitEvent(NearbyEvent.ConnectionRecoveryRequired(endpointId, cause))
+                    return@addOnFailureListener
+                }
                 Log.w(TAG, "[connectToEndpoint] Не удалось запросить соединение endpointId=$endpointId: ${cause.message}", cause)
                 emitEvent(NearbyEvent.ConnectionRequestFailed(endpointId, cause))
             }
+    }
+
+    /**
+     * Явно разрывает все активные Nearby-соединения и очищает транспортный признак connected без сброса discovery-связок.
+     */
+    fun disconnectAllPeers() {
+        val endpointIds = connectedEndpointIds.toList()
+        if (endpointIds.isEmpty()) {
+            Log.i(TAG, "[disconnectAllPeers] Активных Nearby-соединений нет")
+            return
+        }
+        endpointIds.forEach { endpointId ->
+            disconnectEndpoint(endpointId, forgetRegistryEntry = false)
+        }
+    }
+
+    /**
+     * Безусловно отключает endpoint и при recovery удаляет его доменные связи, даже если handshake не завершился.
+     */
+    private fun disconnectEndpoint(endpointId: String, forgetRegistryEntry: Boolean) {
+        connectedEndpointIds.remove(endpointId)
+        connectionsClient.disconnectFromEndpoint(endpointId)
+        if (forgetRegistryEntry) {
+            endpointRegistry.removeEndpoint(endpointId)
+        }
+        Log.i(TAG, "[disconnectEndpoint] Endpoint отключен endpointId=$endpointId forgetRegistryEntry=$forgetRegistryEntry")
     }
 
     /**
@@ -333,9 +411,9 @@ class NearbyTransport(
     }
 
     /**
-     * Отправляет голосовой stream выбранным участникам по доменным PeerId одним Nearby STREAM payload.
+     * Отправляет голосовой stream выбранным участникам одним Nearby STREAM payload с исходным PeerId в заголовке.
      */
-    fun sendStreamToPeers(peerIds: Set<PeerId>, inputStream: InputStream) {
+    fun sendStreamToPeers(peerIds: Set<PeerId>, originPeerId: PeerId, inputStream: InputStream) {
         val endpointIds = peerIds
             .mapNotNull { peerId -> endpointRegistry.getEndpointId(peerId) }
             .distinct()
@@ -352,9 +430,9 @@ class NearbyTransport(
         }
 
         val sendStartedAtMillis = System.currentTimeMillis()
-        Log.i(TAG, "[sendStreamToPeers] Вызываем sendPayload для голосового stream endpointCount=${endpointIds.size} peerCount=${peerIds.size} startedAtMs=$sendStartedAtMillis")
+        Log.i(TAG, "[sendStreamToPeers] Вызываем sendPayload для голосового stream originPeerId=${originPeerId.value} endpointCount=${endpointIds.size} peerCount=${peerIds.size} startedAtMs=$sendStartedAtMillis")
         val loggingInputStream = NearbyStreamLoggingInputStream(
-            delegate = inputStream,
+            delegate = VoiceStreamCodec.frame(originPeerId, inputStream),
             endpointCount = endpointIds.size,
             peerCount = peerIds.size,
             sendStartedAtMillis = sendStartedAtMillis,
@@ -368,6 +446,7 @@ class NearbyTransport(
             }
             .addOnFailureListener { cause ->
                 Log.w(TAG, "[sendStreamToPeers] Не удалось отправить голосовой stream: ${cause.message}", cause)
+                runCatching { loggingInputStream.close() }
                 emitEvent(NearbyEvent.StreamSendFailed(peerIds, cause))
             }
     }
@@ -474,39 +553,85 @@ class NearbyTransport(
     }
 
     /**
-     * Декодирует публичное описание комнаты из компактной Nearby endpointName-визитки.
+     * Декодирует публичное описание комнаты из короткой Nearby endpointName-визитки актуального поколения.
      */
     private fun decodeRoomInfo(endpointInfo: DiscoveredEndpointInfo): RoomInfo? {
         return runCatching {
             NearbyRoomAdvertisement.decode(endpointInfo.endpointName)
-                ?.toRoomInfo(createdAtMillis = System.currentTimeMillis())
+                ?.toRoomInfo()
         }.onFailure { cause ->
             Log.w(TAG, "[decodeRoomInfo] Не удалось декодировать endpointName как визитку комнаты: ${cause.message}", cause)
         }.getOrNull()
     }
 
     /**
-     * Обновляет registry по доменным идентификаторам, найденным внутри packet.
+     * Обновляет registry только по данным прямого Nearby-соседа, не по автору relayed-сообщения.
      */
     private fun bindPacketMetadata(endpointId: String, packet: WirePacket) {
         packet.roomId?.let { endpointRegistry.bindRoom(endpointId, it) }
         packet.roomInfo?.let { roomInfo ->
             endpointRegistry.bindRoom(endpointId, roomInfo.roomId)
-            endpointRegistry.bindPeer(endpointId, roomInfo.host.peerId)
         }
-        findPacketPeerId(packet)?.let { peerId ->
-            endpointRegistry.bindPeer(endpointId, peerId)
+        findDirectEndpointPeerId(packet)?.let { peerId ->
+            bindDirectPeerIfStable(endpointId, peerId, packet)
         }
     }
 
     /**
-     * Достаёт наиболее вероятный PeerId отправителя или участника из packet.
+     * Привязывает endpoint к прямому соседу, разрешая заменить только временный advertised-host после JOIN_ACCEPTED.
      */
-    private fun findPacketPeerId(packet: WirePacket): PeerId? {
-        return packet.sender?.peerId
-            ?: packet.peer?.peerId
-            ?: packet.message?.author?.peerId
-            ?: packet.roomInfo?.host?.peerId
+    private fun bindDirectPeerIfStable(endpointId: String, peerId: PeerId, packet: WirePacket) {
+        val existingPeerId = endpointRegistry.getPeerId(endpointId)
+        if (existingPeerId != null && existingPeerId != peerId) {
+            if (canReplaceAdvertisedHostPeer(existingPeerId, packet)) {
+                endpointRegistry.bindPeer(endpointId, peerId)
+                Log.i(
+                    TAG,
+                    "[bindDirectPeerIfStable] Временный host peer заменен реальным endpointId=$endpointId advertisedPeerId=${existingPeerId.value} realPeerId=${peerId.value} packetType=${packet.type}",
+                )
+                return
+            }
+            Log.w(
+                TAG,
+                "[bindDirectPeerIfStable] Не перезаписываем прямой endpoint endpointId=$endpointId existingPeerId=${existingPeerId.value} packetPeerId=${peerId.value} packetType=${packet.type}",
+            )
+            return
+        }
+        val bound = endpointRegistry.bindPeerIfEndpointFree(endpointId, peerId)
+        Log.i(
+            TAG,
+            "[bindDirectPeerIfStable] Endpoint привязан к прямому peer endpointId=$endpointId peerId=${peerId.value} packetType=${packet.type} bound=$bound",
+        )
+    }
+
+    /**
+     * Проверяет, можно ли заменить временный host PeerId из рекламы на реальный PeerId из прямого handshake-пакета.
+     */
+    private fun canReplaceAdvertisedHostPeer(existingPeerId: PeerId, packet: WirePacket): Boolean {
+        return NearbyRoomAdvertisement.isAdvertisedHostPeerId(existingPeerId) &&
+            packet.type in REAL_HOST_ID_PACKET_TYPES
+    }
+
+    /**
+     * Возвращает PeerId только если packet описывает прямого соседа, а не автора ретранслированного сообщения.
+     */
+    private fun findDirectEndpointPeerId(packet: WirePacket): PeerId? {
+        return when (packet.type) {
+            WirePacketType.JOIN_REQUEST -> packet.peer?.peerId ?: packet.sender?.peerId
+            WirePacketType.JOIN_ACCEPTED,
+            WirePacketType.JOIN_REJECTED,
+            WirePacketType.MEMBER_LIST,
+            WirePacketType.ROOM_CLOSED,
+            WirePacketType.PING,
+            WirePacketType.PONG,
+            WirePacketType.ROOM_INFO,
+            -> packet.sender?.peerId ?: packet.roomInfo?.host?.peerId
+
+            WirePacketType.MEMBER_JOINED,
+            WirePacketType.MEMBER_LEFT,
+            WirePacketType.CHAT_MESSAGE,
+            -> null
+        }
     }
 
     /**
@@ -595,5 +720,19 @@ class NearbyTransport(
         private const val DEFAULT_SERVICE_ID = "com.yellastro.btration.nearby.ROOM_V1"
         private const val EVENT_BUFFER_CAPACITY = 64
         private const val STREAM_READ_LIMIT_BYTES = 320
+        private val REAL_HOST_ID_PACKET_TYPES = setOf(
+            WirePacketType.JOIN_ACCEPTED,
+            WirePacketType.JOIN_REJECTED,
+            WirePacketType.MEMBER_LIST,
+            WirePacketType.ROOM_CLOSED,
+            WirePacketType.PING,
+            WirePacketType.PONG,
+            WirePacketType.ROOM_INFO,
+        )
+        private val RECOVERABLE_CONNECTION_STATUS_CODES = setOf(
+            ConnectionsStatusCodes.STATUS_RADIO_ERROR,
+            ConnectionsStatusCodes.STATUS_OUT_OF_ORDER_API_CALL,
+            ConnectionsStatusCodes.STATUS_ENDPOINT_IO_ERROR,
+        )
     }
 }

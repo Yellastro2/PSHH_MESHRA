@@ -43,6 +43,7 @@
                 android:textStyle="bold" />
 
             <TextView
+                android:id="@+id/tv_channel_status"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="В ЭФИРЕ • ШИФРОВАНИЕ"
@@ -130,7 +131,7 @@
         android:background="#090A0C"
         android:gravity="center_vertical|end"
         android:paddingHorizontal="16dp"
-        android:text="УДЕРЖИВАЙТЕ ДЛЯ СВЯЗИ"
+        android:text=""
         android:textColor="#FFFFFF"
         android:textSize="10sp"
         android:textStyle="bold"
@@ -235,5 +236,57 @@
         </androidx.constraintlayout.widget.ConstraintLayout>
 
     </LinearLayout>
+
+    <FrameLayout
+        android:id="@+id/layout_connecting_overlay"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="#F2090A0C"
+        android:clickable="true"
+        android:elevation="20dp"
+        android:focusable="true"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/layout_room_header"
+        tools:visibility="visible">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:padding="24dp">
+
+            <ProgressBar
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:indeterminate="true"
+                android:indeterminateTint="@color/accent_green" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:gravity="center"
+                android:text="ПОДКЛЮЧАЕМСЯ К КОМНАТЕ"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:gravity="center"
+                android:text="Устанавливаем защищённый канал Nearby"
+                android:textColor="#94A3B8"
+                android:textSize="11sp" />
+
+        </LinearLayout>
+
+    </FrameLayout>
 
 </androidx.constraintlayout.widget.ConstraintLayout>

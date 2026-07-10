@@ -4,7 +4,7 @@ import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.RoomId
 
 /**
- * Хранит связи между Nearby endpointId и доменными идентификаторами приложения.
+ * Хранит связи между Nearby endpointId и доменными идентификаторами приложения, где endpointId описывает прямого Nearby-соседа.
  */
 class NearbyEndpointRegistry {
     private val endpointToPeer = mutableMapOf<String, PeerId>()
@@ -13,13 +13,27 @@ class NearbyEndpointRegistry {
     private val roomToEndpoints = mutableMapOf<RoomId, MutableSet<String>>()
 
     /**
-     * Связывает Nearby endpointId с участником приложения.
+     * Связывает Nearby endpointId с участником приложения, заменяя старую прямую связь при новом discovery/handshake.
      */
     fun bindPeer(endpointId: String, peerId: PeerId) {
         endpointToPeer[endpointId]?.let(peerToEndpoint::remove)
         peerToEndpoint[peerId]?.let(endpointToPeer::remove)
         endpointToPeer[endpointId] = peerId
         peerToEndpoint[peerId] = endpointId
+    }
+
+    /**
+     * Связывает Nearby endpointId с участником только если endpoint еще не закреплен за другим прямым соседом.
+     */
+    fun bindPeerIfEndpointFree(endpointId: String, peerId: PeerId): Boolean {
+        val existingPeerId = endpointToPeer[endpointId]
+        if (existingPeerId != null) {
+            return existingPeerId == peerId
+        }
+        peerToEndpoint[peerId]?.let(endpointToPeer::remove)
+        endpointToPeer[endpointId] = peerId
+        peerToEndpoint[peerId] = endpointId
+        return true
     }
 
     /**

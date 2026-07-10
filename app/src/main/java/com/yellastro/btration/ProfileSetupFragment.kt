@@ -19,7 +19,7 @@ import com.yellastro.btration.ui.profile.ProfileViewModel
 import kotlinx.coroutines.launch
 
 /**
- * Экран первичной настройки имени пользователя через ProfileViewModel.
+ * Экран первичной настройки имени пользователя, который после завершения заменяется лобби без back stack.
  */
 class ProfileSetupFragment : Fragment() {
     private val viewModel: ProfileViewModel by viewModels {
@@ -95,7 +95,7 @@ class ProfileSetupFragment : Fragment() {
         tvError.visibility = if (state.errorMessage == null) View.GONE else View.VISIBLE
         if (state.isCompleted && !openedLobby) {
             openedLobby = true
-            (activity as? MainActivity)?.navigateTo(LobbyFragment())
+            (activity as? MainActivity)?.replaceRoot(LobbyFragment())
         }
     }
 }

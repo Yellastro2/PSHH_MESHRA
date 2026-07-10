@@ -11,7 +11,7 @@ import com.yellastro.btration.domain.model.WirePacket
 import java.io.InputStream
 
 /**
- * Событие низкого Nearby-слоя без бизнес-решений комнаты, включая bytes-пакеты и voice streams.
+ * Событие низкого Nearby-слоя без бизнес-решений комнаты, включая payload, connection recovery и voice streams.
  */
 sealed class NearbyEvent {
     /**
@@ -45,6 +45,21 @@ sealed class NearbyEvent {
     data class ConnectionResult(
         val endpointId: String,
         val resolution: ConnectionResolution,
+    ) : NearbyEvent()
+
+    /**
+     * Транспорт подтвердил, что ранее установленное соединение можно повторно использовать без requestConnection.
+     */
+    data class ConnectionReused(
+        val endpointId: String,
+    ) : NearbyEvent()
+
+    /**
+     * Транспорт принудительно сбросил полуподключенный endpoint и просит заново обнаружить комнату.
+     */
+    data class ConnectionRecoveryRequired(
+        val endpointId: String,
+        val cause: Throwable,
     ) : NearbyEvent()
 
     /**

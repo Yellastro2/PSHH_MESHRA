@@ -3,6 +3,7 @@ package com.yellastro.btration.domain.runtime
 import android.util.Log
 import com.yellastro.btration.data.nearby.NearbyEvent
 import com.yellastro.btration.data.nearby.NearbyRequirementException
+import com.yellastro.btration.data.nearby.NearbyRoomAdvertisement
 import com.yellastro.btration.data.nearby.NearbyTransport
 import com.yellastro.btration.domain.model.ChatMessage
 import com.yellastro.btration.domain.model.Peer
@@ -16,21 +17,26 @@ import com.yellastro.btration.domain.util.IdGenerator
 import com.yellastro.btration.repository.ProfileRepository
 import com.yellastro.btration.voice.VoiceRuntime
 import java.io.InputStream
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
- * Рабочая машина комнаты: слушает NearbyTransport, ведет состояние комнаты, участников, чат и PTT-голос.
+ * Рабочая машина комнаты: ведет discovery с временными advertised-id, Nearby-сессии, чат, PTT-голос и host relay.
  */
 class RoomRuntime(
     private val profileRepository: ProfileRepository,
     private val nearbyTransport: NearbyTransport,
     private val voiceRuntime: VoiceRuntime,
     private val idGenerator: IdGenerator,
-    externalScope: CoroutineScope,
+    private val externalScope: CoroutineScope,
 ) {
     private val _state = MutableStateFlow<RoomRuntimeState>(RoomRuntimeState.Idle)
     private val _availableRooms = MutableStateFlow<List<RoomInfo>>(emptyList())
@@ -40,6 +46,12 @@ class RoomRuntime(
     private val roomEndpoints = mutableMapOf<RoomId, String>()
     private val endpointRooms = mutableMapOf<String, RoomId>()
     private val seenPacketIds = mutableSetOf<WirePacketId>()
+    private var roomIdsSeenInDiscoveryCycle: MutableSet<RoomId>? = null
+    private val discoveryCycleMutex = Mutex()
+    private var connectionRecoveryJob: Job? = null
+    private var recoveringRoomId: RoomId? = null
+    private var recoveryReconnectRequested = false
+    private var connectionRecoveryAttemptCount = 0
 
     /**
      * Текущее состояние runtime: idle/searching/hosting/joining/client/error.
@@ -76,27 +88,41 @@ class RoomRuntime(
     }
 
     /**
-     * Запускает поиск Nearby-комнат, если пользователь сейчас не состоит в комнате.
+     * Запускает новый поиск Nearby-комнат без очистки ранее показанного списка до завершения первого цикла.
      */
     suspend fun startSearch() {
-        Log.i(TAG, "[startSearch] Команда поиска комнат currentState=${_state.value.javaClass.simpleName}")
-        when (_state.value) {
-            is RoomRuntimeState.Hosting,
-            is RoomRuntimeState.Joining,
-            is RoomRuntimeState.Client,
-            -> {
-                Log.w(TAG, "[startSearch] Поиск отклонен, уже есть активная комната currentState=${_state.value.javaClass.simpleName}")
-                setError("Нельзя искать комнаты, пока активна текущая комната")
-            }
+        discoveryCycleMutex.withLock {
+            Log.i(TAG, "[startSearch] Команда поиска комнат currentState=${_state.value.javaClass.simpleName}")
+            when (_state.value) {
+                is RoomRuntimeState.Hosting,
+                is RoomRuntimeState.Joining,
+                is RoomRuntimeState.Client,
+                -> {
+                    Log.i(TAG, "[startSearch] Поиск пропущен, уже есть активная комната currentState=${_state.value.javaClass.simpleName}")
+                }
 
-            RoomRuntimeState.Idle,
-            is RoomRuntimeState.Error,
-            RoomRuntimeState.Searching,
-            -> {
-                nearbyTransport.startDiscovery()
-                _state.value = RoomRuntimeState.Searching
-                Log.i(TAG, "[startSearch] Runtime переведен в Searching")
+                RoomRuntimeState.Idle,
+                is RoomRuntimeState.Error,
+                -> {
+                    startDiscoveryCycle(reconcilePreviousCycle = false)
+                }
+
+                RoomRuntimeState.Searching -> startDiscoveryCycle(reconcilePreviousCycle = true)
             }
+        }
+    }
+
+    /**
+     * Завершает текущий десятисекундный снимок комнат и запускает следующий, только пока runtime ищет комнаты.
+     */
+    suspend fun refreshSearch() {
+        discoveryCycleMutex.withLock {
+            if (_state.value !is RoomRuntimeState.Searching) {
+                Log.i(TAG, "[refreshSearch] Обновление discovery пропущено currentState=${_state.value.javaClass.simpleName}")
+                return@withLock
+            }
+            Log.i(TAG, "[refreshSearch] Завершаем текущий discovery-цикл и запускаем следующий")
+            startDiscoveryCycle(reconcilePreviousCycle = true)
         }
     }
 
@@ -104,11 +130,14 @@ class RoomRuntime(
      * Останавливает поиск Nearby-комнат и возвращает runtime в Idle, если он только искал комнаты.
      */
     suspend fun stopSearch() {
-        Log.i(TAG, "[stopSearch] Останавливаем поиск currentState=${_state.value.javaClass.simpleName}")
-        nearbyTransport.stopDiscovery()
-        if (_state.value is RoomRuntimeState.Searching) {
-            _state.value = RoomRuntimeState.Idle
-            Log.i(TAG, "[stopSearch] Runtime переведен в Idle")
+        discoveryCycleMutex.withLock {
+            Log.i(TAG, "[stopSearch] Останавливаем поиск currentState=${_state.value.javaClass.simpleName}")
+            nearbyTransport.stopDiscovery()
+            roomIdsSeenInDiscoveryCycle = null
+            if (_state.value is RoomRuntimeState.Searching) {
+                _state.value = RoomRuntimeState.Idle
+                Log.i(TAG, "[stopSearch] Runtime переведен в Idle")
+            }
         }
     }
 
@@ -153,9 +182,18 @@ class RoomRuntime(
     }
 
     /**
-     * Начинает подключение к найденной комнате по ее RoomId.
+     * Атомарно останавливает discovery refresh и начинает подключение к найденной комнате по ее RoomId.
      */
     suspend fun joinRoom(roomId: RoomId) {
+        discoveryCycleMutex.withLock {
+            joinRoomLocked(roomId)
+        }
+    }
+
+    /**
+     * Выполняет вход под discovery mutex, чтобы endpoint не сменился между выбором комнаты и requestConnection.
+     */
+    private fun joinRoomLocked(roomId: RoomId) {
         Log.i(TAG, "[joinRoom] Команда войти в комнату roomId=${roomId.value} currentState=${_state.value.javaClass.simpleName}")
         when (_state.value) {
             is RoomRuntimeState.Hosting,
@@ -181,6 +219,9 @@ class RoomRuntime(
             return
         }
 
+        clearConnectionRecovery()
+        nearbyTransport.stopDiscovery()
+        roomIdsSeenInDiscoveryCycle = null
         _messages.value = emptyList()
         _state.value = RoomRuntimeState.Joining(room)
         Log.i(TAG, "[joinRoom] Runtime переведен в Joining roomId=${room.roomId.value} endpointId=$endpointId")
@@ -236,7 +277,6 @@ class RoomRuntime(
         )
         sendToMembers(currentState.members, roomClosed, excludedPeerIds = setOf(profileRepository.getOrCreatePeerId()))
         Log.i(TAG, "[closeRoom] ROOM_CLOSED разослан roomId=${currentState.room.roomId.value} memberCount=${currentState.members.size}")
-        nearbyTransport.stopAdvertising()
         resetSession()
     }
 
@@ -292,7 +332,7 @@ class RoomRuntime(
     }
 
     /**
-     * Начинает передачу микрофона в текущую комнату через voice runtime и возвращает true при реальном старте.
+     * Начинает передачу микрофона локального PeerId в текущую комнату и возвращает true при реальном старте.
      */
     suspend fun startTalking(): Boolean {
         Log.i(TAG, "[startTalking] Команда начать передачу голоса currentState=${_state.value.javaClass.simpleName}")
@@ -303,7 +343,7 @@ class RoomRuntime(
                     .map { peer -> peer.peerId }
                     .filterNot { peerId -> peerId == selfPeerId }
                     .toSet()
-                if (voiceRuntime.startTalking(targetPeerIds)) {
+                if (voiceRuntime.startTalking(selfPeerId, targetPeerIds)) {
                     addTalkingPeer(selfPeerId)
                     return true
                 }
@@ -311,7 +351,7 @@ class RoomRuntime(
             }
 
             is RoomRuntimeState.Client -> {
-                if (voiceRuntime.startTalking(setOf(currentState.room.host.peerId))) {
+                if (voiceRuntime.startTalking(selfPeerId, setOf(currentState.room.host.peerId))) {
                     addTalkingPeer(selfPeerId)
                     return true
                 }
@@ -348,6 +388,8 @@ class RoomRuntime(
             is NearbyEvent.EndpointFound -> handleEndpointFound(event)
             is NearbyEvent.EndpointLost -> handleEndpointLost(event)
             is NearbyEvent.ConnectionResult -> handleConnectionResult(event)
+            is NearbyEvent.ConnectionReused -> handleConnectionReady(event.endpointId, reused = true)
+            is NearbyEvent.ConnectionRecoveryRequired -> handleConnectionRecoveryRequired(event)
             is NearbyEvent.Disconnected -> handleDisconnected(event)
             is NearbyEvent.PacketReceived -> handlePacketReceived(event)
             is NearbyEvent.StreamReceived -> handleStreamReceived(event)
@@ -372,7 +414,7 @@ class RoomRuntime(
     }
 
     /**
-     * Принимает входящий voice stream, если отправитель относится к текущей комнате.
+     * Передает входящий voice stream в VoiceRuntime, который проверит исходного автора и выполнит host relay.
      */
     private fun handleStreamReceived(event: NearbyEvent.StreamReceived) {
         val peerId = event.peerId
@@ -382,35 +424,58 @@ class RoomRuntime(
             return
         }
 
-        when (val currentState = _state.value) {
+        if (_state.value !is RoomRuntimeState.Hosting && _state.value !is RoomRuntimeState.Client) {
+            Log.w(TAG, "[handleStreamReceived] Голосовой stream получен вне активной комнаты currentState=${_state.value.javaClass.simpleName}")
+            closeInputStream(event.inputStream)
+            return
+        }
+
+        voiceRuntime.playIncoming(
+            directPeerId = peerId,
+            inputStream = event.inputStream,
+            resolveRelayTargets = ::resolveVoiceRelayTargets,
+            onStarted = ::addTalkingPeer,
+            onFinished = ::removeTalkingPeer,
+        )
+    }
+
+    /**
+     * Проверяет заявленного автора voice stream и возвращает адресатов host relay либо null при недопустимом маршруте.
+     */
+    private fun resolveVoiceRelayTargets(directPeerId: PeerId, originPeerId: PeerId): Set<PeerId>? {
+        return when (val currentState = _state.value) {
             is RoomRuntimeState.Hosting -> {
-                if (currentState.members.none { peer -> peer.peerId == peerId }) {
-                    Log.w(TAG, "[handleStreamReceived] Host игнорирует голосовой stream от неизвестного peerId=${peerId.value}")
-                    closeInputStream(event.inputStream)
-                    return
+                val originIsDirectMember = originPeerId == directPeerId &&
+                    currentState.members.any { peer -> peer.peerId == originPeerId }
+                if (!originIsDirectMember) {
+                    Log.w(TAG, "[resolveVoiceRelayTargets] Host отклонил автора directPeerId=${directPeerId.value} originPeerId=${originPeerId.value}")
+                    null
+                } else {
+                    val selfPeerId = profileRepository.getOrCreatePeerId()
+                    currentState.members
+                        .asSequence()
+                        .map { peer -> peer.peerId }
+                        .filterNot { peerId -> peerId == selfPeerId || peerId == originPeerId }
+                        .toSet()
                 }
-                addTalkingPeer(peerId)
-                voiceRuntime.playIncoming(peerId, event.inputStream, ::removeTalkingPeer)
             }
 
             is RoomRuntimeState.Client -> {
-                if (currentState.members.none { peer -> peer.peerId == peerId }) {
-                    Log.w(TAG, "[handleStreamReceived] Client игнорирует голосовой stream от неизвестного peerId=${peerId.value}")
-                    closeInputStream(event.inputStream)
-                    return
+                val streamCameFromHost = directPeerId == currentState.room.host.peerId
+                val originIsMember = currentState.members.any { peer -> peer.peerId == originPeerId }
+                if (!streamCameFromHost || !originIsMember) {
+                    Log.w(TAG, "[resolveVoiceRelayTargets] Client отклонил маршрут directPeerId=${directPeerId.value} originPeerId=${originPeerId.value}")
+                    null
+                } else {
+                    emptySet()
                 }
-                addTalkingPeer(peerId)
-                voiceRuntime.playIncoming(peerId, event.inputStream, ::removeTalkingPeer)
             }
 
             RoomRuntimeState.Idle,
             RoomRuntimeState.Searching,
             is RoomRuntimeState.Joining,
             is RoomRuntimeState.Error,
-            -> {
-                Log.w(TAG, "[handleStreamReceived] Голосовой stream получен вне активной комнаты currentState=${_state.value.javaClass.simpleName}")
-                closeInputStream(event.inputStream)
-            }
+            -> null
         }
     }
 
@@ -423,10 +488,28 @@ class RoomRuntime(
             Log.w(TAG, "[handleEndpointFound] Endpoint найден, но визитка комнаты отсутствует endpointId=${event.endpointId}")
             return
         }
+        roomIdsSeenInDiscoveryCycle?.add(roomInfo.roomId)
         roomEndpoints[roomInfo.roomId] = event.endpointId
         endpointRooms[event.endpointId] = roomInfo.roomId
         upsertAvailableRoom(roomInfo)
         Log.i(TAG, "[handleEndpointFound] Комната добавлена roomId=${roomInfo.roomId.value} roomName=${roomInfo.name} endpointId=${event.endpointId} availableCount=${_availableRooms.value.size}")
+        reconnectAfterRecoveryIfNeeded(roomInfo.roomId, event.endpointId)
+    }
+
+    /**
+     * После свежего обнаружения восстанавливаемой комнаты останавливает recovery discovery и повторяет connection один раз.
+     */
+    private fun reconnectAfterRecoveryIfNeeded(roomId: RoomId, endpointId: String) {
+        val currentState = _state.value as? RoomRuntimeState.Joining ?: return
+        if (recoveringRoomId != roomId || currentState.room.roomId != roomId || recoveryReconnectRequested) {
+            return
+        }
+        recoveryReconnectRequested = true
+        connectionRecoveryJob?.cancel()
+        connectionRecoveryJob = null
+        nearbyTransport.stopDiscovery()
+        Log.i(TAG, "[reconnectAfterRecoveryIfNeeded] Комната найдена заново, повторяем connection roomId=${roomId.value} endpointId=$endpointId")
+        nearbyTransport.connectToEndpoint(endpointId)
     }
 
     /**
@@ -441,33 +524,116 @@ class RoomRuntime(
     }
 
     /**
-     * После успешного Nearby connection отправляет JOIN_REQUEST в найденную комнату.
+     * Сверяет комнаты прошлого цикла, перезапускает Nearby discovery и открывает новый набор увиденных RoomId.
+     */
+    private fun startDiscoveryCycle(reconcilePreviousCycle: Boolean) {
+        nearbyTransport.stopDiscovery()
+        if (reconcilePreviousCycle) {
+            reconcileAvailableRoomsWithDiscoveryCycle()
+        }
+        roomIdsSeenInDiscoveryCycle = ConcurrentHashMap.newKeySet()
+        nearbyTransport.startDiscovery()
+        _state.value = RoomRuntimeState.Searching
+        Log.i(
+            TAG,
+            "[startDiscoveryCycle] Новый discovery-цикл запущен reconcilePreviousCycle=$reconcilePreviousCycle availableCount=${_availableRooms.value.size}",
+        )
+    }
+
+    /**
+     * Удаляет комнаты, которые не были повторно найдены в завершившемся discovery-цикле.
+     */
+    private fun reconcileAvailableRoomsWithDiscoveryCycle() {
+        val seenRoomIds = roomIdsSeenInDiscoveryCycle ?: return
+        val missingRoomIds = _availableRooms.value
+            .asSequence()
+            .map { roomInfo -> roomInfo.roomId }
+            .filterNot(seenRoomIds::contains)
+            .toSet()
+        if (missingRoomIds.isEmpty()) {
+            Log.i(TAG, "[reconcileAvailableRoomsWithDiscoveryCycle] Расхождений не найдено seenCount=${seenRoomIds.size}")
+            return
+        }
+
+        missingRoomIds.forEach { roomId ->
+            roomEndpoints.remove(roomId)?.let { endpointId -> endpointRooms.remove(endpointId) }
+        }
+        _availableRooms.value = _availableRooms.value.filterNot { roomInfo -> roomInfo.roomId in missingRoomIds }
+        Log.i(
+            TAG,
+            "[reconcileAvailableRoomsWithDiscoveryCycle] Пропавшие комнаты удалены missingCount=${missingRoomIds.size} availableCount=${_availableRooms.value.size}",
+        )
+    }
+
+    /**
+     * Проверяет результат нового Nearby connection и передает готовый endpoint в общий обработчик входа.
      */
     private fun handleConnectionResult(event: NearbyEvent.ConnectionResult) {
         if (!event.resolution.status.isSuccess) {
             Log.w(TAG, "[handleConnectionResult] Соединение не установлено endpointId=${event.endpointId} statusCode=${event.resolution.status.statusCode}")
-            setError("Подключение не установлено: ${event.resolution.status.statusCode}")
+            if (_state.value is RoomRuntimeState.Joining) {
+                setError("Подключение не установлено: ${event.resolution.status.statusCode}")
+            }
             return
         }
 
+        handleConnectionReady(event.endpointId, reused = false)
+    }
+
+    /**
+     * Отправляет JOIN_REQUEST через новый или переиспользованный endpoint текущей Joining-комнаты без реального RoomId.
+     */
+    private fun handleConnectionReady(endpointId: String, reused: Boolean) {
         val currentState = _state.value as? RoomRuntimeState.Joining ?: return
-        val endpointId = roomEndpoints[currentState.room.roomId]
-        if (endpointId != event.endpointId) {
-            Log.w(TAG, "[handleConnectionResult] Успешное соединение не совпало с joining endpointId=${event.endpointId} expectedEndpointId=$endpointId")
+        val expectedEndpointId = roomEndpoints[currentState.room.roomId]
+        if (expectedEndpointId != endpointId) {
+            Log.w(TAG, "[handleConnectionReady] Готовое соединение не совпало с joining endpointId=$endpointId expectedEndpointId=$expectedEndpointId")
             return
         }
 
         val self = profileRepository.getSelfPeer()
-        Log.i(TAG, "[handleConnectionResult] Соединение установлено, отправляем JOIN_REQUEST roomId=${currentState.room.roomId.value} endpointId=${event.endpointId}")
+        Log.i(TAG, "[handleConnectionReady] Соединение готово, отправляем JOIN_REQUEST roomId=${currentState.room.roomId.value} endpointId=$endpointId reused=$reused")
         nearbyTransport.sendToPeer(
             currentState.room.host.peerId,
             packet(
                 type = WirePacketType.JOIN_REQUEST,
-                roomId = currentState.room.roomId,
                 sender = self,
                 peer = self,
             ),
         )
+    }
+
+    /**
+     * Выполняет один clean-discovery retry после 8007/8009/8012 либо завершает Joining ошибкой после повторного сбоя.
+     */
+    private fun handleConnectionRecoveryRequired(event: NearbyEvent.ConnectionRecoveryRequired) {
+        val currentState = _state.value as? RoomRuntimeState.Joining ?: return
+        if (connectionRecoveryAttemptCount >= MAX_CONNECTION_RECOVERY_ATTEMPTS) {
+            Log.w(TAG, "[handleConnectionRecoveryRequired] Recovery уже использован endpointId=${event.endpointId}: ${event.cause.message}")
+            setError("Не удалось восстановить подключение к комнате: ${event.cause.message.orEmpty()}")
+            return
+        }
+
+        connectionRecoveryAttemptCount += 1
+        recoveringRoomId = currentState.room.roomId
+        recoveryReconnectRequested = false
+        roomEndpoints.remove(currentState.room.roomId)
+        endpointRooms.remove(event.endpointId)
+        connectionRecoveryJob?.cancel()
+        connectionRecoveryJob = externalScope.launch {
+            Log.i(TAG, "[handleConnectionRecoveryRequired] Ждем cooldown перед clean discovery roomId=${currentState.room.roomId.value} attempt=$connectionRecoveryAttemptCount")
+            delay(CONNECTION_RECOVERY_COOLDOWN_MILLIS)
+            val joiningState = _state.value as? RoomRuntimeState.Joining
+            if (joiningState?.room?.roomId != currentState.room.roomId || recoveringRoomId != currentState.room.roomId) {
+                return@launch
+            }
+            nearbyTransport.startDiscovery()
+            Log.i(TAG, "[handleConnectionRecoveryRequired] Clean discovery запущен roomId=${currentState.room.roomId.value}")
+            delay(CONNECTION_RECOVERY_DISCOVERY_TIMEOUT_MILLIS)
+            if (_state.value is RoomRuntimeState.Joining && recoveringRoomId == currentState.room.roomId && !recoveryReconnectRequested) {
+                setError("Комната не найдена повторно после сброса соединения")
+            }
+        }
     }
 
     /**
@@ -532,12 +698,13 @@ class RoomRuntime(
     }
 
     /**
-     * На стороне host принимает JOIN_REQUEST и рассылает обновление участников.
+     * На стороне host принимает JOIN_REQUEST по прямому endpoint-у и рассылает реальный RoomInfo участнику.
      */
     private fun handleJoinRequest(event: NearbyEvent.PacketReceived) {
         val currentState = _state.value as? RoomRuntimeState.Hosting ?: return
         val joiningPeer = event.packet.peer ?: event.packet.sender
-        if (joiningPeer == null || event.packet.roomId != currentState.room.roomId) {
+        val packetRoomId = event.packet.roomId
+        if (joiningPeer == null || (packetRoomId != null && packetRoomId != currentState.room.roomId)) {
             Log.w(TAG, "[handleJoinRequest] Некорректный JOIN_REQUEST roomId=${event.packet.roomId?.value} expectedRoomId=${currentState.room.roomId.value}")
             sendJoinRejected(event.packet.sender, currentState.room.roomId, "Некорректный запрос входа")
             return
@@ -578,17 +745,37 @@ class RoomRuntime(
     }
 
     /**
-     * Переводит client из Joining в Client после JOIN_ACCEPTED.
+     * Переводит client из Joining в Client после JOIN_ACCEPTED и заменяет advertised RoomId реальным.
      */
     private fun handleJoinAccepted(packet: WirePacket) {
         val currentState = _state.value as? RoomRuntimeState.Joining ?: return
         val room = packet.roomInfo ?: currentState.room
-        if (room.roomId != currentState.room.roomId) {
+        val joiningWasAdvertised = NearbyRoomAdvertisement.isAdvertisedRoomId(currentState.room.roomId)
+        if (!joiningWasAdvertised && room.roomId != currentState.room.roomId) {
             Log.w(TAG, "[handleJoinAccepted] JOIN_ACCEPTED не для текущей комнаты packetRoomId=${room.roomId.value} currentRoomId=${currentState.room.roomId.value}")
             return
         }
+        replaceAdvertisedRoomMappingIfNeeded(advertisedRoom = currentState.room, realRoom = room)
         _state.value = RoomRuntimeState.Client(room = room, members = listOf(room.host, profileRepository.getSelfPeer()))
+        clearConnectionRecovery()
         Log.i(TAG, "[handleJoinAccepted] Runtime переведен в Client roomId=${room.roomId.value}")
+    }
+
+    /**
+     * Переносит endpoint mapping с временного RoomId из рекламы на настоящий RoomId, полученный от host-а.
+     */
+    private fun replaceAdvertisedRoomMappingIfNeeded(advertisedRoom: RoomInfo, realRoom: RoomInfo) {
+        if (!NearbyRoomAdvertisement.isAdvertisedRoomId(advertisedRoom.roomId) || advertisedRoom.roomId == realRoom.roomId) {
+            return
+        }
+        val endpointId = roomEndpoints.remove(advertisedRoom.roomId) ?: return
+        endpointRooms[endpointId] = realRoom.roomId
+        roomEndpoints[realRoom.roomId] = endpointId
+        _availableRooms.value = _availableRooms.value.filterNot { roomInfo -> roomInfo.roomId == advertisedRoom.roomId }
+        Log.i(
+            TAG,
+            "[replaceAdvertisedRoomMappingIfNeeded] Временная комната заменена реальной advertisedRoomId=${advertisedRoom.roomId.value} realRoomId=${realRoom.roomId.value} endpointId=$endpointId",
+        )
     }
 
     /**
@@ -870,15 +1057,16 @@ class RoomRuntime(
     }
 
     /**
-     * Сбрасывает текущую комнатную сессию без очистки списка найденных комнат.
+     * Сначала переводит runtime в Idle, затем закрывает voice и полностью сбрасывает локальное Nearby-состояние.
      */
     private fun resetSession() {
         Log.i(TAG, "[resetSession] Сбрасываем текущую сессию currentState=${_state.value.javaClass.simpleName}")
+        clearConnectionRecovery()
+        _state.value = RoomRuntimeState.Idle
         voiceRuntime.stopAll()
-        nearbyTransport.stopAdvertising()
         _messages.value = emptyList()
         _talkingPeerIds.value = emptySet()
-        _state.value = RoomRuntimeState.Idle
+        nearbyTransport.stopAllEndpointsAndClearState(reason = "runtime_reset_session")
         Log.i(TAG, "[resetSession] Runtime переведен в Idle")
     }
 
@@ -890,16 +1078,29 @@ class RoomRuntime(
     }
 
     /**
-     * Переводит runtime в Error с человекочитаемым сообщением и optional UI-действием.
+     * Переводит runtime в Error до отключения voice и Nearby, чтобы поздние callbacks не оживили старую сессию.
      */
     private fun setError(message: String, action: RoomRuntimeErrorAction? = null) {
         Log.w(TAG, "[setError] Runtime перешел в Error message=$message action=$action")
-        voiceRuntime.stopAll()
-        _talkingPeerIds.value = emptySet()
+        clearConnectionRecovery()
         _state.value = RoomRuntimeState.Error(
             message = message.ifBlank { "Неизвестная ошибка" },
             action = action,
         )
+        voiceRuntime.stopAll()
+        _talkingPeerIds.value = emptySet()
+        nearbyTransport.stopAllEndpointsAndClearState(reason = "runtime_error")
+    }
+
+    /**
+     * Отменяет отложенный recovery и сбрасывает счетчик автоматического connection retry.
+     */
+    private fun clearConnectionRecovery() {
+        connectionRecoveryJob?.cancel()
+        connectionRecoveryJob = null
+        recoveringRoomId = null
+        recoveryReconnectRequested = false
+        connectionRecoveryAttemptCount = 0
     }
 
     /**
@@ -922,5 +1123,8 @@ class RoomRuntime(
     private companion object {
         private const val TAG = "RoomRuntime"
         private const val DEFAULT_PACKET_TTL = 1
+        private const val MAX_CONNECTION_RECOVERY_ATTEMPTS = 1
+        private const val CONNECTION_RECOVERY_COOLDOWN_MILLIS = 750L
+        private const val CONNECTION_RECOVERY_DISCOVERY_TIMEOUT_MILLIS = 15_000L
     }
 }

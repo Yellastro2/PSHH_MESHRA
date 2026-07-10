@@ -23,7 +23,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.serialization.json.Json
 
 /**
- * Ручной composition root приложения: собирает транспорт, voice runtime, room runtime, repository и ViewModel factories.
+ * Ручной composition root приложения: собирает транспорт, чистит старое Nearby-состояние, voice runtime, repository и ViewModel factories.
  */
 class AppContainer(context: Context) {
     private val applicationContext = context.applicationContext
@@ -44,7 +44,12 @@ class AppContainer(context: Context) {
         nearbyTransport = nearbyTransport,
         voiceCapture = PcmVoiceCapture(applicationScope),
         voicePlayer = PcmVoicePlayer(applicationScope),
+        externalScope = applicationScope,
     )
+
+    init {
+        nearbyTransport.stopAllEndpointsAndClearState(reason = "app_container_init")
+    }
 
     /**
      * Репозиторий локального профиля пользователя.

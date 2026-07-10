@@ -5,7 +5,7 @@ import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.runtime.RoomRuntimeErrorAction
 
 /**
- * UI-состояние экрана комнаты.
+ * UI-состояние экрана комнаты, включая отдельный режим ожидания завершения Nearby join.
  */
 data class RoomUiState(
     val roomName: String = "",
@@ -15,6 +15,7 @@ data class RoomUiState(
     val inputText: String = "",
     val canSend: Boolean = false,
     val canTalk: Boolean = false,
+    val isConnecting: Boolean = false,
     val isTalking: Boolean = false,
     val isClosed: Boolean = false,
     val errorMessage: String? = null,

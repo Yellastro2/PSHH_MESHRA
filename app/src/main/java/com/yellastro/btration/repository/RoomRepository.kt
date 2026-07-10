@@ -8,7 +8,7 @@ import com.yellastro.btration.domain.runtime.RoomRuntimeState
 import com.yellastro.btration.service.RoomServiceController
 
 /**
- * Фасад комнаты для ViewModel: прокидывает команды комнаты, чата и голоса в runtime и управляет service-обвязкой.
+ * Фасад комнаты для ViewModel: прокидывает discovery-циклы, команды комнаты, чат и голос в runtime.
  */
 class RoomRepository(
     private val roomRuntime: RoomRuntime,
@@ -50,6 +50,14 @@ class RoomRepository(
         roomRuntime.startSearch()
         roomServiceController.startIfNeeded(roomRuntime.state.value.needsService())
         Log.i(TAG, "[startSearch] Поиск обработан state=${roomRuntime.state.value.javaClass.simpleName}")
+    }
+
+    /**
+     * Завершает текущий снимок Nearby-комнат и запускает следующий без повторного старта foreground service.
+     */
+    suspend fun refreshSearch() {
+        Log.i(TAG, "[refreshSearch] Обновляем список комнат через новый discovery-цикл")
+        roomRuntime.refreshSearch()
     }
 
     /**

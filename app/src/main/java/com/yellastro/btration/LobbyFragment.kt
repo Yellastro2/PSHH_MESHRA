@@ -1,16 +1,23 @@
 package com.yellastro.btration
 
 import android.content.Intent
+import android.content.Context
 import android.os.Bundle
 import android.provider.Settings
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.animation.LinearInterpolator
 import android.widget.Button
+import android.widget.EditText
+import android.widget.ImageButton
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
+import androidx.core.widget.doAfterTextChanged
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
@@ -23,7 +30,7 @@ import com.yellastro.btration.ui.lobby.RoomItemUi
 import kotlinx.coroutines.launch
 
 /**
- * Экран лобби со списком Nearby-комнат и созданием локальной комнаты.
+ * Экран лобби с inline-редактором имени и циклическим Nearby-поиском в resumed-состоянии.
  */
 class LobbyFragment : Fragment() {
     private val viewModel: LobbyViewModel by viewModels {
@@ -31,13 +38,18 @@ class LobbyFragment : Fragment() {
     }
 
     private lateinit var tvWelcome: TextView
+    private lateinit var etPeerName: EditText
+    private lateinit var btnEditName: ImageButton
     private lateinit var tvLobbyError: TextView
     private lateinit var btnCreateRoom: Button
+    private lateinit var viewScanProgress: View
     private lateinit var rvRooms: RecyclerView
     private lateinit var roomsAdapter: RoomsAdapter
 
     private var openedRoom = false
     private var handledErrorAction: RoomRuntimeErrorAction? = null
+    private var wasEditingName = false
+    private var renderedScanCycleId = Long.MIN_VALUE
 
     /**
      * Создает XML-разметку лобби.
@@ -57,8 +69,11 @@ class LobbyFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
 
         tvWelcome = view.findViewById(R.id.tv_welcome)
+        etPeerName = view.findViewById(R.id.et_peer_name)
+        btnEditName = view.findViewById(R.id.btn_edit_name)
         tvLobbyError = view.findViewById(R.id.tv_lobby_error)
         btnCreateRoom = view.findViewById(R.id.btn_create_room)
+        viewScanProgress = view.findViewById(R.id.view_scan_progress)
         rvRooms = view.findViewById(R.id.rv_rooms)
 
         roomsAdapter = RoomsAdapter { room ->
@@ -66,6 +81,25 @@ class LobbyFragment : Fragment() {
         }
         rvRooms.layoutManager = LinearLayoutManager(requireContext())
         rvRooms.adapter = roomsAdapter
+
+        etPeerName.doAfterTextChanged { value ->
+            viewModel.onNameChanged(value?.toString().orEmpty())
+        }
+        etPeerName.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == EditorInfo.IME_ACTION_DONE && viewModel.uiState.value.canSaveName) {
+                viewModel.onSaveNameClicked()
+                true
+            } else {
+                false
+            }
+        }
+        btnEditName.setOnClickListener {
+            if (viewModel.uiState.value.isEditingName) {
+                viewModel.onSaveNameClicked()
+            } else {
+                viewModel.onEditNameClicked()
+            }
+        }
 
         childFragmentManager.setFragmentResultListener(
             CreateRoomDialogFragment.REQUEST_KEY,
@@ -87,19 +121,20 @@ class LobbyFragment : Fragment() {
     }
 
     /**
-     * Запускает поиск комнат, когда лобби становится видимым.
+     * Перезапускает поиск комнат при каждом возвращении лобби в resumed-состояние.
      */
-    override fun onStart() {
-        super.onStart()
-        viewModel.onStartSearchClicked()
+    override fun onResume() {
+        super.onResume()
+        viewModel.onLobbyResumed()
     }
 
     /**
-     * Останавливает discovery при уходе с лобби.
+     * Останавливает периодические discovery-циклы, когда лобби теряет resumed-состояние.
      */
-    override fun onStop() {
-        super.onStop()
-        viewModel.onStopSearchClicked()
+    override fun onPause() {
+        stopScanProgress()
+        viewModel.onLobbyPaused()
+        super.onPause()
     }
 
     /**
@@ -119,6 +154,8 @@ class LobbyFragment : Fragment() {
     private fun renderState(state: LobbyUiState) {
         val selfName = state.selfName.ifBlank { "Гость" }
         tvWelcome.text = "Привет, $selfName!"
+        renderNameEditor(state)
+        renderScanProgress(state)
         tvLobbyError.text = state.errorMessage.orEmpty()
         tvLobbyError.visibility = if (state.errorMessage.isNullOrBlank()) View.GONE else View.VISIBLE
         showErrorActionIfNeeded(state.errorAction)
@@ -129,6 +166,82 @@ class LobbyFragment : Fragment() {
             openedRoom = true
             (activity as? MainActivity)?.navigateTo(RoomFragment.newInstance())
         }
+    }
+
+    /**
+     * Переключает приветствие и поле имени, обновляет иконку и управляет клавиатурой только при смене режима.
+     */
+    private fun renderNameEditor(state: LobbyUiState) {
+        tvWelcome.visibility = if (state.isEditingName) View.GONE else View.VISIBLE
+        etPeerName.visibility = if (state.isEditingName) View.VISIBLE else View.GONE
+        btnEditName.setImageResource(if (state.isEditingName) R.drawable.ic_check else R.drawable.ic_edit)
+        btnEditName.contentDescription = if (state.isEditingName) "Сохранить имя" else "Редактировать имя"
+        btnEditName.isEnabled = !state.isEditingName || state.canSaveName
+        btnEditName.alpha = if (btnEditName.isEnabled) 1f else 0.45f
+
+        if (etPeerName.text.toString() != state.nameInput) {
+            etPeerName.setText(state.nameInput)
+            etPeerName.setSelection(etPeerName.text.length)
+        }
+        if (state.isEditingName != wasEditingName) {
+            wasEditingName = state.isEditingName
+            if (state.isEditingName) {
+                etPeerName.requestFocus()
+                etPeerName.post { showNameKeyboard() }
+            } else {
+                etPeerName.clearFocus()
+                hideNameKeyboard()
+            }
+        }
+    }
+
+    /**
+     * Показывает системную клавиатуру для поля имени.
+     */
+    private fun showNameKeyboard() {
+        val inputMethodManager = requireContext().getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        inputMethodManager.showSoftInput(etPeerName, InputMethodManager.SHOW_IMPLICIT)
+    }
+
+    /**
+     * Скрывает системную клавиатуру после сохранения имени.
+     */
+    private fun hideNameKeyboard() {
+        val inputMethodManager = requireContext().getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        inputMethodManager.hideSoftInputFromWindow(etPeerName.windowToken, 0)
+    }
+
+    /**
+     * Сбрасывает линию при новом discovery-цикле и линейно заполняет ее за фактическую длительность цикла.
+     */
+    private fun renderScanProgress(state: LobbyUiState) {
+        if (!state.isSearching) {
+            stopScanProgress()
+            return
+        }
+        if (renderedScanCycleId == state.scanCycleId) {
+            return
+        }
+        renderedScanCycleId = state.scanCycleId
+        viewScanProgress.animate().cancel()
+        viewScanProgress.scaleX = 0f
+        viewScanProgress.animate()
+            .scaleX(1f)
+            .setDuration(state.scanCycleDurationMillis)
+            .setInterpolator(LinearInterpolator())
+            .start()
+    }
+
+    /**
+     * Останавливает анимацию сканирования и возвращает линию к левому краю.
+     */
+    private fun stopScanProgress() {
+        if (!::viewScanProgress.isInitialized) {
+            return
+        }
+        viewScanProgress.animate().cancel()
+        viewScanProgress.scaleX = 0f
+        renderedScanCycleId = Long.MIN_VALUE
     }
 
     /**

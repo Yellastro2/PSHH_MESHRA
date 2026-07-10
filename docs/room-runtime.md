@@ -53,10 +53,11 @@ Host:
 Client:
 
 - запускает discovery;
-- хранит внутреннюю связь `RoomId -> endpointId`;
+- получает из `NearbyRoomAdvertisement` временный advertised `RoomId`, потому что `endpointName` не несет полный `roomId`;
+- хранит внутреннюю связь `RoomId -> endpointId`, где до входа `RoomId` может быть временным advertised-id;
 - по `joinRoom(roomId)` подключается к endpoint;
-- после успешного connection отправляет `JOIN_REQUEST`;
-- после `JOIN_ACCEPTED` переходит в `Client`;
+- после успешного connection отправляет `JOIN_REQUEST` без реального `roomId`;
+- после `JOIN_ACCEPTED` получает настоящий `RoomInfo`, заменяет временный `RoomId -> endpointId` на реальный `RoomId -> endpointId` и переходит в `Client`;
 - по `MEMBER_LIST` обновляет участников;
 - свои сообщения добавляет локально и отправляет host-у;
 - сообщения от host-а добавляет в чат;

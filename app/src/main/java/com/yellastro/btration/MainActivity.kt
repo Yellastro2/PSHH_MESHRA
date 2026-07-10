@@ -12,7 +12,7 @@ import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 
 /**
- * Главный контейнер UI-слоя: запрашивает Nearby/voice/notification permissions и выбирает стартовый экран.
+ * Главный контейнер UI-слоя: запрашивает permissions, выбирает стартовый экран и управляет ручной fragment-навигацией.
  */
 class MainActivity : AppCompatActivity() {
     private lateinit var nearbyPermissionLauncher: ActivityResultLauncher<Array<String>>
@@ -161,6 +161,23 @@ class MainActivity : AppCompatActivity() {
             )
             .replace(R.id.fragment_container, fragment)
             .addToBackStack(null)
+            .commit()
+    }
+
+    /**
+     * Заменяет текущий стартовый экран без сохранения предыдущего фрагмента в back stack.
+     */
+    fun replaceRoot(fragment: Fragment) {
+        supportFragmentManager.popBackStack(
+            null,
+            androidx.fragment.app.FragmentManager.POP_BACK_STACK_INCLUSIVE,
+        )
+        supportFragmentManager.beginTransaction()
+            .setCustomAnimations(
+                android.R.anim.fade_in,
+                android.R.anim.fade_out,
+            )
+            .replace(R.id.fragment_container, fragment)
             .commit()
     }
 

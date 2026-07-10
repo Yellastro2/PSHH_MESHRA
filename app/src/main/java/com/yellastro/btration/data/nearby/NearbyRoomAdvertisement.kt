@@ -6,23 +6,26 @@ import com.yellastro.btration.domain.model.RoomId
 import com.yellastro.btration.domain.model.RoomInfo
 
 /**
- * Компактная визитка комнаты для Nearby endpointName, где полный WirePacket не помещается.
+ * Компактная визитка комнаты для Nearby endpointName: только данные для лобби и подключения к endpoint-у.
  */
 data class NearbyRoomAdvertisement(
-    val roomId: RoomId,
     val roomName: String,
-    val hostPeerId: PeerId,
+    val hostShortId: String,
     val hostName: String,
+    val sessionId: String,
+    val createdAtMillis: Long,
 ) {
     /**
-     * Кодирует визитку в короткую строку endpointName с запасом под лимит Nearby.
+     * Кодирует визитку в короткую строку endpointName, отдавая основной бюджет имени комнаты и имени хоста.
      */
     fun encode(): String {
         val cleanRoomName = sanitizeName(roomName)
         val cleanHostName = sanitizeName(hostName)
+        val createdAtToken = createdAtMillis.toString(CREATED_AT_RADIX)
         val fixedBytes = utf8Size(FORMAT_PREFIX) +
-            utf8Size(roomId.value) +
-            utf8Size(hostPeerId.value) +
+            utf8Size(sessionId) +
+            utf8Size(createdAtToken) +
+            utf8Size(hostShortId) +
             SEPARATOR_BYTES * SEPARATOR_COUNT
         val availableNameBytes = (MAX_ENDPOINT_NAME_BYTES - fixedBytes).coerceAtLeast(0)
         val roomNameBudget = (availableNameBytes * ROOM_NAME_WEIGHT_NUMERATOR) / ROOM_NAME_WEIGHT_DENOMINATOR
@@ -36,8 +39,9 @@ data class NearbyRoomAdvertisement(
 
         return listOf(
             FORMAT_PREFIX,
-            roomId.value,
-            hostPeerId.value,
+            sessionId,
+            createdAtToken,
+            hostShortId,
             encodedRoomName,
             encodedHostName,
         ).joinToString(SEPARATOR)
@@ -46,12 +50,12 @@ data class NearbyRoomAdvertisement(
     /**
      * Превращает визитку обратно в RoomInfo для показа комнаты в лобби.
      */
-    fun toRoomInfo(createdAtMillis: Long): RoomInfo {
+    fun toRoomInfo(): RoomInfo {
         return RoomInfo(
-            roomId = roomId,
+            roomId = RoomId("$ADVERTISED_ROOM_ID_PREFIX$sessionId"),
             name = roomName.ifBlank { DEFAULT_ROOM_NAME },
             host = Peer(
-                peerId = hostPeerId,
+                peerId = PeerId("$ADVERTISED_HOST_PEER_ID_PREFIX$hostShortId"),
                 name = hostName.ifBlank { DEFAULT_HOST_NAME },
             ),
             createdAtMillis = createdAtMillis,
@@ -59,45 +63,82 @@ data class NearbyRoomAdvertisement(
     }
 
     companion object {
-        private const val FORMAT_PREFIX = "BTR1"
+        private const val FORMAT_PREFIX = "BTR3"
         private const val SEPARATOR = "|"
-        private const val FIELD_COUNT = 5
+        private const val FIELD_COUNT = 6
         private const val SEPARATOR_COUNT = FIELD_COUNT - 1
         private const val SEPARATOR_BYTES = 1
         private const val MAX_ENDPOINT_NAME_BYTES = 120
+        private const val CREATED_AT_RADIX = 36
         private const val ROOM_NAME_WEIGHT_NUMERATOR = 2
         private const val ROOM_NAME_WEIGHT_DENOMINATOR = 3
         private const val DEFAULT_ROOM_NAME = "Комната"
         private const val DEFAULT_HOST_NAME = "Хост"
+        private const val ADVERTISED_ROOM_ID_PREFIX = "ad_room_"
+        private const val ADVERTISED_HOST_PEER_ID_PREFIX = "ad_host_"
 
         /**
          * Создает визитку из доменного описания комнаты.
          */
         fun fromRoom(room: RoomInfo): NearbyRoomAdvertisement {
             return NearbyRoomAdvertisement(
-                roomId = room.roomId,
                 roomName = room.name,
-                hostPeerId = room.host.peerId,
+                hostShortId = shortHostIdFor(room.host.peerId),
                 hostName = room.host.name,
+                sessionId = sessionIdFor(room),
+                createdAtMillis = room.createdAtMillis,
             )
         }
 
         /**
-         * Декодирует endpointName, если это визитка комнаты BtRation актуального формата.
+         * Декодирует endpointName, если это короткая визитка комнаты BtRation актуального поколения рекламы.
          */
         fun decode(endpointName: String): NearbyRoomAdvertisement? {
             val parts = endpointName.split(SEPARATOR, limit = FIELD_COUNT)
             if (parts.size != FIELD_COUNT || parts[0] != FORMAT_PREFIX) {
                 return null
             }
-            val roomId = parts[1].takeIf { value -> value.isNotBlank() } ?: return null
-            val hostPeerId = parts[2].takeIf { value -> value.isNotBlank() } ?: return null
+            val sessionId = parts[1].takeIf { value -> value.isNotBlank() } ?: return null
+            val createdAtMillis = parts[2].toLongOrNull(CREATED_AT_RADIX) ?: return null
+            val hostShortId = parts[3].takeIf { value -> value.isNotBlank() } ?: return null
             return NearbyRoomAdvertisement(
-                roomId = RoomId(roomId),
-                hostPeerId = PeerId(hostPeerId),
-                roomName = parts[3],
-                hostName = parts[4],
+                hostShortId = hostShortId,
+                roomName = parts[4],
+                hostName = parts[5],
+                sessionId = sessionId,
+                createdAtMillis = createdAtMillis,
             )
+        }
+
+        /**
+         * Возвращает true, если RoomId был создан из короткой Nearby-визитки и еще не подтвержден host-ом.
+         */
+        fun isAdvertisedRoomId(roomId: RoomId): Boolean {
+            return roomId.value.startsWith(ADVERTISED_ROOM_ID_PREFIX)
+        }
+
+        /**
+         * Возвращает true, если PeerId host-а был создан из короткой Nearby-визитки и еще не подтвержден host-ом.
+         */
+        fun isAdvertisedHostPeerId(peerId: PeerId): Boolean {
+            return peerId.value.startsWith(ADVERTISED_HOST_PEER_ID_PREFIX)
+        }
+
+        /**
+         * Создает короткий идентификатор поколения рекламы из RoomId и времени создания комнаты.
+         */
+        private fun sessionIdFor(room: RoomInfo): String {
+            val time = room.createdAtMillis.toString(CREATED_AT_RADIX)
+            val roomHash = Integer.toUnsignedString(room.roomId.value.hashCode(), CREATED_AT_RADIX)
+            return "$time$roomHash".takeLast(MAX_SESSION_ID_CHARS)
+        }
+
+        /**
+         * Создает короткий стабильный след host-а для показа и временной адресации endpoint-а до JOIN_ACCEPTED.
+         */
+        private fun shortHostIdFor(peerId: PeerId): String {
+            return Integer.toUnsignedString(peerId.value.hashCode(), CREATED_AT_RADIX)
+                .takeLast(MAX_HOST_SHORT_ID_CHARS)
         }
 
         /**
@@ -141,5 +182,8 @@ data class NearbyRoomAdvertisement(
             }
             return builder.toString()
         }
+
+        private const val MAX_SESSION_ID_CHARS = 18
+        private const val MAX_HOST_SHORT_ID_CHARS = 6
     }
 }

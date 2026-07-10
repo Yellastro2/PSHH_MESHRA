@@ -18,7 +18,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /**
- * ViewModel комнаты: показывает участников, чат и прокидывает команды сообщения, выхода и PTT-голоса.
+ * ViewModel комнаты: показывает connecting, участников и чат, затем открывает команды сообщения и PTT.
  */
 class RoomViewModel(
     private val roomRepository: RoomRepository,
@@ -165,6 +165,7 @@ class RoomViewModel(
                 inputText = input,
                 canSend = false,
                 canTalk = false,
+                isConnecting = true,
                 isTalking = false,
                 isClosed = false,
             )

@@ -10,10 +10,14 @@
 ## Практический контракт проекта
 
 - Advertising публикует комнату через `endpointName`.
-- В `endpointName` кладётся компактная визитка `NearbyRoomAdvertisement`, чтобы discovery мог показать комнату без подключения.
+- В `endpointName` кладётся компактная визитка `NearbyRoomAdvertisement` формата `BTR3`, чтобы discovery мог показать комнату без подключения.
+- Визитка `BTR3` содержит только `sessionId`, `createdAtMillis`, короткий след host-а, `roomName` и `hostName`. Полные `roomId` и `hostPeerId` не кладутся в `endpointName`, потому что лимит Nearby маленький и название комнаты важнее.
+- До `JOIN_ACCEPTED` listener использует временные `RoomId`/`PeerId` из визитки. После подключения host присылает настоящий `RoomInfo`, и runtime заменяет временные идентификаторы реальными.
 - Nearby endpointId не считается доменным идентификатором участника. Для этого есть `NearbyEndpointRegistry`, который связывает `endpointId` с `PeerId` и `RoomId`.
+- `endpointId -> PeerId` описывает только прямого физического Nearby-соседа. Автор `CHAT_MESSAGE` или другого relayed-пакета не должен перезаписывать эту связь.
 - Транспорт автоматически принимает Nearby connection, а бизнес-решение входа в комнату остаётся выше, в `RoomRuntime`, через `JOIN_ACCEPTED` / `JOIN_REJECTED`.
 - Для будущего mesh/relay в `WirePacket` уже есть поля `packetId` и `ttl`, но Nearby-слой пока не делает dedup и relay.
+- При старте приложения, перед новой рекламой и при сбросе runtime вызывается полный cleanup Nearby: `stopDiscovery()`, `stopAdvertising()`, `stopAllEndpoints()` и очистка локального registry.
 
 ## STREAM payload для MVP-голоса
 

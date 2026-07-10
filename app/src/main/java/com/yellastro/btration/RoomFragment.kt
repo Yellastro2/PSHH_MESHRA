@@ -1,6 +1,7 @@
 package com.yellastro.btration
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
@@ -10,6 +11,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.TextView
@@ -33,7 +35,7 @@ import com.yellastro.btration.ui.room.RoomViewModel
 import kotlinx.coroutines.launch
 
 /**
- * Экран комнаты, связанный с RoomViewModel, списком участников, текстовым чатом и PTT-кнопкой.
+ * Экран комнаты с connecting-overlay, списком участников, текстовым чатом, PTT-кнопкой и очисткой клавиатуры при уходе.
  */
 class RoomFragment : Fragment() {
     private val viewModel: RoomViewModel by viewModels {
@@ -41,12 +43,15 @@ class RoomFragment : Fragment() {
     }
 
     private lateinit var tvChannelTitle: TextView
+    private lateinit var tvChannelStatus: TextView
     private lateinit var btnBack: ImageButton
     private lateinit var rvMessages: RecyclerView
     private lateinit var rvMembers: RecyclerView
     private lateinit var tvRoomError: TextView
     private lateinit var etMessage: EditText
     private lateinit var btnSend: ImageButton
+    private lateinit var layoutChatInput: View
+    private lateinit var layoutConnectingOverlay: View
 
     private lateinit var btnPushToTalk: View
     private lateinit var tvTransmissionStatus: TextView
@@ -107,12 +112,15 @@ class RoomFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
 
         tvChannelTitle = view.findViewById(R.id.tv_channel_title)
+        tvChannelStatus = view.findViewById(R.id.tv_channel_status)
         btnBack = view.findViewById(R.id.btn_back)
         rvMessages = view.findViewById(R.id.rv_messages)
         rvMembers = view.findViewById(R.id.rv_members)
         tvRoomError = view.findViewById(R.id.tv_room_error)
         etMessage = view.findViewById(R.id.et_message)
         btnSend = view.findViewById(R.id.btn_send)
+        layoutChatInput = view.findViewById(R.id.layout_chat_input)
+        layoutConnectingOverlay = view.findViewById(R.id.layout_connecting_overlay)
 
         btnPushToTalk = view.findViewById(R.id.btn_push_to_talk)
         tvTransmissionStatus = view.findViewById(R.id.tv_transmission_status)
@@ -190,10 +198,19 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Останавливает передачу микрофона при уничтожении view комнаты.
+     * Скрывает клавиатуру при уходе с экрана комнаты, чтобы IME не оставалась поверх следующего экрана.
+     */
+    override fun onPause() {
+        hideMessageKeyboard()
+        super.onPause()
+    }
+
+    /**
+     * Останавливает передачу микрофона и скрывает клавиатуру при уничтожении view комнаты.
      */
     override fun onDestroyView() {
         stopTransmission()
+        hideMessageKeyboard()
         super.onDestroyView()
     }
 
@@ -209,13 +226,14 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Отрисовывает участников, чат, ошибку комнаты, поле ввода, PTT-состояние и закрытие комнаты.
+     * Отрисовывает connecting-overlay, участников, чат, ошибку, PTT-состояние и закрытие комнаты.
      */
     private fun renderState(state: RoomUiState) {
         latestState = state
         tvChannelTitle.text = state.roomName.ifBlank { "ROOM" }
-        btnSend.isEnabled = state.canSend
-        btnSend.alpha = if (state.canSend) 1.0f else 0.45f
+        renderConnectingState(state)
+        btnSend.isEnabled = state.canSend && !state.isConnecting
+        btnSend.alpha = if (btnSend.isEnabled) 1.0f else 0.45f
         tvRoomError.text = state.errorMessage.orEmpty()
         tvRoomError.visibility = if (state.errorMessage.isNullOrBlank()) View.GONE else View.VISIBLE
         showErrorActionIfNeeded(state.errorAction)
@@ -236,6 +254,19 @@ class RoomFragment : Fragment() {
         if (!state.isTalking && isTransmitting) {
             stopTransmission()
         }
+    }
+
+    /**
+     * Показывает ожидание Nearby join и блокирует интерактивное содержимое комнаты, сохраняя кнопку назад доступной.
+     */
+    private fun renderConnectingState(state: RoomUiState) {
+        layoutConnectingOverlay.visibility = if (state.isConnecting) View.VISIBLE else View.GONE
+        tvChannelStatus.text = if (state.isConnecting) "ПОДКЛЮЧЕНИЕ…" else "В ЭФИРЕ • ШИФРОВАНИЕ"
+        etMessage.isEnabled = !state.isConnecting
+        btnPushToTalk.isEnabled = !state.isConnecting && state.canTalk
+        layoutChatInput.alpha = if (state.isConnecting) 0.45f else 1f
+        rvMembers.isEnabled = !state.isConnecting
+        rvMessages.isEnabled = !state.isConnecting
     }
 
     /**
@@ -313,7 +344,7 @@ class RoomFragment : Fragment() {
         isTransmitting = false
         viewModel.onMicReleased()
 
-        tvTransmissionStatus.text = "УДЕРЖИВАЙТЕ ДЛЯ СВЯЗИ"
+        tvTransmissionStatus.text = ""
         tvTransmissionStatus.setTextColor(requireContext().getColor(android.R.color.white))
         btnPushToTalk.animate().scaleX(1.0f).scaleY(1.0f).setDuration(150).start()
 
@@ -321,6 +352,19 @@ class RoomFragment : Fragment() {
         viewWave2.visibility = View.GONE
         viewWave3.visibility = View.GONE
 
+    }
+
+    /**
+     * Прячет системную клавиатуру поля сообщения, если оно еще связано с окном.
+     */
+    private fun hideMessageKeyboard() {
+        if (!::etMessage.isInitialized) {
+            return
+        }
+        val currentContext = context ?: return
+        val inputMethodManager = currentContext.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        inputMethodManager.hideSoftInputFromWindow(etMessage.windowToken, 0)
+        etMessage.clearFocus()
     }
 
     /**
