@@ -14,13 +14,16 @@ import com.yellastro.btration.service.RoomServiceController
 import com.yellastro.btration.ui.lobby.LobbyViewModel
 import com.yellastro.btration.ui.profile.ProfileViewModel
 import com.yellastro.btration.ui.room.RoomViewModel
+import com.yellastro.btration.voice.PcmVoiceCapture
+import com.yellastro.btration.voice.PcmVoicePlayer
+import com.yellastro.btration.voice.VoiceRuntime
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.serialization.json.Json
 
 /**
- * Ручной composition root приложения: собирает транспорт, runtime, repository и ViewModel factories.
+ * Ручной composition root приложения: собирает транспорт, voice runtime, room runtime, repository и ViewModel factories.
  */
 class AppContainer(context: Context) {
     private val applicationContext = context.applicationContext
@@ -37,6 +40,11 @@ class AppContainer(context: Context) {
         wireCodec = wireCodec,
     )
     private val roomServiceController = RoomServiceController(applicationContext)
+    private val voiceRuntime = VoiceRuntime(
+        nearbyTransport = nearbyTransport,
+        voiceCapture = PcmVoiceCapture(applicationScope),
+        voicePlayer = PcmVoicePlayer(applicationScope),
+    )
 
     /**
      * Репозиторий локального профиля пользователя.
@@ -48,6 +56,7 @@ class AppContainer(context: Context) {
     private val roomRuntime = RoomRuntime(
         profileRepository = profileRepository,
         nearbyTransport = nearbyTransport,
+        voiceRuntime = voiceRuntime,
         idGenerator = idGenerator,
         externalScope = applicationScope,
     )

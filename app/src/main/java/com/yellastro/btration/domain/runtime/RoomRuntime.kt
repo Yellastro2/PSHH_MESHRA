@@ -14,6 +14,8 @@ import com.yellastro.btration.domain.model.WirePacketId
 import com.yellastro.btration.domain.model.WirePacketType
 import com.yellastro.btration.domain.util.IdGenerator
 import com.yellastro.btration.repository.ProfileRepository
+import com.yellastro.btration.voice.VoiceRuntime
+import java.io.InputStream
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -21,11 +23,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Рабочая машина комнаты: слушает NearbyTransport, ведет состояние комнаты, участников и чат.
+ * Рабочая машина комнаты: слушает NearbyTransport, ведет состояние комнаты, участников, чат и PTT-голос.
  */
 class RoomRuntime(
     private val profileRepository: ProfileRepository,
     private val nearbyTransport: NearbyTransport,
+    private val voiceRuntime: VoiceRuntime,
     private val idGenerator: IdGenerator,
     externalScope: CoroutineScope,
 ) {
@@ -283,6 +286,44 @@ class RoomRuntime(
     }
 
     /**
+     * Начинает передачу микрофона в текущую комнату через voice runtime.
+     */
+    suspend fun startTalking() {
+        Log.i(TAG, "[startTalking] Команда начать передачу голоса currentState=${_state.value.javaClass.simpleName}")
+        val selfPeerId = profileRepository.getOrCreatePeerId()
+        when (val currentState = _state.value) {
+            is RoomRuntimeState.Hosting -> {
+                val targetPeerIds = currentState.members
+                    .map { peer -> peer.peerId }
+                    .filterNot { peerId -> peerId == selfPeerId }
+                    .toSet()
+                voiceRuntime.startTalking(targetPeerIds)
+            }
+
+            is RoomRuntimeState.Client -> {
+                voiceRuntime.startTalking(setOf(currentState.room.host.peerId))
+            }
+
+            RoomRuntimeState.Idle,
+            RoomRuntimeState.Searching,
+            is RoomRuntimeState.Joining,
+            is RoomRuntimeState.Error,
+            -> {
+                Log.w(TAG, "[startTalking] Передача голоса отклонена, нет активной комнаты")
+                setError("Нельзя передавать голос вне активной комнаты")
+            }
+        }
+    }
+
+    /**
+     * Останавливает передачу микрофона.
+     */
+    suspend fun stopTalking() {
+        Log.i(TAG, "[stopTalking] Команда остановить передачу голоса")
+        voiceRuntime.stopTalking()
+    }
+
+    /**
      * Обрабатывает события NearbyTransport и маршрутизирует их в доменную логику.
      */
     private fun handleNearbyEvent(event: NearbyEvent) {
@@ -293,6 +334,7 @@ class RoomRuntime(
             is NearbyEvent.ConnectionResult -> handleConnectionResult(event)
             is NearbyEvent.Disconnected -> handleDisconnected(event)
             is NearbyEvent.PacketReceived -> handlePacketReceived(event)
+            is NearbyEvent.StreamReceived -> handleStreamReceived(event)
             is NearbyEvent.AdvertisingFailed -> setError(
                 message = "Не удалось запустить комнату: ${event.cause.message.orEmpty()}",
                 action = actionFor(event.cause),
@@ -305,10 +347,52 @@ class RoomRuntime(
             is NearbyEvent.ConnectionAcceptFailed -> setError("Не удалось принять подключение: ${event.cause.message.orEmpty()}")
             is NearbyEvent.PayloadDecodeFailed -> setError("Не удалось прочитать пакет: ${event.cause.message.orEmpty()}")
             is NearbyEvent.SendFailed -> setError("Не удалось отправить пакет: ${event.cause.message.orEmpty()}")
+            is NearbyEvent.StreamSendFailed -> setError("Не удалось отправить голос: ${event.cause.message.orEmpty()}")
             is NearbyEvent.ConnectionInitiated,
             is NearbyEvent.PayloadTransferUpdated,
             is NearbyEvent.UnsupportedPayloadReceived,
             -> Unit
+        }
+    }
+
+    /**
+     * Принимает входящий voice stream, если отправитель относится к текущей комнате.
+     */
+    private fun handleStreamReceived(event: NearbyEvent.StreamReceived) {
+        val peerId = event.peerId
+        if (peerId == null) {
+            Log.w(TAG, "[handleStreamReceived] Голосовой stream без известного peerId endpointId=${event.endpointId}")
+            closeInputStream(event.inputStream)
+            return
+        }
+
+        when (val currentState = _state.value) {
+            is RoomRuntimeState.Hosting -> {
+                if (currentState.members.none { peer -> peer.peerId == peerId }) {
+                    Log.w(TAG, "[handleStreamReceived] Host игнорирует голосовой stream от неизвестного peerId=${peerId.value}")
+                    closeInputStream(event.inputStream)
+                    return
+                }
+                voiceRuntime.playIncoming(peerId, event.inputStream)
+            }
+
+            is RoomRuntimeState.Client -> {
+                if (currentState.members.none { peer -> peer.peerId == peerId }) {
+                    Log.w(TAG, "[handleStreamReceived] Client игнорирует голосовой stream от неизвестного peerId=${peerId.value}")
+                    closeInputStream(event.inputStream)
+                    return
+                }
+                voiceRuntime.playIncoming(peerId, event.inputStream)
+            }
+
+            RoomRuntimeState.Idle,
+            RoomRuntimeState.Searching,
+            is RoomRuntimeState.Joining,
+            is RoomRuntimeState.Error,
+            -> {
+                Log.w(TAG, "[handleStreamReceived] Голосовой stream получен вне активной комнаты currentState=${_state.value.javaClass.simpleName}")
+                closeInputStream(event.inputStream)
+            }
         }
     }
 
@@ -748,6 +832,7 @@ class RoomRuntime(
      */
     private fun resetSession() {
         Log.i(TAG, "[resetSession] Сбрасываем текущую сессию currentState=${_state.value.javaClass.simpleName}")
+        voiceRuntime.stopAll()
         nearbyTransport.stopAdvertising()
         _messages.value = emptyList()
         _state.value = RoomRuntimeState.Idle
@@ -755,10 +840,18 @@ class RoomRuntime(
     }
 
     /**
+     * Закрывает входящий stream, если runtime не может его использовать.
+     */
+    private fun closeInputStream(inputStream: InputStream) {
+        runCatching { inputStream.close() }
+    }
+
+    /**
      * Переводит runtime в Error с человекочитаемым сообщением и optional UI-действием.
      */
     private fun setError(message: String, action: RoomRuntimeErrorAction? = null) {
         Log.w(TAG, "[setError] Runtime перешел в Error message=$message action=$action")
+        voiceRuntime.stopAll()
         _state.value = RoomRuntimeState.Error(
             message = message.ifBlank { "Неизвестная ошибка" },
             action = action,

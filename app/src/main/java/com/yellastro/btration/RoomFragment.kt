@@ -1,6 +1,8 @@
 package com.yellastro.btration
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.provider.Settings
 import android.view.LayoutInflater
@@ -11,7 +13,11 @@ import android.view.inputmethod.EditorInfo
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
+import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
 import androidx.lifecycle.Lifecycle
@@ -27,7 +33,7 @@ import com.yellastro.btration.ui.room.RoomViewModel
 import kotlinx.coroutines.launch
 
 /**
- * Экран комнаты, связанный с RoomViewModel, списком участников и текстовым чатом.
+ * Экран комнаты, связанный с RoomViewModel, списком участников, текстовым чатом и PTT-кнопкой.
  */
 class RoomFragment : Fragment() {
     private val viewModel: RoomViewModel by viewModels {
@@ -55,6 +61,7 @@ class RoomFragment : Fragment() {
     private var latestState = RoomUiState()
     private var closedHandled = false
     private var handledErrorAction: RoomRuntimeErrorAction? = null
+    private lateinit var recordAudioPermissionLauncher: ActivityResultLauncher<String>
 
     /**
      * Фабрика RoomFragment без аргументов: состояние комнаты берется из RoomViewModel.
@@ -65,6 +72,20 @@ class RoomFragment : Fragment() {
          */
         fun newInstance(): RoomFragment {
             return RoomFragment()
+        }
+    }
+
+    /**
+     * Регистрирует launcher runtime-permission микрофона для PTT.
+     */
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        recordAudioPermissionLauncher = registerForActivityResult(
+            ActivityResultContracts.RequestPermission(),
+        ) { isGranted ->
+            if (!isGranted) {
+                Toast.makeText(requireContext(), "Без микрофона голосовая передача не работает", Toast.LENGTH_LONG).show()
+            }
         }
     }
 
@@ -169,6 +190,14 @@ class RoomFragment : Fragment() {
     }
 
     /**
+     * Останавливает передачу микрофона при уничтожении view комнаты.
+     */
+    override fun onDestroyView() {
+        stopTransmission()
+        super.onDestroyView()
+    }
+
+    /**
      * Подписывается на состояние комнаты.
      */
     private fun collectUiState() {
@@ -180,7 +209,7 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Отрисовывает участников, чат, ошибку комнаты, поле ввода и закрытие комнаты.
+     * Отрисовывает участников, чат, ошибку комнаты, поле ввода, PTT-состояние и закрытие комнаты.
      */
     private fun renderState(state: RoomUiState) {
         latestState = state
@@ -203,6 +232,9 @@ class RoomFragment : Fragment() {
         if (state.isClosed && !closedHandled) {
             closedHandled = true
             (activity as? MainActivity)?.popBackStack()
+        }
+        if (!state.isTalking && isTransmitting) {
+            stopTransmission()
         }
     }
 
@@ -252,11 +284,16 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Включает визуальное состояние передачи и отмечает себя говорящим.
+     * Включает визуальное состояние передачи, стартует ViewModel-команду микрофона и отмечает себя говорящим.
      */
     private fun startTransmission() {
-        if (isTransmitting) return
+        if (isTransmitting || !latestState.canTalk) return
+        if (!hasRecordAudioPermission()) {
+            recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
         isTransmitting = true
+        viewModel.onMicPressed()
 
         tvTransmissionStatus.text = "ПЕРЕДАЧА..."
         tvTransmissionStatus.setTextColor(requireContext().getColor(android.R.color.holo_green_light))
@@ -270,11 +307,12 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Выключает визуальное состояние передачи и снимает talking-статус.
+     * Выключает визуальное состояние передачи, останавливает ViewModel-команду микрофона и снимает talking-статус.
      */
     private fun stopTransmission() {
         if (!isTransmitting) return
         isTransmitting = false
+        viewModel.onMicReleased()
 
         tvTransmissionStatus.text = "УДЕРЖИВАЙТЕ ДЛЯ СВЯЗИ"
         tvTransmissionStatus.setTextColor(requireContext().getColor(android.R.color.white))
@@ -285,6 +323,16 @@ class RoomFragment : Fragment() {
         viewWave3.visibility = View.GONE
 
         memberAdapter.setSelfTalking(false)
+    }
+
+    /**
+     * Проверяет runtime-permission микрофона перед стартом AudioRecord.
+     */
+    private fun hasRecordAudioPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            requireContext(),
+            Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
     }
 
     /**

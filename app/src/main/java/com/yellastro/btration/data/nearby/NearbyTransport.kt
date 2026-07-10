@@ -24,12 +24,13 @@ import com.yellastro.btration.data.wire.WireCodec
 import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.RoomInfo
 import com.yellastro.btration.domain.model.WirePacket
+import java.io.InputStream
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 
 /**
- * Тонкая обертка над Nearby Connections: discovery, advertising, connection callbacks и byte payload.
+ * Тонкая обертка над Nearby Connections: discovery, advertising, connection callbacks, byte payload и stream payload.
  */
 class NearbyTransport(
     private val context: Context,
@@ -103,43 +104,71 @@ class NearbyTransport(
 
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
-            if (payload.type != Payload.Type.BYTES) {
-                Log.w(TAG, "[onPayloadReceived] Получен неподдерживаемый payload endpointId=$endpointId type=${payload.type}")
-                emitEvent(NearbyEvent.UnsupportedPayloadReceived(endpointId, payload.type))
-                return
-            }
-
-            val bytes = payload.asBytes()
-            if (bytes == null) {
-                Log.w(TAG, "[onPayloadReceived] Payload bytes пустые endpointId=$endpointId")
-                emitEvent(
-                    NearbyEvent.PayloadDecodeFailed(
-                        endpointId,
-                        IllegalArgumentException("Payload bytes are null"),
-                    ),
-                )
-                return
-            }
-
-            val packet = runCatching { wireCodec.decode(bytes) }
-                .onFailure { cause ->
-                    Log.w(TAG, "[onPayloadReceived] Не удалось декодировать payload endpointId=$endpointId bytes=${bytes.size}: ${cause.message}", cause)
-                    emitEvent(NearbyEvent.PayloadDecodeFailed(endpointId, cause))
+            when (payload.type) {
+                Payload.Type.BYTES -> handleBytesPayload(endpointId, payload)
+                Payload.Type.STREAM -> handleStreamPayload(endpointId, payload)
+                else -> {
+                    Log.w(TAG, "[onPayloadReceived] Получен неподдерживаемый payload endpointId=$endpointId type=${payload.type}")
+                    emitEvent(NearbyEvent.UnsupportedPayloadReceived(endpointId, payload.type))
                 }
-                .getOrNull()
-                ?: return
-
-            bindPacketMetadata(endpointId, packet)
-            Log.i(
-                TAG,
-                "[onPayloadReceived] Получен packet endpointId=$endpointId peerId=${endpointRegistry.getPeerId(endpointId)?.value} type=${packet.type} roomId=${packet.roomId?.value}",
-            )
-            emitEvent(NearbyEvent.PacketReceived(endpointId, endpointRegistry.getPeerId(endpointId), packet))
+            }
         }
 
         override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
             emitEvent(NearbyEvent.PayloadTransferUpdated(endpointId, update))
         }
+    }
+
+    /**
+     * Обрабатывает bytes payload как wire-пакет протокола комнаты.
+     */
+    private fun handleBytesPayload(endpointId: String, payload: Payload) {
+        val bytes = payload.asBytes()
+        if (bytes == null) {
+            Log.w(TAG, "[handleBytesPayload] Payload bytes пустые endpointId=$endpointId")
+            emitEvent(
+                NearbyEvent.PayloadDecodeFailed(
+                    endpointId,
+                    IllegalArgumentException("Payload bytes are null"),
+                ),
+            )
+            return
+        }
+
+        val packet = runCatching { wireCodec.decode(bytes) }
+            .onFailure { cause ->
+                Log.w(TAG, "[handleBytesPayload] Не удалось декодировать payload endpointId=$endpointId bytes=${bytes.size}: ${cause.message}", cause)
+                emitEvent(NearbyEvent.PayloadDecodeFailed(endpointId, cause))
+            }
+            .getOrNull()
+            ?: return
+
+        bindPacketMetadata(endpointId, packet)
+        Log.i(
+            TAG,
+            "[handleBytesPayload] Получен packet endpointId=$endpointId peerId=${endpointRegistry.getPeerId(endpointId)?.value} type=${packet.type} roomId=${packet.roomId?.value}",
+        )
+        emitEvent(NearbyEvent.PacketReceived(endpointId, endpointRegistry.getPeerId(endpointId), packet))
+    }
+
+    /**
+     * Обрабатывает stream payload как входящий голосовой поток.
+     */
+    private fun handleStreamPayload(endpointId: String, payload: Payload) {
+        val inputStream = payload.asStream()?.asInputStream()
+        if (inputStream == null) {
+            Log.w(TAG, "[handleStreamPayload] Stream payload без InputStream endpointId=$endpointId")
+            emitEvent(
+                NearbyEvent.PayloadDecodeFailed(
+                    endpointId,
+                    IllegalArgumentException("Payload stream input is null"),
+                ),
+            )
+            return
+        }
+        val peerId = endpointRegistry.getPeerId(endpointId)
+        Log.i(TAG, "[handleStreamPayload] Получен голосовой stream endpointId=$endpointId peerId=${peerId?.value}")
+        emitEvent(NearbyEvent.StreamReceived(endpointId, peerId, inputStream))
     }
 
     /**
@@ -298,6 +327,36 @@ class NearbyTransport(
                         cause = cause,
                     ),
                 )
+            }
+    }
+
+    /**
+     * Отправляет голосовой stream выбранным участникам по доменным PeerId одним Nearby STREAM payload.
+     */
+    fun sendStreamToPeers(peerIds: Set<PeerId>, inputStream: InputStream) {
+        val endpointIds = peerIds
+            .mapNotNull { peerId -> endpointRegistry.getEndpointId(peerId) }
+            .distinct()
+        if (endpointIds.isEmpty()) {
+            Log.w(TAG, "[sendStreamToPeers] Нельзя отправить голосовой stream, endpoint-ы неизвестны peerCount=${peerIds.size}")
+            runCatching { inputStream.close() }
+            emitEvent(
+                NearbyEvent.StreamSendFailed(
+                    peerIds = peerIds,
+                    cause = IllegalStateException("Endpoints for voice stream are unknown"),
+                ),
+            )
+            return
+        }
+
+        Log.i(TAG, "[sendStreamToPeers] Отправляем голосовой stream endpointCount=${endpointIds.size} peerCount=${peerIds.size}")
+        connectionsClient.sendPayload(endpointIds, Payload.fromStream(inputStream))
+            .addOnSuccessListener {
+                Log.i(TAG, "[sendStreamToPeers] Голосовой stream передан Nearby endpointCount=${endpointIds.size}")
+            }
+            .addOnFailureListener { cause ->
+                Log.w(TAG, "[sendStreamToPeers] Не удалось отправить голосовой stream: ${cause.message}", cause)
+                emitEvent(NearbyEvent.StreamSendFailed(peerIds, cause))
             }
     }
 

@@ -8,7 +8,7 @@ import com.yellastro.btration.domain.runtime.RoomRuntimeState
 import com.yellastro.btration.service.RoomServiceController
 
 /**
- * Фасад комнаты для будущих ViewModel: прокидывает команды в runtime и управляет service-обвязкой.
+ * Фасад комнаты для ViewModel: прокидывает команды комнаты, чата и голоса в runtime и управляет service-обвязкой.
  */
 class RoomRepository(
     private val roomRuntime: RoomRuntime,
@@ -103,6 +103,23 @@ class RoomRepository(
     suspend fun sendMessage(text: String) {
         Log.i(TAG, "[sendMessage] Отправляем сообщение через RoomRepository textLength=${text.length}")
         roomRuntime.sendMessage(text)
+    }
+
+    /**
+     * Начинает передачу микрофона в активную комнату.
+     */
+    suspend fun startTalking() {
+        Log.i(TAG, "[startTalking] Запускаем передачу голоса через RoomRepository")
+        roomRuntime.startTalking()
+        roomServiceController.startIfNeeded(roomRuntime.state.value.needsService())
+    }
+
+    /**
+     * Останавливает передачу микрофона.
+     */
+    suspend fun stopTalking() {
+        Log.i(TAG, "[stopTalking] Останавливаем передачу голоса через RoomRepository")
+        roomRuntime.stopTalking()
     }
 
     /**

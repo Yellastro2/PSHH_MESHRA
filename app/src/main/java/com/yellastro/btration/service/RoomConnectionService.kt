@@ -61,6 +61,12 @@ class RoomConnectionService : Service() {
      */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(TAG, "[onStartCommand] Получена команда action=${intent?.action} startId=$startId")
+        if (intent?.action == ACTION_DISCONNECT) {
+            Log.i(TAG, "[onStartCommand] Отключаем runtime по ACTION_DISCONNECT")
+            handleDisconnectAction()
+            return START_NOT_STICKY
+        }
+
         if (intent?.action == ACTION_STOP) {
             Log.i(TAG, "[onStartCommand] Останавливаем service по ACTION_STOP")
             stopSelf()
@@ -123,6 +129,21 @@ class RoomConnectionService : Service() {
         messageCollectorStarted = true
         serviceScope.launch {
             roomRepository.messages.collect(::handleMessagesChanged)
+        }
+    }
+
+    /**
+     * Отключает текущую активность комнаты или поиска из action-кнопки foreground notification.
+     */
+    private fun handleDisconnectAction() {
+        serviceScope.launch {
+            runCatching {
+                roomRepository.leaveRoom()
+                Log.i(TAG, "[handleDisconnectAction] Runtime отключен из кнопки уведомления")
+            }.onFailure { cause ->
+                Log.w(TAG, "[handleDisconnectAction] Не удалось отключить runtime из кнопки уведомления: ${cause.message}", cause)
+            }
+            stopSelf()
         }
     }
 
@@ -281,6 +302,7 @@ class RoomConnectionService : Service() {
             .setContentIntent(createOpenAppPendingIntent())
             .setOngoing(true)
             .setOnlyAlertOnce(true)
+            .addAction(R.drawable.ic_radio, DISCONNECT_ACTION_TITLE, createDisconnectPendingIntent())
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
@@ -330,6 +352,18 @@ class RoomConnectionService : Service() {
     }
 
     /**
+     * Создает PendingIntent для отключения комнаты или поиска из foreground notification.
+     */
+    private fun createDisconnectPendingIntent(): PendingIntent {
+        return PendingIntent.getService(
+            this,
+            DISCONNECT_REQUEST_CODE,
+            createDisconnectIntent(this),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
+    /**
      * Возвращает стабильный notification id для сообщения.
      */
     private fun notificationIdFor(messageId: MessageId): Int {
@@ -343,12 +377,15 @@ class RoomConnectionService : Service() {
         private const val TAG = "RoomConnectionService"
         private const val ACTION_START = "com.yellastro.btration.service.START_ROOM_CONNECTION"
         private const val ACTION_STOP = "com.yellastro.btration.service.STOP_ROOM_CONNECTION"
+        private const val ACTION_DISCONNECT = "com.yellastro.btration.service.DISCONNECT_ROOM_CONNECTION"
         private const val ROOM_CHANNEL_ID = "room_connection"
         private const val MESSAGE_CHANNEL_ID = "room_messages"
+        private const val DISCONNECT_ACTION_TITLE = "Отключить"
         private const val FOREGROUND_NOTIFICATION_ID = 1001
         private const val MESSAGE_NOTIFICATION_BASE_ID = 2_000
         private const val MESSAGE_NOTIFICATION_BUCKET = 100_000
         private const val OPEN_APP_REQUEST_CODE = 2001
+        private const val DISCONNECT_REQUEST_CODE = 2002
 
         /**
          * Создает intent запуска foreground service.
@@ -365,6 +402,15 @@ class RoomConnectionService : Service() {
         fun createStopIntent(context: Context): Intent {
             return Intent(context, RoomConnectionService::class.java).apply {
                 action = ACTION_STOP
+            }
+        }
+
+        /**
+         * Создает intent отключения комнаты или поиска из foreground notification.
+         */
+        fun createDisconnectIntent(context: Context): Intent {
+            return Intent(context, RoomConnectionService::class.java).apply {
+                action = ACTION_DISCONNECT
             }
         }
     }

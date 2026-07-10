@@ -18,12 +18,13 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /**
- * ViewModel комнаты: показывает участников, чат и прокидывает команды сообщения/выхода.
+ * ViewModel комнаты: показывает участников, чат и прокидывает команды сообщения, выхода и PTT-голоса.
  */
 class RoomViewModel(
     private val roomRepository: RoomRepository,
 ) : ViewModel() {
     private val inputText = MutableStateFlow("")
+    private val isTalking = MutableStateFlow(false)
 
     /**
      * UI-состояние комнаты, собранное из runtime, сообщений и текущего ввода.
@@ -32,8 +33,9 @@ class RoomViewModel(
         roomRepository.runtimeState,
         roomRepository.messages,
         inputText,
-    ) { runtimeState, messages, input ->
-        mapUiState(runtimeState, messages, input)
+        isTalking,
+    ) { runtimeState, messages, input, talking ->
+        mapUiState(runtimeState, messages, input, talking)
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
@@ -41,6 +43,7 @@ class RoomViewModel(
             runtimeState = roomRepository.runtimeState.value,
             messages = roomRepository.messages.value,
             input = inputText.value,
+            talking = isTalking.value,
         ),
     )
 
@@ -85,16 +88,44 @@ class RoomViewModel(
     }
 
     /**
+     * Начинает передачу микрофона, если runtime сейчас находится в активной комнате.
+     */
+    fun onMicPressed() {
+        if (!uiState.value.canTalk || isTalking.value) {
+            return
+        }
+        isTalking.value = true
+        viewModelScope.launch {
+            roomRepository.startTalking()
+        }
+    }
+
+    /**
+     * Останавливает передачу микрофона.
+     */
+    fun onMicReleased() {
+        if (!isTalking.value) {
+            return
+        }
+        isTalking.value = false
+        viewModelScope.launch {
+            roomRepository.stopTalking()
+        }
+    }
+
+    /**
      * Преобразует runtime-состояние комнаты в UI-состояние.
      */
     private fun mapUiState(
         runtimeState: RoomRuntimeState,
         messages: List<ChatMessage>,
         input: String,
+        talking: Boolean,
     ): RoomUiState {
         val selfPeerId = roomRepository.getSelfPeerId()
         val canSend = input.isNotBlank() &&
             (runtimeState is RoomRuntimeState.Hosting || runtimeState is RoomRuntimeState.Client)
+        val canTalk = runtimeState is RoomRuntimeState.Hosting || runtimeState is RoomRuntimeState.Client
 
         return when (runtimeState) {
             is RoomRuntimeState.Hosting -> RoomUiState(
@@ -104,6 +135,8 @@ class RoomViewModel(
                 messages = messages.map { mapMessage(it, selfPeerId) },
                 inputText = input,
                 canSend = canSend,
+                canTalk = canTalk,
+                isTalking = talking,
                 isClosed = false,
                 errorMessage = null,
             )
@@ -115,6 +148,8 @@ class RoomViewModel(
                 messages = messages.map { mapMessage(it, selfPeerId) },
                 inputText = input,
                 canSend = canSend,
+                canTalk = canTalk,
+                isTalking = talking,
                 isClosed = false,
                 errorMessage = null,
             )
@@ -123,6 +158,8 @@ class RoomViewModel(
                 roomName = runtimeState.room.name,
                 inputText = input,
                 canSend = false,
+                canTalk = false,
+                isTalking = false,
                 isClosed = false,
             )
 
@@ -130,12 +167,16 @@ class RoomViewModel(
             RoomRuntimeState.Searching,
             -> RoomUiState(
                 inputText = input,
+                canTalk = false,
+                isTalking = false,
                 isClosed = true,
             )
 
             is RoomRuntimeState.Error -> RoomUiState(
                 inputText = input,
                 canSend = false,
+                canTalk = false,
+                isTalking = false,
                 isClosed = false,
                 errorMessage = runtimeState.message,
                 errorAction = runtimeState.action,

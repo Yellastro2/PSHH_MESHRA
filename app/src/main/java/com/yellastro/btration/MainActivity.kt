@@ -12,7 +12,7 @@ import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 
 /**
- * Главный контейнер UI-слоя: запрашивает Nearby/notification permissions и выбирает стартовый экран.
+ * Главный контейнер UI-слоя: запрашивает Nearby/voice/notification permissions и выбирает стартовый экран.
  */
 class MainActivity : AppCompatActivity() {
     private lateinit var nearbyPermissionLauncher: ActivityResultLauncher<Array<String>>
@@ -36,7 +36,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Запрашивает runtime permissions, без которых Nearby и уведомления не смогут работать полноценно.
+     * Запрашивает runtime permissions, без которых Nearby, голос и уведомления не смогут работать полноценно.
      */
     private fun requestStartupPermissionsIfNeeded() {
         val missingPermissions = requiredStartupPermissions()
@@ -55,7 +55,7 @@ class MainActivity : AppCompatActivity() {
      * Проверяет результат runtime-запроса, показывает недостающие permissions и открывает стартовый экран.
      */
     private fun handleStartupPermissionResult() {
-        val missingPermissions = missingRequiredNearbyPermissions()
+        val missingPermissions = missingRequiredStartupPermissions()
         if (missingPermissions.isNotEmpty()) {
             Toast.makeText(
                 this,
@@ -71,7 +71,14 @@ class MainActivity : AppCompatActivity() {
      * Возвращает набор runtime permissions для текущей версии Android.
      */
     private fun requiredStartupPermissions(): List<String> {
-        return (requiredNearbyPermissions() + optionalNotificationPermissions()).distinct()
+        return (requiredNearbyPermissions() + requiredVoicePermissions() + optionalNotificationPermissions()).distinct()
+    }
+
+    /**
+     * Возвращает runtime permissions для будущей PTT-передачи голоса.
+     */
+    private fun requiredVoicePermissions(): List<String> {
+        return listOf(Manifest.permission.RECORD_AUDIO)
     }
 
     /**
@@ -115,10 +122,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Возвращает список обязательных Nearby permissions, которые Android сейчас не выдал.
+     * Возвращает список обязательных startup permissions, которые Android сейчас не выдал.
      */
-    private fun missingRequiredNearbyPermissions(): List<String> {
-        return requiredNearbyPermissions().filter { permission ->
+    private fun missingRequiredStartupPermissions(): List<String> {
+        return requiredStartupPermissions().filter { permission ->
             ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED
         }
     }

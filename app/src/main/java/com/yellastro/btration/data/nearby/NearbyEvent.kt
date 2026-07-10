@@ -8,9 +8,10 @@ import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.RoomId
 import com.yellastro.btration.domain.model.RoomInfo
 import com.yellastro.btration.domain.model.WirePacket
+import java.io.InputStream
 
 /**
- * Событие низкого Nearby-слоя без бизнес-решений комнаты.
+ * Событие низкого Nearby-слоя без бизнес-решений комнаты, включая bytes-пакеты и voice streams.
  */
 sealed class NearbyEvent {
     /**
@@ -61,6 +62,15 @@ sealed class NearbyEvent {
         val endpointId: String,
         val peerId: PeerId?,
         val packet: WirePacket,
+    ) : NearbyEvent()
+
+    /**
+     * Транспорт получил входящий voice stream от Nearby endpoint.
+     */
+    data class StreamReceived(
+        val endpointId: String,
+        val peerId: PeerId?,
+        val inputStream: InputStream,
     ) : NearbyEvent()
 
     /**
@@ -124,6 +134,14 @@ sealed class NearbyEvent {
         val endpointId: String?,
         val peerId: PeerId?,
         val packet: WirePacket,
+        val cause: Throwable,
+    ) : NearbyEvent()
+
+    /**
+     * Nearby не смог отправить voice stream.
+     */
+    data class StreamSendFailed(
+        val peerIds: Set<PeerId>,
         val cause: Throwable,
     ) : NearbyEvent()
 }

@@ -14,6 +14,8 @@ data class RoomUiState(
     val messages: List<ChatMessageUi> = emptyList(),
     val inputText: String = "",
     val canSend: Boolean = false,
+    val canTalk: Boolean = false,
+    val isTalking: Boolean = false,
     val isClosed: Boolean = false,
     val errorMessage: String? = null,
     val errorAction: RoomRuntimeErrorAction? = null,
