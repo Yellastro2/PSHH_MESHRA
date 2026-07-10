@@ -10,7 +10,7 @@ import android.widget.TextView
 import androidx.fragment.app.DialogFragment
 
 /**
- * Диалог создания моковой комнаты, возвращающий имя комнаты через Fragment Result API.
+ * Диалог создания комнаты, возвращающий имя комнаты через Fragment Result API.
  */
 class CreateRoomDialogFragment : DialogFragment() {
 

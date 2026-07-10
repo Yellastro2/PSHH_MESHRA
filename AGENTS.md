@@ -48,8 +48,8 @@
 
 ## Internal Code Version
 
-- После каждого изменения кода, сделанного Codex, инкрементить внутреннюю версию в строковом ресурсе `rnk_internal_code_version`.
-- Ресурс хранится в `ui/src/main/res/values/strings.xml` и отображается в нижней строке лицензии на главном RNK-экране.
+- После каждого изменения кода, сделанного Codex, инкрементить внутреннюю версию в строковом ресурсе `btratio_internal_code_version`.
+- Ресурс хранится в `app/src/main/res/values/strings.xml`.
 - Формат значения: `\u0020в-N`, где `N` — возрастающий внутренний номер, не связанный с Gradle `versionCode` или `versionName`.
 
 ## Module Documentation

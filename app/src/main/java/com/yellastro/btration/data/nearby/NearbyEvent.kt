@@ -2,7 +2,7 @@ package com.yellastro.btration.data.nearby
 
 import com.google.android.gms.nearby.connection.ConnectionInfo
 import com.google.android.gms.nearby.connection.ConnectionResolution
-import com.google.android.gms.nearby.connection.EndpointInfo
+import com.google.android.gms.nearby.connection.DiscoveredEndpointInfo
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.RoomId
@@ -18,7 +18,7 @@ sealed class NearbyEvent {
      */
     data class EndpointFound(
         val endpointId: String,
-        val endpointInfo: EndpointInfo,
+        val endpointInfo: DiscoveredEndpointInfo,
         val roomInfo: RoomInfo?,
     ) : NearbyEvent()
 

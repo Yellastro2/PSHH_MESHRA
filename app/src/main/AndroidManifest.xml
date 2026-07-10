@@ -2,45 +2,34 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <uses-permission
-        android:name="android.permission.ACCESS_WIFI_STATE"
-        android:maxSdkVersion="31" />
-    <uses-permission
-        android:name="android.permission.CHANGE_WIFI_STATE"
-        android:maxSdkVersion="31" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission
         android:name="android.permission.BLUETOOTH"
         android:maxSdkVersion="30" />
     <uses-permission
         android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
-    <uses-permission
-        android:name="android.permission.ACCESS_COARSE_LOCATION"
-        android:maxSdkVersion="28" />
-    <uses-permission
-        android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:minSdkVersion="29"
-        android:maxSdkVersion="31" />
-    <uses-permission
-        android:name="android.permission.BLUETOOTH_ADVERTISE"
-        android:minSdkVersion="31" />
-    <uses-permission
-        android:name="android.permission.BLUETOOTH_CONNECT"
-        android:minSdkVersion="31" />
-    <uses-permission
-        android:name="android.permission.BLUETOOTH_SCAN"
-        android:minSdkVersion="31" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission
         android:name="android.permission.NEARBY_WIFI_DEVICES"
-        android:minSdkVersion="32" />
+        />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
 
     <application
+        android:name=".BtRationApplication"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@mipmap/ic_launch_bt"
         android:label="@string/app_name"
-        android:roundIcon="@mipmap/ic_launcher_round"
+        android:roundIcon="@mipmap/ic_launch_bt_round"
         android:supportsRtl="true"
         android:theme="@style/Theme_WalkieTalkie">
         <activity
@@ -54,6 +43,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <service
+            android:name=".service.RoomConnectionService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
     </application>
 
 </manifest>

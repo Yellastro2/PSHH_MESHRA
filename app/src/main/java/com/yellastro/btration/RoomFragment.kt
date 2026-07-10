@@ -1,30 +1,44 @@
 package com.yellastro.btration
 
-import android.content.Context
+import android.content.Intent
 import android.os.Bundle
+import android.provider.Settings
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.EditorInfo
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import com.yellastro.btration.domain.runtime.RoomRuntimeErrorAction
+import com.yellastro.btration.ui.room.ChatMessageUi
+import com.yellastro.btration.ui.room.MemberUi
+import com.yellastro.btration.ui.room.RoomUiState
+import com.yellastro.btration.ui.room.RoomViewModel
+import kotlinx.coroutines.launch
 
 /**
- * Моковый экран комнаты со списком участников, чатом и визуальным PTT-контролом.
+ * Экран комнаты, связанный с RoomViewModel, списком участников и текстовым чатом.
  */
 class RoomFragment : Fragment() {
+    private val viewModel: RoomViewModel by viewModels {
+        (requireActivity().application as BtRationApplication).appContainer.roomViewModelFactory()
+    }
 
     private lateinit var tvChannelTitle: TextView
     private lateinit var btnBack: ImageButton
     private lateinit var rvMessages: RecyclerView
     private lateinit var rvMembers: RecyclerView
+    private lateinit var tvRoomError: TextView
     private lateinit var etMessage: EditText
     private lateinit var btnSend: ImageButton
 
@@ -34,47 +48,23 @@ class RoomFragment : Fragment() {
     private lateinit var viewWave2: View
     private lateinit var viewWave3: View
 
-    private var roomId: String = ""
-    private var roomName: String = ""
-    private var hostName: String = ""
-    private var selfName: String = "Гость"
-
-    private val messages = mutableListOf<Message>()
-    private val members = mutableListOf<Member>()
-
     private lateinit var messageAdapter: MessageAdapter
     private lateinit var memberAdapter: MemberAdapter
 
     private var isTransmitting = false
+    private var latestState = RoomUiState()
+    private var closedHandled = false
+    private var handledErrorAction: RoomRuntimeErrorAction? = null
 
     /**
-     * Фабрика RoomFragment с аргументами моковой комнаты.
+     * Фабрика RoomFragment без аргументов: состояние комнаты берется из RoomViewModel.
      */
     companion object {
         /**
-         * Создает экран комнаты с идентификатором, названием и именем хоста.
+         * Создает экран текущей активной комнаты.
          */
-        fun newInstance(roomId: String, roomName: String, hostName: String): RoomFragment {
-            val fragment = RoomFragment()
-            val args = Bundle().apply {
-                putString("room_id", roomId)
-                putString("room_name", roomName)
-                putString("host_name", hostName)
-            }
-            fragment.arguments = args
-            return fragment
-        }
-    }
-
-    /**
-     * Читает аргументы комнаты до создания view.
-     */
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        arguments?.let {
-            roomId = it.getString("room_id", "")
-            roomName = it.getString("room_name", "")
-            hostName = it.getString("host_name", "")
+        fun newInstance(): RoomFragment {
+            return RoomFragment()
         }
     }
 
@@ -90,18 +80,16 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Настраивает моковые списки, чат, кнопки и PTT-визуализацию.
+     * Настраивает списки участников, чат, кнопки и PTT-визуализацию.
      */
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-
-        val sharedPrefs = requireActivity().getSharedPreferences("walkie_talkie_prefs", Context.MODE_PRIVATE)
-        selfName = sharedPrefs.getString("self_name", "Гость") ?: "Гость"
 
         tvChannelTitle = view.findViewById(R.id.tv_channel_title)
         btnBack = view.findViewById(R.id.btn_back)
         rvMessages = view.findViewById(R.id.rv_messages)
         rvMembers = view.findViewById(R.id.rv_members)
+        tvRoomError = view.findViewById(R.id.tv_room_error)
         etMessage = view.findViewById(R.id.et_message)
         btnSend = view.findViewById(R.id.btn_send)
 
@@ -111,27 +99,57 @@ class RoomFragment : Fragment() {
         viewWave2 = view.findViewById(R.id.view_wave_2)
         viewWave3 = view.findViewById(R.id.view_wave_3)
 
-        tvChannelTitle.text = roomName
-
-        setupMockData()
-
-        messageAdapter = MessageAdapter(messages)
+        messageAdapter = MessageAdapter()
         rvMessages.layoutManager = LinearLayoutManager(requireContext()).apply {
             stackFromEnd = true
         }
         rvMessages.adapter = messageAdapter
 
-        memberAdapter = MemberAdapter(members)
+        memberAdapter = MemberAdapter()
         rvMembers.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
         rvMembers.adapter = memberAdapter
 
         btnBack.setOnClickListener {
-            (activity as? MainActivity)?.popBackStack()
+            if (latestState.isHost) {
+                showCloseRoomConfirmationDialog()
+            } else {
+                viewModel.onLeaveClicked()
+            }
         }
 
         btnSend.setOnClickListener {
-            sendMessage()
+            viewModel.onSendClicked()
         }
+
+        etMessage.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == EditorInfo.IME_ACTION_SEND || actionId == EditorInfo.IME_ACTION_DONE) {
+                viewModel.onSendClicked()
+                true
+            } else {
+                false
+            }
+        }
+
+        etMessage.addTextChangedListener(
+            object : android.text.TextWatcher {
+                /**
+                 * Не используется: ViewModel получает уже измененный текст в afterTextChanged.
+                 */
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+
+                /**
+                 * Не используется: ViewModel получает уже измененный текст в afterTextChanged.
+                 */
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+
+                /**
+                 * Передает актуальный текст ввода во ViewModel.
+                 */
+                override fun afterTextChanged(s: android.text.Editable?) {
+                    viewModel.onMessageChanged(s?.toString().orEmpty())
+                }
+            },
+        )
 
         btnPushToTalk.setOnTouchListener { _, event ->
             when (event.action) {
@@ -146,57 +164,91 @@ class RoomFragment : Fragment() {
                 else -> false
             }
         }
+
+        collectUiState()
     }
 
     /**
-     * Наполняет экран статичными моковыми сообщениями и участниками.
+     * Подписывается на состояние комнаты.
      */
-    private fun setupMockData() {
-        messages.clear()
-        messages.add(Message("sys_1", "Вы подключились к каналу $roomName", "SYSTEM", "", isSystem = true))
-        messages.add(Message("m1", "Привет всем! Слышно меня?", hostName, "13:02"))
-        messages.add(Message("m2", "Да, прием отличный, чистый звук!", "Dmitry", "13:04"))
-
-        members.clear()
-        members.add(
-            Member(
-                "self",
-                selfName,
-                isTalking = false,
-                isMe = true,
-                role = if (selfName == hostName) "HOST" else "USER",
-            ),
-        )
-        if (hostName != selfName) {
-            members.add(Member("host", hostName, isTalking = false, role = "HOST"))
+    private fun collectUiState() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.uiState.collect(::renderState)
+            }
         }
-        members.add(Member("m_dmitry", "Dmitry", isTalking = false))
-        members.add(Member("m_anna", "Anna", isMuted = true))
     }
 
     /**
-     * Добавляет локальное моковое сообщение из поля ввода.
+     * Отрисовывает участников, чат, ошибку комнаты, поле ввода и закрытие комнаты.
      */
-    private fun sendMessage() {
-        val text = etMessage.text.toString().trim()
-        if (text.isEmpty()) return
+    private fun renderState(state: RoomUiState) {
+        latestState = state
+        tvChannelTitle.text = state.roomName.ifBlank { "ROOM" }
+        btnSend.isEnabled = state.canSend
+        btnSend.alpha = if (state.canSend) 1.0f else 0.45f
+        tvRoomError.text = state.errorMessage.orEmpty()
+        tvRoomError.visibility = if (state.errorMessage.isNullOrBlank()) View.GONE else View.VISIBLE
+        showErrorActionIfNeeded(state.errorAction)
+        if (etMessage.text.toString() != state.inputText) {
+            etMessage.setText(state.inputText)
+            etMessage.setSelection(state.inputText.length)
+        }
+        memberAdapter.submitItems(state.members)
+        val oldMessageCount = messageAdapter.itemCount
+        messageAdapter.submitItems(state.messages)
+        if (state.messages.size > oldMessageCount) {
+            rvMessages.scrollToPosition(state.messages.lastIndex)
+        }
+        if (state.isClosed && !closedHandled) {
+            closedHandled = true
+            (activity as? MainActivity)?.popBackStack()
+        }
+    }
 
-        val sdf = SimpleDateFormat("HH:mm", Locale.getDefault())
-        val currentTime = sdf.format(Date())
+    /**
+     * Просит хоста подтвердить выход, потому что выход закрывает комнату для всех участников.
+     */
+    private fun showCloseRoomConfirmationDialog() {
+        AlertDialog.Builder(requireContext())
+            .setTitle("Закрыть комнату?")
+            .setMessage("Если вы выйдете, комната будет закрыта для всех участников.")
+            .setPositiveButton("Закрыть") { _, _ ->
+                viewModel.onCloseRoomClicked()
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
 
-        val newMsg = Message(
-            id = "msg_${System.currentTimeMillis()}",
-            text = text,
-            senderName = selfName,
-            timestamp = currentTime,
-            isMe = true,
-        )
+    /**
+     * Показывает одноразовый диалог с действием для исправления runtime-ошибки.
+     */
+    private fun showErrorActionIfNeeded(action: RoomRuntimeErrorAction?) {
+        if (action == null) {
+            handledErrorAction = null
+            return
+        }
+        if (handledErrorAction == action) {
+            return
+        }
+        handledErrorAction = action
+        when (action) {
+            RoomRuntimeErrorAction.OPEN_LOCATION_SETTINGS -> showLocationSettingsDialog()
+        }
+    }
 
-        messages.add(newMsg)
-        messageAdapter.notifyItemInserted(messages.size - 1)
-        rvMessages.scrollToPosition(messages.size - 1)
-
-        etMessage.text.clear()
+    /**
+     * Предлагает включить системную геолокацию, без которой Nearby advertising не стартует.
+     */
+    private fun showLocationSettingsDialog() {
+        AlertDialog.Builder(requireContext())
+            .setTitle("Геолокация выключена")
+            .setMessage("Для работы Nearby-комнаты нужно включить геолокацию устройства. BtRation не читает GPS-координаты.")
+            .setPositiveButton("Включить") { _, _ ->
+                startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+            }
+            .setNegativeButton("Позже", null)
+            .show()
     }
 
     /**
@@ -214,7 +266,7 @@ class RoomFragment : Fragment() {
         viewWave2.visibility = View.VISIBLE
         viewWave3.visibility = View.VISIBLE
 
-        updateSelfTalking(true)
+        memberAdapter.setSelfTalking(true)
     }
 
     /**
@@ -232,41 +284,34 @@ class RoomFragment : Fragment() {
         viewWave2.visibility = View.GONE
         viewWave3.visibility = View.GONE
 
-        updateSelfTalking(false)
+        memberAdapter.setSelfTalking(false)
     }
 
     /**
-     * Обновляет talking-состояние локального участника в моковом списке.
+     * Адаптер списка сообщений с разными layout для своих и чужих сообщений.
      */
-    private fun updateSelfTalking(talking: Boolean) {
-        val selfIndex = members.indexOfFirst { it.isMe }
-        if (selfIndex != -1) {
-            val updated = members[selfIndex].copy(isTalking = talking)
-            members[selfIndex] = updated
-            memberAdapter.notifyItemChanged(selfIndex)
-        }
-    }
-
-    /**
-     * Адаптер мокового списка сообщений с разными layout для своих, чужих и системных сообщений.
-     */
-    private class MessageAdapter(private val items: List<Message>) :
+    private class MessageAdapter :
         RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+        private val items = mutableListOf<ChatMessageUi>()
 
-        private val TYPE_SYSTEM = 0
         private val TYPE_ME = 1
         private val TYPE_OTHER = 2
+
+        /**
+         * Заменяет список сообщений и перерисовывает RecyclerView.
+         */
+        fun submitItems(newItems: List<ChatMessageUi>) {
+            items.clear()
+            items.addAll(newItems)
+            notifyDataSetChanged()
+        }
 
         /**
          * Выбирает тип карточки сообщения.
          */
         override fun getItemViewType(position: Int): Int {
             val item = items[position]
-            return when {
-                item.isSystem -> TYPE_SYSTEM
-                item.isMe -> TYPE_ME
-                else -> TYPE_OTHER
-            }
+            return if (item.isOwn) TYPE_ME else TYPE_OTHER
         }
 
         /**
@@ -275,10 +320,6 @@ class RoomFragment : Fragment() {
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
             val inflater = LayoutInflater.from(parent.context)
             return when (viewType) {
-                TYPE_SYSTEM -> {
-                    val view = inflater.inflate(R.layout.item_system_message, parent, false)
-                    SystemViewHolder(view)
-                }
                 TYPE_ME -> {
                     val view = inflater.inflate(R.layout.item_message_me, parent, false)
                     MessageViewHolder(view)
@@ -295,26 +336,17 @@ class RoomFragment : Fragment() {
          */
         override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
             val item = items[position]
-            if (holder is SystemViewHolder) {
-                holder.tvText.text = item.text
-            } else if (holder is MessageViewHolder) {
+            if (holder is MessageViewHolder) {
                 holder.tvSender.text = item.senderName
-                holder.tvTime.text = item.timestamp
+                holder.tvTime.text = item.timeText
                 holder.tvText.text = item.text
             }
         }
 
         /**
-         * Возвращает количество сообщений в моковом списке.
+         * Возвращает количество сообщений в текущей комнате.
          */
         override fun getItemCount(): Int = items.size
-
-        /**
-         * ViewHolder системного сообщения.
-         */
-        class SystemViewHolder(view: View) : RecyclerView.ViewHolder(view) {
-            val tvText: TextView = view.findViewById(R.id.tv_system_text)
-        }
 
         /**
          * ViewHolder обычного сообщения.
@@ -327,10 +359,12 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Адаптер горизонтального мокового списка участников.
+     * Адаптер горизонтального списка участников.
      */
-    private class MemberAdapter(private val items: List<Member>) :
+    private class MemberAdapter :
         RecyclerView.Adapter<MemberAdapter.ViewHolder>() {
+        private val items = mutableListOf<MemberUi>()
+        private var selfTalking = false
 
         /**
          * ViewHolder участника комнаты.
@@ -340,6 +374,26 @@ class RoomFragment : Fragment() {
             val tvStatus: TextView = view.findViewById(R.id.tv_member_status)
             val viewIndicator: View = view.findViewById(R.id.view_talking_indicator)
             val ivMuted: View = view.findViewById(R.id.iv_muted_icon)
+        }
+
+        /**
+         * Заменяет список участников и перерисовывает RecyclerView.
+         */
+        fun submitItems(newItems: List<MemberUi>) {
+            items.clear()
+            items.addAll(newItems)
+            notifyDataSetChanged()
+        }
+
+        /**
+         * Локально подсвечивает себя говорящим при удержании PTT-кнопки.
+         */
+        fun setSelfTalking(talking: Boolean) {
+            selfTalking = talking
+            val selfIndex = items.indexOfFirst { it.isSelf }
+            if (selfIndex != -1) {
+                notifyItemChanged(selfIndex)
+            }
         }
 
         /**
@@ -357,29 +411,22 @@ class RoomFragment : Fragment() {
             val member = items[position]
             holder.tvName.text = member.name
 
-            val subtitle = when {
-                member.isMe && member.role == "HOST" -> "Вы • Хост"
-                member.isMe -> "Вы"
-                member.role == "HOST" -> "Хост"
-                else -> "Участник"
-            }
+            val subtitle = if (member.isSelf) "Вы" else "Участник"
             holder.tvStatus.text = subtitle
 
-            if (member.isTalking) {
+            if (member.isSelf && selfTalking) {
                 holder.viewIndicator.setBackgroundResource(R.drawable.bg_dot_talking)
                 holder.viewIndicator.visibility = View.VISIBLE
-            } else if (member.isMuted) {
-                holder.viewIndicator.visibility = View.GONE
             } else {
                 holder.viewIndicator.setBackgroundResource(R.drawable.bg_dot_idle)
                 holder.viewIndicator.visibility = View.VISIBLE
             }
 
-            holder.ivMuted.visibility = if (member.isMuted) View.VISIBLE else View.GONE
+            holder.ivMuted.visibility = View.GONE
         }
 
         /**
-         * Возвращает количество участников в моковом списке.
+         * Возвращает количество участников в текущей комнате.
          */
         override fun getItemCount(): Int = items.size
     }

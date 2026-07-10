@@ -1,6 +1,5 @@
 package com.yellastro.btration
 
-import android.content.Context
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
@@ -9,16 +8,28 @@ import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
+import androidx.core.widget.doAfterTextChanged
 import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import com.yellastro.btration.ui.profile.ProfileUiState
+import com.yellastro.btration.ui.profile.ProfileViewModel
+import kotlinx.coroutines.launch
 
 /**
- * Моковый экран первичной настройки имени пользователя.
+ * Экран первичной настройки имени пользователя через ProfileViewModel.
  */
 class ProfileSetupFragment : Fragment() {
+    private val viewModel: ProfileViewModel by viewModels {
+        (requireActivity().application as BtRationApplication).appContainer.profileViewModelFactory()
+    }
 
     private lateinit var etNickname: EditText
     private lateinit var btnContinue: Button
     private lateinit var tvError: TextView
+    private var openedLobby = false
 
     /**
      * Создает XML-разметку экрана профиля.
@@ -41,9 +52,12 @@ class ProfileSetupFragment : Fragment() {
         btnContinue = view.findViewById(R.id.btn_continue)
         tvError = view.findViewById(R.id.tv_error)
 
+        etNickname.doAfterTextChanged { editable ->
+            viewModel.onNameChanged(editable?.toString().orEmpty())
+        }
         etNickname.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_DONE) {
-                handleContinue()
+                viewModel.onContinueClicked()
                 true
             } else {
                 false
@@ -51,32 +65,37 @@ class ProfileSetupFragment : Fragment() {
         }
 
         btnContinue.setOnClickListener {
-            handleContinue()
+            viewModel.onContinueClicked()
+        }
+
+        collectUiState()
+    }
+
+    /**
+     * Подписывается на состояние формы профиля.
+     */
+    private fun collectUiState() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.uiState.collect(::renderState)
+            }
         }
     }
 
     /**
-     * Валидирует имя, сохраняет его локально и открывает лобби.
+     * Отрисовывает состояние формы и открывает лобби после успешного сохранения.
      */
-    private fun handleContinue() {
-        val nickname = etNickname.text.toString().trim()
-        if (nickname.isEmpty()) {
-            tvError.text = "Имя не может быть пустым"
-            tvError.visibility = View.VISIBLE
-            return
+    private fun renderState(state: ProfileUiState) {
+        if (etNickname.text.toString() != state.name) {
+            etNickname.setText(state.name)
+            etNickname.setSelection(state.name.length)
         }
-
-        if (nickname.length > 18) {
-            tvError.text = "Имя слишком длинное (макс. 18 символов)"
-            tvError.visibility = View.VISIBLE
-            return
+        btnContinue.isEnabled = state.canContinue
+        tvError.text = state.errorMessage.orEmpty()
+        tvError.visibility = if (state.errorMessage == null) View.GONE else View.VISIBLE
+        if (state.isCompleted && !openedLobby) {
+            openedLobby = true
+            (activity as? MainActivity)?.navigateTo(LobbyFragment())
         }
-
-        tvError.visibility = View.GONE
-
-        val sharedPrefs = requireActivity().getSharedPreferences("walkie_talkie_prefs", Context.MODE_PRIVATE)
-        sharedPrefs.edit().putString("self_name", nickname).apply()
-
-        (activity as? MainActivity)?.navigateTo(LobbyFragment())
     }
 }

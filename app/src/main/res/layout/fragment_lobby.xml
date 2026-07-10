@@ -4,7 +4,7 @@
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#090A0C"
+    android:background="@color/hacker_black"
     android:padding="20dp">
 
     <!-- Top welcome bar -->
@@ -52,6 +52,23 @@
 
     </LinearLayout>
 
+    <TextView
+        android:id="@+id/tv_lobby_error"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:background="#331F2937"
+        android:paddingHorizontal="10dp"
+        android:paddingVertical="8dp"
+        android:textColor="#F43F5E"
+        android:textSize="12sp"
+        android:visibility="gone"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/layout_welcome_header"
+        tools:text="Нет Nearby permissions"
+        tools:visibility="visible" />
+
     <!-- Main Active Rooms List Card -->
     <LinearLayout
         android:id="@+id/layout_rooms_container"
@@ -62,7 +79,7 @@
         android:background="@drawable/bg_card_border_styled"
         android:orientation="vertical"
         android:padding="16dp"
-        app:layout_constraintTop_toBottomOf="@id/layout_welcome_header"
+        app:layout_constraintTop_toBottomOf="@id/tv_lobby_error"
         app:layout_constraintBottom_toTopOf="@id/btn_create_room"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
@@ -94,7 +111,7 @@
         android:layout_marginBottom="16dp"
         android:background="@drawable/bg_btn_green"
         android:text="Создать новый канал (+)"
-        android:textColor="#090A0C"
+        android:textColor="@color/hacker_black"
         android:textSize="14sp"
         android:textStyle="bold"
         app:layout_constraintBottom_toBottomOf="parent"

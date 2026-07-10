@@ -93,6 +93,20 @@
             android:orientation="horizontal"
             tools:listitem="@layout/item_member" />
 
+        <TextView
+            android:id="@+id/tv_room_error"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:background="#331F2937"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="6dp"
+            android:textColor="#F43F5E"
+            android:textSize="11sp"
+            android:visibility="gone"
+            tools:text="Не удалось запустить комнату"
+            tools:visibility="visible" />
+
     </LinearLayout>
 
     <!-- Message Board area -->
@@ -211,6 +225,7 @@
             android:layout_weight="1"
             android:background="@drawable/bg_input_styled"
             android:hint="Текстовое сообщение..."
+            android:imeOptions="actionSend"
             android:textColorHint="#4B5261"
             android:textColor="#FFFFFF"
             android:paddingHorizontal="16dp"
