@@ -46,7 +46,7 @@ Host:
 - рассылает сообщение остальным участникам;
 - при закрытии комнаты рассылает `ROOM_CLOSED`.
 - при локальном PTT отправляет voice stream всем client-участникам;
-- при входящем voice stream помечает участника говорящим и запускает воспроизведение.
+- при входящих Opus voice frames помечает участника говорящим, запускает локальное декодирование/воспроизведение и ретранслирует сжатые frames другим client-участникам без decode/re-encode.
 
 ## Client MVP
 
@@ -63,13 +63,18 @@ Client:
 - сообщения от host-а добавляет в чат;
 - по `ROOM_CLOSED` сбрасывает сессию в `Idle`.
 - при локальном PTT отправляет voice stream host-у;
-- при входящем voice stream от известного участника помечает его говорящим и запускает воспроизведение.
+- при входящих Opus voice frames от host-а помечает исходного участника говорящим и запускает декодирование/воспроизведение.
+
+## Reconnect
+
+- `STATUS_ENDPOINT_UNKNOWN` считается recoverable stale endpoint: runtime удаляет комнату из `availableRooms`, запускает clean discovery и при повторном `EndpointFound` автоматически повторяет connection.
+- Если client внезапно теряет host-а не через `ROOM_CLOSED`, runtime не сбрасывает комнату в `Idle`, а переходит в `Joining` по сохраненной advertised-комнате и пробует переподключиться.
 
 ## PTT-индикация
 
 - `RoomRuntime.startTalking()` добавляет локальный `PeerId` в `talkingPeerIds`, только если `VoiceRuntime` реально начал передачу.
 - `RoomRuntime.stopTalking()` убирает локальный `PeerId` из `talkingPeerIds`.
-- При `NearbyEvent.StreamReceived` runtime добавляет `peerId` отправителя в `talkingPeerIds`, передает stream в `VoiceRuntime.playIncoming(...)` и снимает индикатор через callback после окончания воспроизведения.
+- При `NearbyEvent.VoiceFrameReceived` runtime добавляет `originPeerId` отправителя в `talkingPeerIds`, передает Opus frame в `VoiceRuntime.playIncomingFrame(...)` и снимает индикатор через callback после final-frame/EOF.
 - `resetSession()`, `setError()`, disconnect и `MEMBER_LEFT` очищают соответствующие talking-состояния.
 
 ## PacketId / TTL
@@ -85,4 +90,4 @@ Client:
 ## Ограничения текущего слоя
 
 - Нет mesh relay, только задел через `packetId` и `ttl`.
-- Voice MVP пока использует Nearby STREAM и PCM16 без кодека/джиттер-буфера.
+- Voice MVP использует Nearby BYTES frames и Opus без отдельного jitter-buffer.

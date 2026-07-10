@@ -13,7 +13,7 @@ android {
 
     defaultConfig {
         applicationId = "com.yellastro.btration"
-        minSdk = 24
+        minSdk = 26
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
@@ -47,6 +47,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.ktx)
     implementation(libs.androidx.recyclerview)
     implementation(libs.google.material)
+    implementation(libs.kopus)
 }
 
 tasks.withType<KotlinCompile>().configureEach {

@@ -45,6 +45,7 @@ class RoomRuntime(
 
     private val roomEndpoints = mutableMapOf<RoomId, String>()
     private val endpointRooms = mutableMapOf<String, RoomId>()
+    private val realRoomToAdvertisedRoom = mutableMapOf<RoomId, RoomInfo>()
     private val seenPacketIds = mutableSetOf<WirePacketId>()
     private var roomIdsSeenInDiscoveryCycle: MutableSet<RoomId>? = null
     private val discoveryCycleMutex = Mutex()
@@ -383,7 +384,9 @@ class RoomRuntime(
      * Обрабатывает события NearbyTransport и маршрутизирует их в доменную логику.
      */
     private fun handleNearbyEvent(event: NearbyEvent) {
-        Log.i(TAG, "[handleNearbyEvent] Получено событие NearbyEvent type=${event.javaClass.simpleName} currentState=${_state.value.javaClass.simpleName}")
+        if (event !is NearbyEvent.VoiceFrameReceived && event !is NearbyEvent.PayloadTransferUpdated) {
+            Log.i(TAG, "[handleNearbyEvent] Получено событие NearbyEvent type=${event.javaClass.simpleName} currentState=${_state.value.javaClass.simpleName}")
+        }
         when (event) {
             is NearbyEvent.EndpointFound -> handleEndpointFound(event)
             is NearbyEvent.EndpointLost -> handleEndpointLost(event)
@@ -393,6 +396,7 @@ class RoomRuntime(
             is NearbyEvent.Disconnected -> handleDisconnected(event)
             is NearbyEvent.PacketReceived -> handlePacketReceived(event)
             is NearbyEvent.StreamReceived -> handleStreamReceived(event)
+            is NearbyEvent.VoiceFrameReceived -> handleVoiceFrameReceived(event)
             is NearbyEvent.AdvertisingFailed -> setError(
                 message = "Не удалось запустить комнату: ${event.cause.message.orEmpty()}",
                 action = actionFor(event.cause),
@@ -406,6 +410,7 @@ class RoomRuntime(
             is NearbyEvent.PayloadDecodeFailed -> setError("Не удалось прочитать пакет: ${event.cause.message.orEmpty()}")
             is NearbyEvent.SendFailed -> setError("Не удалось отправить пакет: ${event.cause.message.orEmpty()}")
             is NearbyEvent.StreamSendFailed -> setError("Не удалось отправить голос: ${event.cause.message.orEmpty()}")
+            is NearbyEvent.VoiceFrameSendFailed -> Log.w(TAG, "[handleNearbyEvent] Voice frame не отправлен, не роняем комнату: ${event.cause.message}", event.cause)
             is NearbyEvent.ConnectionInitiated,
             is NearbyEvent.PayloadTransferUpdated,
             is NearbyEvent.UnsupportedPayloadReceived,
@@ -433,6 +438,30 @@ class RoomRuntime(
         voiceRuntime.playIncoming(
             directPeerId = peerId,
             inputStream = event.inputStream,
+            resolveRelayTargets = ::resolveVoiceRelayTargets,
+            onStarted = ::addTalkingPeer,
+            onFinished = ::removeTalkingPeer,
+        )
+    }
+
+    /**
+     * Передает входящий voice frame в VoiceRuntime после проверки прямого Nearby-соседа.
+     */
+    private fun handleVoiceFrameReceived(event: NearbyEvent.VoiceFrameReceived) {
+        val peerId = event.peerId
+        if (peerId == null) {
+            Log.w(TAG, "[handleVoiceFrameReceived] Voice frame без известного peerId endpointId=${event.endpointId}")
+            return
+        }
+
+        if (_state.value !is RoomRuntimeState.Hosting && _state.value !is RoomRuntimeState.Client) {
+            Log.w(TAG, "[handleVoiceFrameReceived] Voice frame получен вне активной комнаты currentState=${_state.value.javaClass.simpleName}")
+            return
+        }
+
+        voiceRuntime.playIncomingFrame(
+            directPeerId = peerId,
+            frame = event.frame,
             resolveRelayTargets = ::resolveVoiceRelayTargets,
             onStarted = ::addTalkingPeer,
             onFinished = ::removeTalkingPeer,
@@ -617,6 +646,7 @@ class RoomRuntime(
         connectionRecoveryAttemptCount += 1
         recoveringRoomId = currentState.room.roomId
         recoveryReconnectRequested = false
+        removeAvailableRoom(currentState.room.roomId, reason = "connection_recovery")
         roomEndpoints.remove(currentState.room.roomId)
         endpointRooms.remove(event.endpointId)
         connectionRecoveryJob?.cancel()
@@ -657,8 +687,8 @@ class RoomRuntime(
 
             is RoomRuntimeState.Client -> {
                 if (peerId == currentState.room.host.peerId) {
-                    Log.i(TAG, "[handleDisconnected] Отключился host, сбрасываем client-сессию")
-                    resetSession()
+                    Log.i(TAG, "[handleDisconnected] Отключился host, запускаем переподключение client-сессии")
+                    beginClientReconnectAfterHostDisconnect(currentState)
                 }
             }
 
@@ -667,6 +697,33 @@ class RoomRuntime(
             is RoomRuntimeState.Joining,
             is RoomRuntimeState.Error,
             -> Unit
+        }
+    }
+
+    /**
+     * Переводит client обратно в Joining и запускает clean discovery той же advertised-комнаты после обрыва host-а.
+     */
+    private fun beginClientReconnectAfterHostDisconnect(currentState: RoomRuntimeState.Client) {
+        clearConnectionRecovery()
+        voiceRuntime.stopAll()
+        _talkingPeerIds.value = emptySet()
+        val reconnectRoom = realRoomToAdvertisedRoom[currentState.room.roomId] ?: currentState.room
+        val oldEndpointId = roomEndpoints.remove(currentState.room.roomId)
+        if (oldEndpointId != null) {
+            endpointRooms.remove(oldEndpointId)
+        }
+        _state.value = RoomRuntimeState.Joining(reconnectRoom)
+        recoveringRoomId = reconnectRoom.roomId
+        recoveryReconnectRequested = false
+        connectionRecoveryAttemptCount = 0
+        nearbyTransport.stopAllEndpointsAndClearState(reason = "client_host_disconnect_reconnect")
+        connectionRecoveryJob = externalScope.launch {
+            Log.i(TAG, "[beginClientReconnectAfterHostDisconnect] Запускаем discovery для переподключения roomId=${reconnectRoom.roomId.value}")
+            nearbyTransport.startDiscovery()
+            delay(CLIENT_RECONNECT_DISCOVERY_TIMEOUT_MILLIS)
+            if (_state.value is RoomRuntimeState.Joining && recoveringRoomId == reconnectRoom.roomId && !recoveryReconnectRequested) {
+                setError("Не удалось переподключиться к комнате")
+            }
         }
     }
 
@@ -771,6 +828,7 @@ class RoomRuntime(
         val endpointId = roomEndpoints.remove(advertisedRoom.roomId) ?: return
         endpointRooms[endpointId] = realRoom.roomId
         roomEndpoints[realRoom.roomId] = endpointId
+        realRoomToAdvertisedRoom[realRoom.roomId] = advertisedRoom
         _availableRooms.value = _availableRooms.value.filterNot { roomInfo -> roomInfo.roomId == advertisedRoom.roomId }
         Log.i(
             TAG,
@@ -1029,6 +1087,15 @@ class RoomRuntime(
     }
 
     /**
+     * Удаляет найденную комнату и связанные endpoint mapping по причине stale/recovery.
+     */
+    private fun removeAvailableRoom(roomId: RoomId, reason: String) {
+        roomEndpoints.remove(roomId)?.let { endpointId -> endpointRooms.remove(endpointId) }
+        _availableRooms.value = _availableRooms.value.filterNot { roomInfo -> roomInfo.roomId == roomId }
+        Log.i(TAG, "[removeAvailableRoom] Комната удалена из availableRooms roomId=${roomId.value} reason=$reason availableCount=${_availableRooms.value.size}")
+    }
+
+    /**
      * Создает wire-пакет с packetId, ttl и временем отправки.
      */
     private fun packet(
@@ -1067,6 +1134,7 @@ class RoomRuntime(
         _messages.value = emptyList()
         _talkingPeerIds.value = emptySet()
         nearbyTransport.stopAllEndpointsAndClearState(reason = "runtime_reset_session")
+        realRoomToAdvertisedRoom.clear()
         Log.i(TAG, "[resetSession] Runtime переведен в Idle")
     }
 
@@ -1090,6 +1158,7 @@ class RoomRuntime(
         voiceRuntime.stopAll()
         _talkingPeerIds.value = emptySet()
         nearbyTransport.stopAllEndpointsAndClearState(reason = "runtime_error")
+        realRoomToAdvertisedRoom.clear()
     }
 
     /**
@@ -1123,8 +1192,9 @@ class RoomRuntime(
     private companion object {
         private const val TAG = "RoomRuntime"
         private const val DEFAULT_PACKET_TTL = 1
-        private const val MAX_CONNECTION_RECOVERY_ATTEMPTS = 1
+        private const val MAX_CONNECTION_RECOVERY_ATTEMPTS = 3
         private const val CONNECTION_RECOVERY_COOLDOWN_MILLIS = 750L
         private const val CONNECTION_RECOVERY_DISCOVERY_TIMEOUT_MILLIS = 15_000L
+        private const val CLIENT_RECONNECT_DISCOVERY_TIMEOUT_MILLIS = 20_000L
     }
 }

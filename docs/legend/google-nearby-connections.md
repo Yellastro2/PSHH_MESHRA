@@ -19,12 +19,22 @@
 - Для будущего mesh/relay в `WirePacket` уже есть поля `packetId` и `ttl`, но Nearby-слой пока не делает dedup и relay.
 - При старте приложения, перед новой рекламой и при сбросе runtime вызывается полный cleanup Nearby: `stopDiscovery()`, `stopAdvertising()`, `stopAllEndpoints()` и очистка локального registry.
 
-## STREAM payload для MVP-голоса
+## BYTES payload для MVP-голоса
+
+- Актуальный PTT-голос отправляется короткими `Payload.fromBytes(...)` фреймами формата `BTVO`.
+- Один фрейм несет `originPeerId`, `sequence`, признак `isFinal` и Opus packet примерно на 40 ms речи.
+- На говорящем устройстве `AudioRecord` дает PCM16 mono 16 kHz, затем `OpusVoiceEncoder` кодирует его в Opus.
+- На слушающем устройстве `OpusVoiceDecoder` декодирует Opus обратно в PCM16 перед `PcmVoicePlayer` / `AudioTrack`.
+- Host при получении frame проверяет, что `originPeerId == directPeerId`, ретранслирует сжатый Opus-frame остальным участникам без decode/re-encode, а для собственного динамика декодирует отдельной локальной веткой.
+- Client принимает voice frame только от host endpoint-а и только если `originPeerId` есть в списке участников.
+- Ошибка отправки отдельного voice frame логируется, но не переводит комнату в Error: голос может потерять фрейм, а чат и сессия должны жить дальше.
+
+## STREAM payload для старого MVP-голоса
 
 - Голос MVP отправляется через `Payload.fromStream(...)` как PCM16 mono 16 kHz.
 - На Nothing Phone 2a в тесте `Payload.fromStream(...)` впервые прочитал исходящий stream примерно через 1 секунду после `sendPayload` и запросил сразу `25600` байт, то есть около 800 ms PCM-аудио.
 - Чтобы проверить и уменьшить стартовую задержку, `NearbyTransport` оборачивает исходящий stream и ограничивает один `read(...)` до 320 байт, то есть около 10 ms PCM-аудио.
-- Если после этого receiver всё равно получает звук с большой стартовой задержкой, следующий практичный путь для MVP — уйти от `STREAM` к маленьким `Payload.fromBytes(...)` PCM-фреймам.
+- Этот режим оставлен в коде как запасной путь, но PTT переключен на `BYTES` frames после падений `WIFI_DIRECT SEND_PAYLOAD_FAILED SOCKET_CLOSED` на длинных stream payload.
 
 ## Permissions
 

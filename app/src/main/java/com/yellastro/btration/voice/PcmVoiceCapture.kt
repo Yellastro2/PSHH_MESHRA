@@ -16,7 +16,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Захватывает микрофон в PCM16 mono из voice communication источника короткими 20 ms порциями для Nearby STREAM payload.
+ * Захватывает микрофон в PCM16 mono из voice communication источника порциями из PcmVoiceConfig для STREAM или BYTES voice frames.
  */
 class PcmVoiceCapture(
     private val externalScope: CoroutineScope,
@@ -92,8 +92,74 @@ class PcmVoiceCapture(
             Log.i(TAG, "[start] Запись микрофона остановлена")
         }
 
-        activeCapture = ActiveCapture(audioRecord, outputStream, job)
+        activeCapture = ActiveCapture(job) {
+            closeAudioRecord(audioRecord)
+            runCatching { outputStream.close() }
+        }
         return inputStream
+    }
+
+    /**
+     * Запускает запись микрофона и отдает каждый PCM-фрейм в callback для Nearby BYTES payload.
+     */
+    @SuppressLint("MissingPermission")
+    fun startFrames(onFrame: (ByteArray) -> Unit) {
+        stop()
+        val minBufferSize = AudioRecord.getMinBufferSize(
+            PcmVoiceConfig.SAMPLE_RATE_HZ,
+            AudioFormat.CHANNEL_IN_MONO,
+            PcmVoiceConfig.AUDIO_FORMAT,
+        )
+        val readChunkBytes = PcmVoiceConfig.FRAME_BYTES * READ_CHUNK_FRAME_COUNT
+        val audioRecordBufferSize = maxOf(minBufferSize, readChunkBytes)
+        val audioRecord = AudioRecord.Builder()
+            .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setSampleRate(PcmVoiceConfig.SAMPLE_RATE_HZ)
+                    .setEncoding(PcmVoiceConfig.AUDIO_FORMAT)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                    .build(),
+            )
+            .setBufferSizeInBytes(audioRecordBufferSize)
+            .build()
+
+        val job = externalScope.launch(Dispatchers.IO) {
+            val buffer = ByteArray(readChunkBytes)
+            val captureStartedAtMillis = System.currentTimeMillis()
+            var firstReadLogged = false
+            runCatching {
+                audioRecord.startRecording()
+                Log.i(
+                    TAG,
+                    "[startFrames] Запись микрофона для voice frames запущена source=VOICE_COMMUNICATION audioRecordBufferBytes=$audioRecordBufferSize readChunkBytes=$readChunkBytes",
+                )
+                while (isActive) {
+                    val readBytes = audioRecord.read(buffer, 0, buffer.size)
+                    if (readBytes > 0) {
+                        if (!firstReadLogged) {
+                            firstReadLogged = true
+                            Log.i(
+                                TAG,
+                                "[startFrames] Первый read микрофона для voice frame readBytes=$readBytes elapsedMs=${System.currentTimeMillis() - captureStartedAtMillis}",
+                            )
+                        }
+                        onFrame(buffer.copyOf(readBytes))
+                    } else if (readBytes < 0) {
+                        Log.w(TAG, "[startFrames] AudioRecord вернул ошибку readBytes=$readBytes")
+                        break
+                    }
+                }
+            }.onFailure { cause ->
+                Log.w(TAG, "[startFrames] Запись voice frames оборвалась: ${cause.message}", cause)
+            }
+            closeAudioRecord(audioRecord)
+            Log.i(TAG, "[startFrames] Запись voice frames остановлена")
+        }
+
+        activeCapture = ActiveCapture(job) {
+            closeAudioRecord(audioRecord)
+        }
     }
 
     /**
@@ -113,21 +179,19 @@ class PcmVoiceCapture(
     }
 
     /**
-     * Активная запись и связанные с ней pipe-ресурсы.
+     * Активная запись и действие освобождения связанных ресурсов.
      */
     private inner class ActiveCapture(
-        private val audioRecord: AudioRecord,
-        private val outputStream: PipedOutputStream,
         private val job: Job,
+        private val closeResources: () -> Unit,
     ) : Closeable {
         /**
-         * Останавливает coroutine, закрывает write-side pipe и освобождает AudioRecord без резкого закрытия InputStream.
+         * Останавливает coroutine и освобождает ресурсы захвата.
          */
         override fun close() {
             Log.i(TAG, "[close] Останавливаем активную запись микрофона")
             job.cancel()
-            closeAudioRecord(audioRecord)
-            runCatching { outputStream.close() }
+            closeResources()
         }
     }
 

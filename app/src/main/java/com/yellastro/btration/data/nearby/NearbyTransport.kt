@@ -27,6 +27,8 @@ import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.RoomInfo
 import com.yellastro.btration.domain.model.WirePacket
 import com.yellastro.btration.domain.model.WirePacketType
+import com.yellastro.btration.voice.VoiceFrame
+import com.yellastro.btration.voice.VoiceFrameCodec
 import com.yellastro.btration.voice.VoiceStreamCodec
 import java.io.FilterInputStream
 import java.io.InputStream
@@ -36,7 +38,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 
 /**
- * Тонкая обертка над Nearby Connections с короткой рекламой комнат, прямыми endpoint-ами, cleanup, payload и voice stream.
+ * Тонкая обертка над Nearby Connections с короткой рекламой комнат, прямыми endpoint-ами, cleanup, payload, Opus voice frames и legacy voice stream.
  */
 class NearbyTransport(
     private val context: Context,
@@ -158,6 +160,11 @@ class NearbyTransport(
             return
         }
 
+        if (VoiceFrameCodec.isVoiceFrame(bytes)) {
+            handleVoiceFramePayload(endpointId, bytes)
+            return
+        }
+
         val packet = runCatching { wireCodec.decode(bytes) }
             .onFailure { cause ->
                 Log.w(TAG, "[handleBytesPayload] Не удалось декодировать payload endpointId=$endpointId bytes=${bytes.size}: ${cause.message}", cause)
@@ -172,6 +179,27 @@ class NearbyTransport(
             "[handleBytesPayload] Получен packet endpointId=$endpointId peerId=${endpointRegistry.getPeerId(endpointId)?.value} type=${packet.type} roomId=${packet.roomId?.value}",
         )
         emitEvent(NearbyEvent.PacketReceived(endpointId, endpointRegistry.getPeerId(endpointId), packet))
+    }
+
+    /**
+     * Обрабатывает bytes payload как короткий голосовой frame.
+     */
+    private fun handleVoiceFramePayload(endpointId: String, bytes: ByteArray) {
+        val frame = runCatching { VoiceFrameCodec.decode(bytes) }
+            .onFailure { cause ->
+                Log.w(TAG, "[handleVoiceFramePayload] Не удалось декодировать voice frame endpointId=$endpointId bytes=${bytes.size}: ${cause.message}", cause)
+                emitEvent(NearbyEvent.PayloadDecodeFailed(endpointId, cause))
+            }
+            .getOrNull()
+            ?: return
+        val peerId = endpointRegistry.getPeerId(endpointId)
+        if (frame.sequence == FIRST_VOICE_FRAME_SEQUENCE || frame.isFinal) {
+            Log.i(
+                TAG,
+                "[handleVoiceFramePayload] Получен voice frame endpointId=$endpointId peerId=${peerId?.value} originPeerId=${frame.originPeerId.value} sequence=${frame.sequence} encodedBytes=${frame.encodedBytes.size} final=${frame.isFinal}",
+            )
+        }
+        emitEvent(NearbyEvent.VoiceFrameReceived(endpointId, peerId, frame))
     }
 
     /**
@@ -452,6 +480,44 @@ class NearbyTransport(
     }
 
     /**
+     * Отправляет короткий голосовой frame выбранным участникам через Nearby BYTES payload.
+     */
+    fun sendVoiceFrameToPeers(peerIds: Set<PeerId>, frame: VoiceFrame) {
+        val endpointIds = peerIds
+            .mapNotNull { peerId -> endpointRegistry.getEndpointId(peerId) }
+            .distinct()
+        if (endpointIds.isEmpty()) {
+            Log.w(TAG, "[sendVoiceFrameToPeers] Нельзя отправить voice frame, endpoint-ы неизвестны peerCount=${peerIds.size} originPeerId=${frame.originPeerId.value}")
+            emitEvent(
+                NearbyEvent.VoiceFrameSendFailed(
+                    peerIds = peerIds,
+                    cause = IllegalStateException("Endpoints for voice frame are unknown"),
+                ),
+            )
+            return
+        }
+
+        val bytes = VoiceFrameCodec.encode(frame)
+        connectionsClient.sendPayload(endpointIds, Payload.fromBytes(bytes))
+            .addOnSuccessListener {
+                if (frame.sequence == FIRST_VOICE_FRAME_SEQUENCE || frame.isFinal) {
+                    Log.i(
+                        TAG,
+                        "[sendVoiceFrameToPeers] Voice frame передан Nearby originPeerId=${frame.originPeerId.value} sequence=${frame.sequence} endpointCount=${endpointIds.size} final=${frame.isFinal}",
+                    )
+                }
+            }
+            .addOnFailureListener { cause ->
+                Log.w(
+                    TAG,
+                    "[sendVoiceFrameToPeers] Не удалось отправить voice frame originPeerId=${frame.originPeerId.value} sequence=${frame.sequence} final=${frame.isFinal}: ${cause.message}",
+                    cause,
+                )
+                emitEvent(NearbyEvent.VoiceFrameSendFailed(peerIds, cause))
+            }
+    }
+
+    /**
      * Возвращает permissions, без которых discovery заведомо упадет в Nearby API.
      */
     private fun missingPermissionsForDiscovery(): List<String> {
@@ -720,6 +786,7 @@ class NearbyTransport(
         private const val DEFAULT_SERVICE_ID = "com.yellastro.btration.nearby.ROOM_V1"
         private const val EVENT_BUFFER_CAPACITY = 64
         private const val STREAM_READ_LIMIT_BYTES = 320
+        private const val FIRST_VOICE_FRAME_SEQUENCE = 0L
         private val REAL_HOST_ID_PACKET_TYPES = setOf(
             WirePacketType.JOIN_ACCEPTED,
             WirePacketType.JOIN_REJECTED,
@@ -731,6 +798,7 @@ class NearbyTransport(
         )
         private val RECOVERABLE_CONNECTION_STATUS_CODES = setOf(
             ConnectionsStatusCodes.STATUS_RADIO_ERROR,
+            ConnectionsStatusCodes.STATUS_ENDPOINT_UNKNOWN,
             ConnectionsStatusCodes.STATUS_OUT_OF_ORDER_API_CALL,
             ConnectionsStatusCodes.STATUS_ENDPOINT_IO_ERROR,
         )
