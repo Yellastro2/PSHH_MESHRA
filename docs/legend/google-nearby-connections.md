@@ -10,10 +10,17 @@
 ## Практический контракт проекта
 
 - Advertising публикует комнату через `endpointName`.
-- В `endpointName` кладётся JSON wire-пакет `ROOM_INFO`, чтобы discovery мог показать комнату без подключения.
+- В `endpointName` кладётся компактная визитка `NearbyRoomAdvertisement`, чтобы discovery мог показать комнату без подключения.
 - Nearby endpointId не считается доменным идентификатором участника. Для этого есть `NearbyEndpointRegistry`, который связывает `endpointId` с `PeerId` и `RoomId`.
 - Транспорт автоматически принимает Nearby connection, а бизнес-решение входа в комнату остаётся выше, в `RoomRuntime`, через `JOIN_ACCEPTED` / `JOIN_REJECTED`.
 - Для будущего mesh/relay в `WirePacket` уже есть поля `packetId` и `ttl`, но Nearby-слой пока не делает dedup и relay.
+
+## STREAM payload для MVP-голоса
+
+- Голос MVP отправляется через `Payload.fromStream(...)` как PCM16 mono 16 kHz.
+- На Nothing Phone 2a в тесте `Payload.fromStream(...)` впервые прочитал исходящий stream примерно через 1 секунду после `sendPayload` и запросил сразу `25600` байт, то есть около 800 ms PCM-аудио.
+- Чтобы проверить и уменьшить стартовую задержку, `NearbyTransport` оборачивает исходящий stream и ограничивает один `read(...)` до 320 байт, то есть около 10 ms PCM-аудио.
+- Если после этого receiver всё равно получает звук с большой стартовой задержкой, следующий практичный путь для MVP — уйти от `STREAM` к маленьким `Payload.fromBytes(...)` PCM-фреймам.
 
 ## Permissions
 

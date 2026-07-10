@@ -30,6 +30,11 @@ class RoomRepository(
     val messages = roomRuntime.messages
 
     /**
+     * Участники, которые сейчас передают или локально доигрывают голос.
+     */
+    val talkingPeerIds = roomRuntime.talkingPeerIds
+
+    /**
      * Возвращает PeerId локального пользователя для маппинга UI-состояний комнаты.
      */
     fun getSelfPeerId(): PeerId {
@@ -106,12 +111,13 @@ class RoomRepository(
     }
 
     /**
-     * Начинает передачу микрофона в активную комнату.
+     * Начинает передачу микрофона в активную комнату и возвращает true при реальном старте.
      */
-    suspend fun startTalking() {
+    suspend fun startTalking(): Boolean {
         Log.i(TAG, "[startTalking] Запускаем передачу голоса через RoomRepository")
-        roomRuntime.startTalking()
+        val started = roomRuntime.startTalking()
         roomServiceController.startIfNeeded(roomRuntime.state.value.needsService())
+        return started
     }
 
     /**

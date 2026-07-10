@@ -24,6 +24,7 @@ import com.yellastro.btration.data.wire.WireCodec
 import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.RoomInfo
 import com.yellastro.btration.domain.model.WirePacket
+import java.io.FilterInputStream
 import java.io.InputStream
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -155,6 +156,7 @@ class NearbyTransport(
      * Обрабатывает stream payload как входящий голосовой поток.
      */
     private fun handleStreamPayload(endpointId: String, payload: Payload) {
+        val receivedAtMillis = System.currentTimeMillis()
         val inputStream = payload.asStream()?.asInputStream()
         if (inputStream == null) {
             Log.w(TAG, "[handleStreamPayload] Stream payload без InputStream endpointId=$endpointId")
@@ -167,7 +169,7 @@ class NearbyTransport(
             return
         }
         val peerId = endpointRegistry.getPeerId(endpointId)
-        Log.i(TAG, "[handleStreamPayload] Получен голосовой stream endpointId=$endpointId peerId=${peerId?.value}")
+        Log.i(TAG, "[handleStreamPayload] Получен голосовой stream endpointId=$endpointId peerId=${peerId?.value} receivedAtMs=$receivedAtMillis")
         emitEvent(NearbyEvent.StreamReceived(endpointId, peerId, inputStream))
     }
 
@@ -349,10 +351,20 @@ class NearbyTransport(
             return
         }
 
-        Log.i(TAG, "[sendStreamToPeers] Отправляем голосовой stream endpointCount=${endpointIds.size} peerCount=${peerIds.size}")
-        connectionsClient.sendPayload(endpointIds, Payload.fromStream(inputStream))
+        val sendStartedAtMillis = System.currentTimeMillis()
+        Log.i(TAG, "[sendStreamToPeers] Вызываем sendPayload для голосового stream endpointCount=${endpointIds.size} peerCount=${peerIds.size} startedAtMs=$sendStartedAtMillis")
+        val loggingInputStream = NearbyStreamLoggingInputStream(
+            delegate = inputStream,
+            endpointCount = endpointIds.size,
+            peerCount = peerIds.size,
+            sendStartedAtMillis = sendStartedAtMillis,
+        )
+        connectionsClient.sendPayload(endpointIds, Payload.fromStream(loggingInputStream))
             .addOnSuccessListener {
-                Log.i(TAG, "[sendStreamToPeers] Голосовой stream передан Nearby endpointCount=${endpointIds.size}")
+                Log.i(
+                    TAG,
+                    "[sendStreamToPeers] Голосовой stream принят Nearby endpointCount=${endpointIds.size} elapsedMs=${System.currentTimeMillis() - sendStartedAtMillis}",
+                )
             }
             .addOnFailureListener { cause ->
                 Log.w(TAG, "[sendStreamToPeers] Не удалось отправить голосовой stream: ${cause.message}", cause)
@@ -507,9 +519,81 @@ class NearbyTransport(
         }
     }
 
+    /**
+     * Оборачивает голосовой stream, ограничивает размер одного чтения Nearby и логирует первый реальный read.
+     */
+    private class NearbyStreamLoggingInputStream(
+        delegate: InputStream,
+        private val endpointCount: Int,
+        private val peerCount: Int,
+        private val sendStartedAtMillis: Long,
+    ) : FilterInputStream(delegate) {
+        private var firstReadLogged = false
+
+        /**
+         * Читает один байт и отмечает первый успешный read со стороны Nearby.
+         */
+        override fun read(): Int {
+            val value = super.read()
+            if (value >= 0) {
+                logFirstRead(readBytes = 1)
+            } else {
+                logEndBeforeFirstRead()
+            }
+            return value
+        }
+
+        /**
+         * Читает порцию байтов и отмечает первый успешный read со стороны Nearby.
+         */
+        override fun read(buffer: ByteArray, byteOffset: Int, byteCount: Int): Int {
+            val limitedByteCount = minOf(byteCount, STREAM_READ_LIMIT_BYTES)
+            val readBytes = super.read(buffer, byteOffset, limitedByteCount)
+            if (readBytes > 0) {
+                logFirstRead(
+                    readBytes = readBytes,
+                    requestedBytes = byteCount,
+                    limitedBytes = limitedByteCount,
+                )
+            } else if (readBytes < 0) {
+                logEndBeforeFirstRead()
+            }
+            return readBytes
+        }
+
+        /**
+         * Логирует первый момент, когда Nearby забрал из stream хотя бы один байт.
+         */
+        private fun logFirstRead(readBytes: Int, requestedBytes: Int = 1, limitedBytes: Int = 1) {
+            if (firstReadLogged) {
+                return
+            }
+            firstReadLogged = true
+            Log.i(
+                TAG,
+                "[read] Nearby впервые прочитал голосовой stream readBytes=$readBytes requestedBytes=$requestedBytes limitedBytes=$limitedBytes endpointCount=$endpointCount peerCount=$peerCount elapsedMs=${System.currentTimeMillis() - sendStartedAtMillis}",
+            )
+        }
+
+        /**
+         * Логирует ситуацию, когда stream закончился до первого полезного чтения Nearby.
+         */
+        private fun logEndBeforeFirstRead() {
+            if (firstReadLogged) {
+                return
+            }
+            firstReadLogged = true
+            Log.w(
+                TAG,
+                "[read] Голосовой stream закончился до первого чтения Nearby endpointCount=$endpointCount peerCount=$peerCount elapsedMs=${System.currentTimeMillis() - sendStartedAtMillis}",
+            )
+        }
+    }
+
     private companion object {
         private const val TAG = "NearbyTransport"
         private const val DEFAULT_SERVICE_ID = "com.yellastro.btration.nearby.ROOM_V1"
         private const val EVENT_BUFFER_CAPACITY = 64
+        private const val STREAM_READ_LIMIT_BYTES = 320
     }
 }

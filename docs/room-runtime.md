@@ -18,7 +18,7 @@
 ```text
 NearbyTransport.events
   -> RoomRuntime
-  -> state / availableRooms / messages
+  -> state / availableRooms / messages / talkingPeerIds
 ```
 
 `RoomRuntime` получает `CoroutineScope` снаружи, например из application-level контейнера, и в `init` подписывается на `NearbyTransport.events`.
@@ -28,6 +28,7 @@ NearbyTransport.events
 - `state: StateFlow<RoomRuntimeState>` — текущая роль и сессия.
 - `availableRooms: StateFlow<List<RoomInfo>>` — комнаты из discovery.
 - `messages: StateFlow<List<ChatMessage>>` — чат текущей комнаты.
+- `talkingPeerIds: StateFlow<Set<PeerId>>` — участники, чей voice stream сейчас передается или локально доигрывается.
 
 ## Host MVP
 
@@ -44,6 +45,8 @@ Host:
 - добавляет сообщение себе;
 - рассылает сообщение остальным участникам;
 - при закрытии комнаты рассылает `ROOM_CLOSED`.
+- при локальном PTT отправляет voice stream всем client-участникам;
+- при входящем voice stream помечает участника говорящим и запускает воспроизведение.
 
 ## Client MVP
 
@@ -58,6 +61,15 @@ Client:
 - свои сообщения добавляет локально и отправляет host-у;
 - сообщения от host-а добавляет в чат;
 - по `ROOM_CLOSED` сбрасывает сессию в `Idle`.
+- при локальном PTT отправляет voice stream host-у;
+- при входящем voice stream от известного участника помечает его говорящим и запускает воспроизведение.
+
+## PTT-индикация
+
+- `RoomRuntime.startTalking()` добавляет локальный `PeerId` в `talkingPeerIds`, только если `VoiceRuntime` реально начал передачу.
+- `RoomRuntime.stopTalking()` убирает локальный `PeerId` из `talkingPeerIds`.
+- При `NearbyEvent.StreamReceived` runtime добавляет `peerId` отправителя в `talkingPeerIds`, передает stream в `VoiceRuntime.playIncoming(...)` и снимает индикатор через callback после окончания воспроизведения.
+- `resetSession()`, `setError()`, disconnect и `MEMBER_LEFT` очищают соответствующие talking-состояния.
 
 ## PacketId / TTL
 
@@ -71,9 +83,5 @@ Client:
 
 ## Ограничения текущего слоя
 
-- Нет Android Service.
-- Нет ViewModel.
-- Нет Repository.
-- Нет UI-связки.
-- Нет настоящего PTT-голоса.
 - Нет mesh relay, только задел через `packetId` и `ttl`.
+- Voice MVP пока использует Nearby STREAM и PCM16 без кодека/джиттер-буфера.

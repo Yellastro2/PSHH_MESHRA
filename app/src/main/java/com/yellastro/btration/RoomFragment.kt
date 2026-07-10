@@ -284,7 +284,7 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Включает визуальное состояние передачи, стартует ViewModel-команду микрофона и отмечает себя говорящим.
+     * Включает визуальное состояние передачи и стартует ViewModel-команду микрофона.
      */
     private fun startTransmission() {
         if (isTransmitting || !latestState.canTalk) return
@@ -303,11 +303,10 @@ class RoomFragment : Fragment() {
         viewWave2.visibility = View.VISIBLE
         viewWave3.visibility = View.VISIBLE
 
-        memberAdapter.setSelfTalking(true)
     }
 
     /**
-     * Выключает визуальное состояние передачи, останавливает ViewModel-команду микрофона и снимает talking-статус.
+     * Выключает визуальное состояние передачи и останавливает ViewModel-команду микрофона.
      */
     private fun stopTransmission() {
         if (!isTransmitting) return
@@ -322,7 +321,6 @@ class RoomFragment : Fragment() {
         viewWave2.visibility = View.GONE
         viewWave3.visibility = View.GONE
 
-        memberAdapter.setSelfTalking(false)
     }
 
     /**
@@ -412,7 +410,6 @@ class RoomFragment : Fragment() {
     private class MemberAdapter :
         RecyclerView.Adapter<MemberAdapter.ViewHolder>() {
         private val items = mutableListOf<MemberUi>()
-        private var selfTalking = false
 
         /**
          * ViewHolder участника комнаты.
@@ -434,17 +431,6 @@ class RoomFragment : Fragment() {
         }
 
         /**
-         * Локально подсвечивает себя говорящим при удержании PTT-кнопки.
-         */
-        fun setSelfTalking(talking: Boolean) {
-            selfTalking = talking
-            val selfIndex = items.indexOfFirst { it.isSelf }
-            if (selfIndex != -1) {
-                notifyItemChanged(selfIndex)
-            }
-        }
-
-        /**
          * Создает карточку участника из XML-разметки.
          */
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
@@ -462,7 +448,7 @@ class RoomFragment : Fragment() {
             val subtitle = if (member.isSelf) "Вы" else "Участник"
             holder.tvStatus.text = subtitle
 
-            if (member.isSelf && selfTalking) {
+            if (member.isTalking) {
                 holder.viewIndicator.setBackgroundResource(R.drawable.bg_dot_talking)
                 holder.viewIndicator.visibility = View.VISIBLE
             } else {

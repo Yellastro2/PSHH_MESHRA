@@ -28,6 +28,7 @@ data class MemberUi(
     val peerId: PeerId,
     val name: String,
     val isSelf: Boolean,
+    val isTalking: Boolean = false,
 )
 
 /**

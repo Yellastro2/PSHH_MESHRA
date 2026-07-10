@@ -35,6 +35,7 @@ class RoomRuntime(
     private val _state = MutableStateFlow<RoomRuntimeState>(RoomRuntimeState.Idle)
     private val _availableRooms = MutableStateFlow<List<RoomInfo>>(emptyList())
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
+    private val _talkingPeerIds = MutableStateFlow<Set<PeerId>>(emptySet())
 
     private val roomEndpoints = mutableMapOf<RoomId, String>()
     private val endpointRooms = mutableMapOf<String, RoomId>()
@@ -54,6 +55,11 @@ class RoomRuntime(
      * Сообщения текущей комнаты.
      */
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
+
+    /**
+     * PeerId участников, чей голосовой stream сейчас передается или доигрывается локально.
+     */
+    val talkingPeerIds: StateFlow<Set<PeerId>> = _talkingPeerIds.asStateFlow()
 
     /**
      * Возвращает PeerId локального пользователя для верхних слоев без доступа к ProfileRepository.
@@ -286,9 +292,9 @@ class RoomRuntime(
     }
 
     /**
-     * Начинает передачу микрофона в текущую комнату через voice runtime.
+     * Начинает передачу микрофона в текущую комнату через voice runtime и возвращает true при реальном старте.
      */
-    suspend fun startTalking() {
+    suspend fun startTalking(): Boolean {
         Log.i(TAG, "[startTalking] Команда начать передачу голоса currentState=${_state.value.javaClass.simpleName}")
         val selfPeerId = profileRepository.getOrCreatePeerId()
         when (val currentState = _state.value) {
@@ -297,11 +303,19 @@ class RoomRuntime(
                     .map { peer -> peer.peerId }
                     .filterNot { peerId -> peerId == selfPeerId }
                     .toSet()
-                voiceRuntime.startTalking(targetPeerIds)
+                if (voiceRuntime.startTalking(targetPeerIds)) {
+                    addTalkingPeer(selfPeerId)
+                    return true
+                }
+                return false
             }
 
             is RoomRuntimeState.Client -> {
-                voiceRuntime.startTalking(setOf(currentState.room.host.peerId))
+                if (voiceRuntime.startTalking(setOf(currentState.room.host.peerId))) {
+                    addTalkingPeer(selfPeerId)
+                    return true
+                }
+                return false
             }
 
             RoomRuntimeState.Idle,
@@ -311,6 +325,7 @@ class RoomRuntime(
             -> {
                 Log.w(TAG, "[startTalking] Передача голоса отклонена, нет активной комнаты")
                 setError("Нельзя передавать голос вне активной комнаты")
+                return false
             }
         }
     }
@@ -321,6 +336,7 @@ class RoomRuntime(
     suspend fun stopTalking() {
         Log.i(TAG, "[stopTalking] Команда остановить передачу голоса")
         voiceRuntime.stopTalking()
+        removeTalkingPeer(profileRepository.getOrCreatePeerId())
     }
 
     /**
@@ -373,7 +389,8 @@ class RoomRuntime(
                     closeInputStream(event.inputStream)
                     return
                 }
-                voiceRuntime.playIncoming(peerId, event.inputStream)
+                addTalkingPeer(peerId)
+                voiceRuntime.playIncoming(peerId, event.inputStream, ::removeTalkingPeer)
             }
 
             is RoomRuntimeState.Client -> {
@@ -382,7 +399,8 @@ class RoomRuntime(
                     closeInputStream(event.inputStream)
                     return
                 }
-                voiceRuntime.playIncoming(peerId, event.inputStream)
+                addTalkingPeer(peerId)
+                voiceRuntime.playIncoming(peerId, event.inputStream, ::removeTalkingPeer)
             }
 
             RoomRuntimeState.Idle,
@@ -462,6 +480,7 @@ class RoomRuntime(
             return
         }
         Log.i(TAG, "[handleDisconnected] Peer отключился endpointId=${event.endpointId} peerId=${peerId.value} currentState=${_state.value.javaClass.simpleName}")
+        removeTalkingPeer(peerId)
         when (val currentState = _state.value) {
             is RoomRuntimeState.Hosting -> {
                 val members = currentState.members.filterNot { it.peerId == peerId }
@@ -615,6 +634,7 @@ class RoomRuntime(
      */
     private fun handleMemberLeft(packet: WirePacket) {
         val peerId = packet.peer?.peerId ?: packet.sender?.peerId ?: return
+        removeTalkingPeer(peerId)
         when (val currentState = _state.value) {
             is RoomRuntimeState.Hosting -> {
                 if (packet.roomId != currentState.room.roomId) {
@@ -791,6 +811,28 @@ class RoomRuntime(
     }
 
     /**
+     * Добавляет участника в набор говорящих, если его voice stream активен.
+     */
+    private fun addTalkingPeer(peerId: PeerId) {
+        if (peerId in _talkingPeerIds.value) {
+            return
+        }
+        _talkingPeerIds.value = _talkingPeerIds.value + peerId
+        Log.i(TAG, "[addTalkingPeer] Участник помечен говорящим peerId=${peerId.value} talkingCount=${_talkingPeerIds.value.size}")
+    }
+
+    /**
+     * Убирает участника из набора говорящих после остановки передачи или завершения входящего stream.
+     */
+    private fun removeTalkingPeer(peerId: PeerId) {
+        if (peerId !in _talkingPeerIds.value) {
+            return
+        }
+        _talkingPeerIds.value = _talkingPeerIds.value - peerId
+        Log.i(TAG, "[removeTalkingPeer] Участник больше не говорит peerId=${peerId.value} talkingCount=${_talkingPeerIds.value.size}")
+    }
+
+    /**
      * Добавляет или заменяет найденную комнату в списке availableRooms.
      */
     private fun upsertAvailableRoom(roomInfo: RoomInfo) {
@@ -835,6 +877,7 @@ class RoomRuntime(
         voiceRuntime.stopAll()
         nearbyTransport.stopAdvertising()
         _messages.value = emptyList()
+        _talkingPeerIds.value = emptySet()
         _state.value = RoomRuntimeState.Idle
         Log.i(TAG, "[resetSession] Runtime переведен в Idle")
     }
@@ -852,6 +895,7 @@ class RoomRuntime(
     private fun setError(message: String, action: RoomRuntimeErrorAction? = null) {
         Log.w(TAG, "[setError] Runtime перешел в Error message=$message action=$action")
         voiceRuntime.stopAll()
+        _talkingPeerIds.value = emptySet()
         _state.value = RoomRuntimeState.Error(
             message = message.ifBlank { "Неизвестная ошибка" },
             action = action,

@@ -16,27 +16,30 @@ class VoiceRuntime(
     private var isTalking = false
 
     /**
-     * Начинает передачу микрофона выбранным участникам через Nearby STREAM.
+     * Начинает передачу микрофона выбранным участникам через Nearby STREAM и возвращает true при реальном старте.
      */
-    fun startTalking(targetPeerIds: Set<PeerId>) {
+    fun startTalking(targetPeerIds: Set<PeerId>): Boolean {
         if (isTalking) {
             Log.i(TAG, "[startTalking] Передача голоса уже активна")
-            return
+            return true
         }
         if (targetPeerIds.isEmpty()) {
             Log.i(TAG, "[startTalking] Некому передавать голос, участники отсутствуют")
-            return
+            return false
         }
 
+        val startedAtMillis = System.currentTimeMillis()
+        Log.i(TAG, "[startTalking] Начинаем запуск голосовой передачи targetCount=${targetPeerIds.size}")
         val inputStream = runCatching { voiceCapture.start() }
             .onFailure { cause ->
                 Log.w(TAG, "[startTalking] Не удалось запустить захват микрофона: ${cause.message}", cause)
             }
             .getOrNull()
-            ?: return
+            ?: return false
         isTalking = true
         nearbyTransport.sendStreamToPeers(targetPeerIds, inputStream)
-        Log.i(TAG, "[startTalking] Передача голоса запущена targetCount=${targetPeerIds.size}")
+        Log.i(TAG, "[startTalking] Передача голоса запущена targetCount=${targetPeerIds.size} elapsedMs=${System.currentTimeMillis() - startedAtMillis}")
+        return true
     }
 
     /**
@@ -52,11 +55,11 @@ class VoiceRuntime(
     }
 
     /**
-     * Проигрывает входящий голосовой stream от участника комнаты.
+     * Проигрывает входящий голосовой stream от участника комнаты и сообщает о завершении воспроизведения.
      */
-    fun playIncoming(peerId: PeerId, inputStream: InputStream) {
+    fun playIncoming(peerId: PeerId, inputStream: InputStream, onFinished: (PeerId) -> Unit) {
         Log.i(TAG, "[playIncoming] Запускаем входящий голосовой stream peerId=${peerId.value}")
-        voicePlayer.play(peerId, inputStream)
+        voicePlayer.play(peerId, inputStream, onFinished)
     }
 
     /**

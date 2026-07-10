@@ -32,16 +32,22 @@ class RoomViewModel(
     val uiState: StateFlow<RoomUiState> = combine(
         roomRepository.runtimeState,
         roomRepository.messages,
+        roomRepository.talkingPeerIds,
         inputText,
         isTalking,
-    ) { runtimeState, messages, input, talking ->
-        mapUiState(runtimeState, messages, input, talking)
+    ) { runtimeState: RoomRuntimeState,
+        messages: List<ChatMessage>,
+        talkingPeerIds: Set<PeerId>,
+        input: String,
+        talking: Boolean ->
+        mapUiState(runtimeState, messages, talkingPeerIds, input, talking)
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
         initialValue = mapUiState(
             runtimeState = roomRepository.runtimeState.value,
             messages = roomRepository.messages.value,
+            talkingPeerIds = roomRepository.talkingPeerIds.value,
             input = inputText.value,
             talking = isTalking.value,
         ),
@@ -94,9 +100,8 @@ class RoomViewModel(
         if (!uiState.value.canTalk || isTalking.value) {
             return
         }
-        isTalking.value = true
         viewModelScope.launch {
-            roomRepository.startTalking()
+            isTalking.value = roomRepository.startTalking()
         }
     }
 
@@ -119,6 +124,7 @@ class RoomViewModel(
     private fun mapUiState(
         runtimeState: RoomRuntimeState,
         messages: List<ChatMessage>,
+        talkingPeerIds: Set<PeerId>,
         input: String,
         talking: Boolean,
     ): RoomUiState {
@@ -131,7 +137,7 @@ class RoomViewModel(
             is RoomRuntimeState.Hosting -> RoomUiState(
                 roomName = runtimeState.room.name,
                 isHost = true,
-                members = runtimeState.members.map { mapMember(it, selfPeerId) },
+                members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, talking) },
                 messages = messages.map { mapMessage(it, selfPeerId) },
                 inputText = input,
                 canSend = canSend,
@@ -144,7 +150,7 @@ class RoomViewModel(
             is RoomRuntimeState.Client -> RoomUiState(
                 roomName = runtimeState.room.name,
                 isHost = false,
-                members = runtimeState.members.map { mapMember(it, selfPeerId) },
+                members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, talking) },
                 messages = messages.map { mapMessage(it, selfPeerId) },
                 inputText = input,
                 canSend = canSend,
@@ -185,13 +191,19 @@ class RoomViewModel(
     }
 
     /**
-     * Преобразует участника в UI-модель с признаком локального пользователя.
+     * Преобразует участника в UI-модель с признаком локального пользователя и активности voice stream.
      */
-    private fun mapMember(peer: Peer, selfPeerId: PeerId): MemberUi {
+    private fun mapMember(
+        peer: Peer,
+        selfPeerId: PeerId,
+        talkingPeerIds: Set<PeerId>,
+        selfTalking: Boolean,
+    ): MemberUi {
         return MemberUi(
             peerId = peer.peerId,
             name = peer.name,
             isSelf = peer.peerId == selfPeerId,
+            isTalking = peer.peerId in talkingPeerIds || (peer.peerId == selfPeerId && selfTalking),
         )
     }
 

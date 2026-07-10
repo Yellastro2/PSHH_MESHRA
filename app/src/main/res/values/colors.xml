@@ -8,5 +8,6 @@
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
     <color name="accent_green">#059669</color>
+    <color name="second_accent_green">#10B981</color>
     <color name="hacker_black">#090A0C</color>
 </resources>
