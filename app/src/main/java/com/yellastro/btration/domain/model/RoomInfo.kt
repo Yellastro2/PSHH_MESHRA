@@ -3,7 +3,7 @@ package com.yellastro.btration.domain.model
 import kotlinx.serialization.Serializable
 
 /**
- * Публичное описание комнаты, которое можно показать в лобби до входа.
+ * Публичное описание комнаты и ее capabilities, которое можно показать в лобби и передать участникам.
  */
 @Serializable
 data class RoomInfo(
@@ -11,4 +11,5 @@ data class RoomInfo(
     val name: String,
     val host: Peer,
     val createdAtMillis: Long,
+    val isDirectAudioReady: Boolean = false,
 )

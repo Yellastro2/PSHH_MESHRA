@@ -56,7 +56,6 @@ class WifiDirectVoiceTransport(
     private var sessionRole: VoiceTransportSessionRole? = null
     private var localDeviceAddress: String? = null
     private var hostDeviceAddress: String? = null
-    private var lastDiscoveredHostDeviceAddress: String? = null
     private var expectedHostPeerId: PeerId? = null
     private var publishedServicePeerId: PeerId? = null
     private var publishingServicePeerId: PeerId? = null
@@ -66,10 +65,8 @@ class WifiDirectVoiceTransport(
     private var receiveJob: Job? = null
     private var helloJob: Job? = null
     private var connectRetryJob: Job? = null
-    private var peerDiscoveryRetryJob: Job? = null
     private var connectAttemptCount = 0
     private var pendingConnectDeviceAddress: String? = null
-    private var peerDiscoveryTargetDeviceAddress: String? = null
     private var connectCooldownUntilMillis = 0L
     private var cachedLocalControlInfo: VoiceTransportControlInfo? = null
 
@@ -101,7 +98,7 @@ class WifiDirectVoiceTransport(
         when (role) {
             VoiceTransportSessionRole.HOST -> {
                 publishHostServiceIfReady()
-                startHostGroup()
+
             }
             VoiceTransportSessionRole.CLIENT -> startClientDiscovery()
         }
@@ -117,11 +114,8 @@ class WifiDirectVoiceTransport(
         helloJob = null
         connectRetryJob?.cancel()
         connectRetryJob = null
-        peerDiscoveryRetryJob?.cancel()
-        peerDiscoveryRetryJob = null
         connectAttemptCount = 0
         pendingConnectDeviceAddress = null
-        peerDiscoveryTargetDeviceAddress = null
         connectCooldownUntilMillis = 0L
         receiveJob?.cancel()
         receiveJob = null
@@ -130,7 +124,6 @@ class WifiDirectVoiceTransport(
         peerUdpEndpoints.clear()
         groupOwnerAddress = null
         hostDeviceAddress = null
-        lastDiscoveredHostDeviceAddress = null
         expectedHostPeerId = null
         cachedLocalControlInfo = null
         publishedServicePeerId = null
@@ -198,7 +191,6 @@ class WifiDirectVoiceTransport(
             addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
             addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION)
             addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
-            addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             applicationContext.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -215,13 +207,13 @@ class WifiDirectVoiceTransport(
     private fun configureServiceDiscoveryListeners() {
         wifiP2pManager.setDnsSdResponseListeners(
             channel,
-            WifiP2pManager.DnsSdServiceResponseListener { instanceName, registrationType, srcDevice ->
+            { instanceName, registrationType, srcDevice ->
                 Log.i(
                     TAG,
                     "[configureServiceDiscoveryListeners] Найден Wi-Fi Direct service instance=$instanceName type=$registrationType device=${srcDevice.deviceName}",
                 )
             },
-            WifiP2pManager.DnsSdTxtRecordListener { fullDomain, record, srcDevice ->
+            { fullDomain, record, srcDevice ->
                 handleDnsSdTxtRecord(fullDomain, record, srcDevice)
             },
         )
@@ -378,7 +370,25 @@ class WifiDirectVoiceTransport(
      */
     @SuppressLint("MissingPermission")
     private fun createGroupAfterCleanup() {
-        wifiP2pManager.createGroup(channel, actionListener("createGroup"))
+        wifiP2pManager.createGroup(
+            channel,
+            object : WifiP2pManager.ActionListener {
+                /**
+                 * Сообщает runtime, что host Wi-Fi Direct group создана и direct-аудио можно анонсировать гостям.
+                 */
+                override fun onSuccess() {
+                    Log.i(TAG, "[createGroupAfterCleanup] Wi-Fi Direct group создана, direct-аудио готово")
+                    emitEvent(VoiceTransportEvent.DirectAudioReady)
+                }
+
+                /**
+                 * Логирует отказ создания Wi-Fi Direct group на host-е.
+                 */
+                override fun onFailure(reason: Int) {
+                    Log.w(TAG, "[createGroupAfterCleanup] Wi-Fi Direct group не создана reason=$reason")
+                }
+            },
+        )
         Log.i(TAG, "[createGroupAfterCleanup] Запрошено создание Wi-Fi Direct group")
     }
 
@@ -389,9 +399,11 @@ class WifiDirectVoiceTransport(
     private fun publishHostServiceIfReady() {
         val peerId = selfPeerId ?: return
         if (sessionRole != VoiceTransportSessionRole.HOST) {
+            Log.w(TAG, "[publishHostServiceIfReady] sessionRole != VoiceTransportSessionRole.HOST")
             return
         }
         if (publishedServicePeerId == peerId || publishingServicePeerId == peerId) {
+            Log.w(TAG, "[publishHostServiceIfReady] publishedServicePeerId == peerId || publishingServicePeerId == peerId")
             return
         }
         if (!hasWifiDirectPermission()) {
@@ -448,6 +460,7 @@ class WifiDirectVoiceTransport(
                     publishingServicePeerId = null
                     publishedServicePeerId = peerId
                     Log.i(TAG, "[addHostService] Wi-Fi Direct service опубликован hostPeerId=${peerId.value}")
+                    startHostGroup()
                 }
 
                 /**
@@ -458,6 +471,7 @@ class WifiDirectVoiceTransport(
                         publishingServicePeerId = null
                     }
                     Log.w(TAG, "[addHostService] Не удалось опубликовать Wi-Fi Direct service reason=$reason hostPeerId=${peerId.value}")
+                    startHostGroup()
                 }
             },
         )
@@ -575,105 +589,11 @@ class WifiDirectVoiceTransport(
             return
         }
         hostDeviceAddress = deviceAddress
-        lastDiscoveredHostDeviceAddress = deviceAddress
-        peerDiscoveryTargetDeviceAddress = deviceAddress
         Log.i(
             TAG,
             "[handleDnsSdTxtRecord] Найден host Wi-Fi Direct service hostPeerId=${expectedPeerId.value} device=${srcDevice.deviceName} address=$deviceAddress",
         )
-        discoverPeersBeforeConnect(deviceAddress)
-    }
-
-    /**
-     * Запускает обычный Wi-Fi Direct peer discovery, чтобы Android добавил найденный DNS-SD host в peer table перед connect.
-     */
-    @SuppressLint("MissingPermission")
-    private fun discoverPeersBeforeConnect(deviceAddress: String) {
-        if (!hasWifiDirectPermission()) {
-            Log.w(TAG, "[discoverPeersBeforeConnect] Нет permissions для Wi-Fi Direct peer discovery")
-            return
-        }
-        peerDiscoveryTargetDeviceAddress = deviceAddress
-        wifiP2pManager.discoverPeers(
-            channel,
-            object : WifiP2pManager.ActionListener {
-                /**
-                 * Запрашивает peer table после принятого discoverPeers.
-                 */
-                override fun onSuccess() {
-                    Log.i(TAG, "[discoverPeersBeforeConnect] Wi-Fi Direct peer discovery запущен deviceAddress=$deviceAddress")
-                    requestPeersForPendingHost("discover_peers_success")
-                }
-
-                /**
-                 * Все равно запрашивает peer table, если discovery уже активен или стек отказал в запуске.
-                 */
-                override fun onFailure(reason: Int) {
-                    Log.w(TAG, "[discoverPeersBeforeConnect] Не удалось запустить Wi-Fi Direct peer discovery reason=$reason deviceAddress=$deviceAddress")
-                    requestPeersForPendingHost("discover_peers_failure_$reason")
-                }
-            },
-        )
-        Log.i(TAG, "[discoverPeersBeforeConnect] Запрошен Wi-Fi Direct peer discovery для host deviceAddress=$deviceAddress")
-    }
-
-    /**
-     * Запрашивает текущий Wi-Fi Direct peer table и ищет в нем host device из DNS-SD callback.
-     */
-    @SuppressLint("MissingPermission")
-    private fun requestPeersForPendingHost(reason: String) {
-        if (!hasWifiDirectPermission()) {
-            Log.w(TAG, "[requestPeersForPendingHost] Нет permissions для Wi-Fi Direct peer table")
-            return
-        }
-        val targetDeviceAddress = peerDiscoveryTargetDeviceAddress
-        if (targetDeviceAddress == null) {
-            Log.i(TAG, "[requestPeersForPendingHost] Нет ожидаемого host device для peer table reason=$reason")
-            return
-        }
-        wifiP2pManager.requestPeers(channel) { peers ->
-            handlePeerTableForConnect(targetDeviceAddress, peers.deviceList, reason)
-        }
-        Log.i(TAG, "[requestPeersForPendingHost] Запрошен Wi-Fi Direct peer table reason=$reason targetDeviceAddress=$targetDeviceAddress")
-    }
-
-    /**
-     * Подключается к host только после того, как Android peer table увидела его как WifiP2pDevice.
-     */
-    private fun handlePeerTableForConnect(targetDeviceAddress: String, peers: Collection<WifiP2pDevice>, reason: String) {
-        val targetDevice = peers.firstOrNull { device -> device.deviceAddress == targetDeviceAddress }
-        if (targetDevice == null) {
-            Log.i(
-                TAG,
-                "[handlePeerTableForConnect] Host device пока не найден в peer table reason=$reason targetDeviceAddress=$targetDeviceAddress peerCount=${peers.size}",
-            )
-            schedulePeerTableRetry(targetDeviceAddress, reason)
-            return
-        }
-        peerDiscoveryTargetDeviceAddress = null
-        Log.i(
-            TAG,
-            "[handlePeerTableForConnect] Host device найден в peer table reason=$reason device=${targetDevice.deviceName} address=${targetDevice.deviceAddress}",
-        )
-        connectToHost(targetDevice.deviceAddress)
-    }
-
-    /**
-     * Повторяет peer discovery, если DNS-SD service найден, но peer table еще не содержит нужное устройство.
-     */
-    private fun schedulePeerTableRetry(deviceAddress: String, reason: String) {
-        peerDiscoveryRetryJob?.cancel()
-        peerDiscoveryRetryJob = externalScope.launch {
-            delay(PEER_TABLE_RETRY_DELAY_MILLIS)
-            if (sessionRole == VoiceTransportSessionRole.CLIENT &&
-                groupOwnerAddress == null &&
-                pendingConnectDeviceAddress == null &&
-                peerDiscoveryTargetDeviceAddress == deviceAddress
-            ) {
-                Log.i(TAG, "[schedulePeerTableRetry] Повторяем Wi-Fi Direct peer discovery reason=$reason deviceAddress=$deviceAddress")
-                discoverPeersBeforeConnect(deviceAddress)
-            }
-        }
+        connectToHost(deviceAddress)
     }
 
     /**
@@ -711,10 +631,8 @@ class WifiDirectVoiceTransport(
         connectAttemptCount += 1
         val attempt = connectAttemptCount
         pendingConnectDeviceAddress = deviceAddress
-        peerDiscoveryRetryJob?.cancel()
-        peerDiscoveryRetryJob = null
         requestConnectToHost(deviceAddress, config, attempt)
-        Log.i(TAG, "[connectToHost] Подключаемся к Wi-Fi Direct host из peer table deviceAddress=$deviceAddress attempt=$attempt")
+        Log.i(TAG, "[connectToHost] Подключаемся к Wi-Fi Direct host из DNS-SD deviceAddress=$deviceAddress attempt=$attempt")
     }
 
     /**
@@ -739,21 +657,28 @@ class WifiDirectVoiceTransport(
                 }
 
                 /**
-                 * Сбрасывает выбранный host device при отказе, чтобы следующий DNS-SD TXT мог повторить connect.
+                 * Выбирает recovery-сценарий по причине отказа: BUSY мягко отменяется, ERROR проходит через hard cleanup.
                  */
                 override fun onFailure(reason: Int) {
-                    if (reason == WifiP2pManager.BUSY) {
-                        pendingConnectDeviceAddress = deviceAddress
-                    } else if (pendingConnectDeviceAddress == deviceAddress) {
+                    if (reason != WifiP2pManager.BUSY && pendingConnectDeviceAddress == deviceAddress) {
                         pendingConnectDeviceAddress = null
                     }
-                    if (hostDeviceAddress == deviceAddress) {
-                        hostDeviceAddress = null
-                    }
-                    connectCooldownUntilMillis = System.currentTimeMillis() + connectFailureCooldownMillis(reason)
                     if (reason == WifiP2pManager.BUSY) {
+                        pendingConnectDeviceAddress = deviceAddress
+                        connectCooldownUntilMillis = System.currentTimeMillis() + connectFailureCooldownMillis(reason)
                         scheduleCancelConnectBeforeRetry(deviceAddress, "connect_busy", attempt)
+                    } else if (reason == WifiP2pManager.ERROR) {
+                        scheduleClientConnectionHardReset(
+                            deviceAddress = deviceAddress,
+                            reason = "connect_error_$reason",
+                            attempt = attempt,
+                            delayMillis = CONNECT_ERROR_HARD_RESET_DELAY_MILLIS,
+                        )
                     } else {
+                        if (hostDeviceAddress == deviceAddress) {
+                            hostDeviceAddress = null
+                        }
+                        connectCooldownUntilMillis = System.currentTimeMillis() + connectFailureCooldownMillis(reason)
                         scheduleDiscoveryRetry("connect_failure_$reason")
                     }
                     Log.w(TAG, "[connectToHost] Wi-Fi Direct connect отклонен reason=$reason deviceAddress=$deviceAddress attempt=$attempt")
@@ -764,7 +689,7 @@ class WifiDirectVoiceTransport(
     }
 
     /**
-     * Планирует watchdog принятого connect, чтобы не запускать новые connect поверх системного pairing.
+     * Планирует watchdog принятого connect и запускает hard cleanup, если group так и не сформировалась.
      */
     private fun scheduleConnectRetry(deviceAddress: String, attempt: Int) {
         connectRetryJob?.cancel()
@@ -781,8 +706,75 @@ class WifiDirectVoiceTransport(
             if (hostDeviceAddress == deviceAddress) {
                 hostDeviceAddress = null
             }
-            cancelConnectBeforeRetry(deviceAddress, "connect_timeout", attempt)
+            runClientConnectionHardReset(
+                deviceAddress = deviceAddress,
+                reason = "connect_timeout",
+                attempt = attempt,
+                delayMillis = CONNECT_TIMEOUT_HARD_RESET_DELAY_MILLIS,
+            )
         }
+    }
+
+    /**
+     * Планирует полный client-side сброс Wi-Fi Direct после общей ошибки Android P2P стека.
+     */
+    private fun scheduleClientConnectionHardReset(deviceAddress: String, reason: String, attempt: Int, delayMillis: Long) {
+        connectRetryJob?.cancel()
+        connectRetryJob = externalScope.launch {
+            runClientConnectionHardReset(deviceAddress, reason, attempt, delayMillis)
+        }
+    }
+
+    /**
+     * Сбрасывает pending connect, service discovery и group, затем заново запускает DNS-SD поиск host-а.
+     */
+    private suspend fun runClientConnectionHardReset(deviceAddress: String, reason: String, attempt: Int, delayMillis: Long) {
+        if (sessionRole != VoiceTransportSessionRole.CLIENT || groupOwnerAddress != null) {
+            Log.i(TAG, "[runClientConnectionHardReset] Сброс не нужен role=$sessionRole groupOwnerAddress=${groupOwnerAddress?.hostAddress} reason=$reason")
+            return
+        }
+        pendingConnectDeviceAddress = null
+        if (hostDeviceAddress == deviceAddress) {
+            hostDeviceAddress = null
+        }
+        connectCooldownUntilMillis = System.currentTimeMillis() + delayMillis
+        cleanupClientConnectionState(reason, deviceAddress, attempt)
+        Log.i(TAG, "[runClientConnectionHardReset] Ждем перед новым Wi-Fi Direct discovery delayMillis=$delayMillis reason=$reason deviceAddress=$deviceAddress attempt=$attempt")
+        delay(delayMillis)
+        restartClientDiscoveryAfterHardReset(reason, deviceAddress, attempt)
+    }
+
+    /**
+     * Просит Android убрать следы текущей client-попытки: service request, discovery, pending connect и group.
+     */
+    @SuppressLint("MissingPermission")
+    private fun cleanupClientConnectionState(reason: String, deviceAddress: String, attempt: Int) {
+        if (!hasWifiDirectPermission()) {
+            Log.w(TAG, "[cleanupClientConnectionState] Нет permissions для Wi-Fi Direct cleanup reason=$reason")
+            return
+        }
+        serviceRequest?.let { request ->
+            wifiP2pManager.removeServiceRequest(channel, request, actionListener("removeServiceRequest:$reason"))
+        }
+        serviceRequest = null
+        wifiP2pManager.stopPeerDiscovery(channel, actionListener("stopPeerDiscovery:$reason"))
+        wifiP2pManager.cancelConnect(channel, actionListener("cancelConnect:$reason"))
+        wifiP2pManager.removeGroup(channel, actionListener("removeGroup:$reason"))
+        Log.i(TAG, "[cleanupClientConnectionState] Запрошен hard cleanup Wi-Fi Direct client state reason=$reason deviceAddress=$deviceAddress attempt=$attempt")
+    }
+
+    /**
+     * Возвращает client к DNS-SD поиску host-а после hard cleanup, если сессия всё ещё актуальна.
+     */
+    private fun restartClientDiscoveryAfterHardReset(reason: String, deviceAddress: String, attempt: Int) {
+        if (sessionRole != VoiceTransportSessionRole.CLIENT || groupOwnerAddress != null || expectedHostPeerId == null) {
+            Log.i(TAG, "[restartClientDiscoveryAfterHardReset] Restart пропущен role=$sessionRole groupOwnerAddress=${groupOwnerAddress?.hostAddress} hostPeerId=${expectedHostPeerId?.value} reason=$reason")
+            return
+        }
+        connectCooldownUntilMillis = 0L
+        connectRetryJob = null
+        Log.i(TAG, "[restartClientDiscoveryAfterHardReset] Перезапускаем Wi-Fi Direct DNS-SD после cleanup reason=$reason deviceAddress=$deviceAddress attempt=$attempt")
+        startClientDiscovery()
     }
 
     /**
@@ -799,7 +791,6 @@ class WifiDirectVoiceTransport(
                 }
                 Log.i(TAG, "[scheduleDiscoveryRetry] Повторяем Wi-Fi Direct discovery reason=$reason hostPeerId=${expectedHostPeerId?.value}")
                 discoverServices()
-                lastDiscoveredHostDeviceAddress?.let(::discoverPeersBeforeConnect)
             }
         }
     }
@@ -866,6 +857,7 @@ class WifiDirectVoiceTransport(
      */
     @SuppressLint("MissingPermission")
     private fun requestConnectionInfo() {
+        Log.i(TAG, "[requestConnectionInfo] Такой WIFI_P2P_CONNECTION_CHANGED_ACTION пришел: ")
         if (!hasWifiDirectPermission()) {
             Log.w(TAG, "[requestConnectionInfo] Нет permissions для Wi-Fi Direct connection info")
             return
@@ -895,12 +887,9 @@ class WifiDirectVoiceTransport(
         }
         groupOwnerAddress = info.groupOwnerAddress
         pendingConnectDeviceAddress = null
-        peerDiscoveryTargetDeviceAddress = null
         connectCooldownUntilMillis = 0L
         connectRetryJob?.cancel()
         connectRetryJob = null
-        peerDiscoveryRetryJob?.cancel()
-        peerDiscoveryRetryJob = null
         connectAttemptCount = 0
         Log.i(
             TAG,
@@ -1077,16 +1066,10 @@ class WifiDirectVoiceTransport(
                     handleThisDeviceChanged(device)
                 }
 
-                WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> requestConnectionInfo()
-                WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
-                    Log.i(TAG, "[onReceive] Wi-Fi Direct peers changed")
-                    if (sessionRole == VoiceTransportSessionRole.CLIENT && expectedHostPeerId != null) {
-                        if (peerDiscoveryTargetDeviceAddress != null) {
-                            requestPeersForPendingHost("peers_changed")
-                        } else {
-                            discoverServices()
-                        }
-                    }
+                WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
+
+                    Log.i(TAG, "[onReceive] Такой WIFI_P2P_CONNECTION_CHANGED_ACTION пришел: ${intent.toString()}")
+                    requestConnectionInfo()
                 }
             }
         }
@@ -1103,7 +1086,8 @@ class WifiDirectVoiceTransport(
         private const val CONNECT_FORMATION_TIMEOUT_MILLIS = 60_000L
         private const val CONNECT_CANCEL_DELAY_MILLIS = 2_000L
         private const val DISCOVERY_RETRY_DELAY_MILLIS = 2_000L
-        private const val PEER_TABLE_RETRY_DELAY_MILLIS = 2_000L
+        private const val CONNECT_ERROR_HARD_RESET_DELAY_MILLIS = 4_000L
+        private const val CONNECT_TIMEOUT_HARD_RESET_DELAY_MILLIS = 5_000L
         private const val CONNECT_FAILURE_COOLDOWN_MILLIS = 5_000L
         private const val CONNECT_ERROR_COOLDOWN_MILLIS = 15_000L
         private const val CONNECT_CANCEL_COOLDOWN_MILLIS = 10_000L

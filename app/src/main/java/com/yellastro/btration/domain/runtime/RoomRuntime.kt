@@ -465,6 +465,7 @@ class RoomRuntime(
     private fun handleVoiceTransportEvent(event: VoiceTransportEvent) {
         when (event) {
             is VoiceTransportEvent.LocalControlInfoChanged -> handleLocalVoiceTransportInfoChanged(event.info)
+            VoiceTransportEvent.DirectAudioReady -> handleDirectAudioReady()
             is VoiceTransportEvent.FrameReceived -> handleVoiceFrameReceived(event)
             is VoiceTransportEvent.TransportUnavailable -> emitNotice(event.message)
             is VoiceTransportEvent.FrameSendFailed -> Log.w(
@@ -476,11 +477,48 @@ class RoomRuntime(
     }
 
     /**
-     * Рассылает локальную voice transport info активным соседям через Nearby signaling.
+     * Помечает host-комнату готовой к Wi-Fi Direct аудио и рассылает обновленный RoomInfo участникам.
+     */
+    private fun handleDirectAudioReady() {
+        when (val currentState = _state.value) {
+            is RoomRuntimeState.Hosting -> {
+                if (currentState.room.isDirectAudioReady) {
+                    Log.i(TAG, "[handleDirectAudioReady] Direct-аудио уже помечено готовым roomId=${currentState.room.roomId.value}")
+                    return
+                }
+                val updatedRoom = currentState.room.copy(isDirectAudioReady = true)
+                _state.value = currentState.copy(room = updatedRoom)
+                emitNotice("Wi-Fi Direct аудио готово")
+                Log.i(TAG, "[handleDirectAudioReady] Host-комната готова к direct-аудио roomId=${updatedRoom.roomId.value} memberCount=${currentState.members.size}")
+                broadcastMemberList(updatedRoom, currentState.members)
+                voiceTransport.localControlInfo?.let { info ->
+                    sendVoiceTransportInfoToMembers(updatedRoom, currentState.members, info)
+                }
+            }
+
+            is RoomRuntimeState.Client -> {
+                emitNotice("Wi-Fi Direct аудио готово")
+                Log.i(TAG, "[handleDirectAudioReady] Client media-plane сообщил готовность roomId=${currentState.room.roomId.value}")
+            }
+
+            RoomRuntimeState.Idle,
+            RoomRuntimeState.Searching,
+            is RoomRuntimeState.Joining,
+            is RoomRuntimeState.Error,
+            -> Log.i(TAG, "[handleDirectAudioReady] Direct-аудио готово вне активной host-комнаты currentState=${currentState.javaClass.simpleName}")
+        }
+    }
+
+    /**
+     * Рассылает локальную voice transport info через Nearby signaling, когда transport уже готов к подключению соседей.
      */
     private fun handleLocalVoiceTransportInfoChanged(info: VoiceTransportControlInfo) {
         when (val currentState = _state.value) {
             is RoomRuntimeState.Hosting -> {
+                if (!currentState.room.isDirectAudioReady) {
+                    Log.i(TAG, "[handleLocalVoiceTransportInfoChanged] Host voice info готова, но direct-аудио комнаты еще не отмечено готовым")
+                    return
+                }
                 Log.i(TAG, "[handleLocalVoiceTransportInfoChanged] Host рассылает voice info memberCount=${currentState.members.size}")
                 sendToMembers(
                     currentState.members,
@@ -866,7 +904,6 @@ class RoomRuntime(
                 roomId = currentState.room.roomId,
                 sender = profileRepository.getSelfPeer(),
                 roomInfo = currentState.room,
-                voiceTransportInfo = voiceTransport.localControlInfo,
             ),
         )
         nearbyTransport.sendToPeer(
@@ -888,13 +925,17 @@ class RoomRuntime(
             ),
             excludedPeerIds = setOf(profileRepository.getOrCreatePeerId(), joiningPeer.peerId),
         )
-        voiceTransport.localControlInfo?.let { info ->
-            sendVoiceTransportInfoTo(joiningPeer.peerId, currentState.room.roomId, info)
+        if (currentState.room.isDirectAudioReady) {
+            voiceTransport.localControlInfo?.let { info ->
+                sendVoiceTransportInfoTo(joiningPeer.peerId, currentState.room.roomId, info)
+            }
+        } else {
+            Log.i(TAG, "[handleJoinRequest] Host direct-аудио еще не готово, voice info для нового участника будет отправлена позже peerId=${joiningPeer.peerId.value}")
         }
     }
 
     /**
-     * Переводит client из Joining в Client после JOIN_ACCEPTED и заменяет advertised RoomId реальным.
+     * Завершает вход по JOIN_ACCEPTED: заменяет временную комнату из рекламы реальным RoomInfo, сохраняет участников и запускает client media-plane.
      */
     private fun handleJoinAccepted(packet: WirePacket) {
         val currentState = _state.value as? RoomRuntimeState.Joining ?: return
@@ -955,8 +996,12 @@ class RoomRuntime(
             Log.w(TAG, "[handleMemberList] MEMBER_LIST не для текущей комнаты packetRoomId=${packet.roomId?.value} currentRoomId=${currentState.room.roomId.value}")
             return
         }
-        _state.value = currentState.copy(members = packet.members)
-        Log.i(TAG, "[handleMemberList] Список участников обновлен memberCount=${packet.members.size}")
+        val updatedRoom = packet.roomInfo ?: currentState.room
+        _state.value = currentState.copy(room = updatedRoom, members = packet.members)
+        Log.i(
+            TAG,
+            "[handleMemberList] Список участников обновлен memberCount=${packet.members.size} directAudioReady=${updatedRoom.isDirectAudioReady}",
+        )
     }
 
     /**
@@ -1126,6 +1171,21 @@ class RoomRuntime(
     }
 
     /**
+     * Рассылает актуальную voice transport info всем гостям host-комнаты после изменения готовности direct-аудио.
+     */
+    private fun sendVoiceTransportInfoToMembers(room: RoomInfo, members: List<Peer>, info: VoiceTransportControlInfo) {
+        val selfPeerId = profileRepository.getOrCreatePeerId()
+        val targetMembers = members.filterNot { peer -> peer.peerId == selfPeerId }
+        Log.i(
+            TAG,
+            "[sendVoiceTransportInfoToMembers] Рассылаем voice info участникам roomId=${room.roomId.value} targetCount=${targetMembers.size} mode=${info.mode}",
+        )
+        targetMembers.forEach { peer ->
+            sendVoiceTransportInfoTo(peer.peerId, room.roomId, info)
+        }
+    }
+
+    /**
      * Рассылает актуальный список участников всем client-участникам комнаты.
      */
     private fun broadcastMemberList(room: RoomInfo, members: List<Peer>) {
@@ -1136,6 +1196,7 @@ class RoomRuntime(
                 type = WirePacketType.MEMBER_LIST,
                 roomId = room.roomId,
                 sender = profileRepository.getSelfPeer(),
+                roomInfo = room,
                 members = members,
             ),
             excludedPeerIds = setOf(profileRepository.getOrCreatePeerId()),

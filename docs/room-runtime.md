@@ -39,8 +39,10 @@ NearbyTransport.events + VoiceTransport.events
 Host:
 
 - создает `RoomInfo`;
+- держит `RoomInfo.isDirectAudioReady=false`, пока host Wi-Fi Direct group не создана;
 - останавливает discovery;
 - запускает advertising;
+- по `VoiceTransportEvent.DirectAudioReady` помечает комнату готовой к direct-аудио, отправляет snackbar host-у и только затем рассылает гостям обновленный `RoomInfo` и host `VOICE_TRANSPORT_INFO`;
 - принимает `JOIN_REQUEST`;
 - добавляет участника в `members`;
 - отправляет `JOIN_ACCEPTED`;
@@ -62,6 +64,7 @@ Client:
 - по `joinRoom(roomId)` подключается к endpoint;
 - после успешного connection отправляет `JOIN_REQUEST` без реального `roomId`;
 - после `JOIN_ACCEPTED` получает настоящий `RoomInfo`, берет `RoomInfo.host.peerId` для Wi-Fi Direct DNS-SD matching, заменяет временный `RoomId -> endpointId` на реальный `RoomId -> endpointId` и переходит в `Client`;
+- ждет host `VOICE_TRANSPORT_INFO`, который host отправляет только после `RoomInfo.isDirectAudioReady=true`;
 - по `MEMBER_LIST` обновляет участников;
 - свои сообщения добавляет локально и отправляет host-у;
 - сообщения от host-а добавляет в чат;

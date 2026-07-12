@@ -67,6 +67,11 @@ sealed class VoiceTransportEvent {
     ) : VoiceTransportEvent()
 
     /**
+     * Локальный media-plane готов принимать direct-аудио для текущей роли.
+     */
+    object DirectAudioReady : VoiceTransportEvent()
+
+    /**
      * Транспорт получил voice frame от прямого соседа.
      */
     data class FrameReceived(
