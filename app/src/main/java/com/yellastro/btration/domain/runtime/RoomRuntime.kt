@@ -355,7 +355,7 @@ class RoomRuntime(
     }
 
     /**
-     * Начинает передачу микрофона локального PeerId в текущую комнату и возвращает true при реальном старте.
+     * Начинает передачу готовым адресатам; один участник без handshake не блокирует голос для остальных.
      */
     suspend fun startTalking(): Boolean {
         Log.i(TAG, "[startTalking] Команда начать передачу голоса currentState=${_state.value.javaClass.simpleName}")
@@ -366,7 +366,19 @@ class RoomRuntime(
                     .map { peer -> peer.peerId }
                     .filterNot { peerId -> peerId == selfPeerId }
                     .toSet()
-                if (voiceRuntime.startTalking(selfPeerId, targetPeerIds)) {
+                val readyPeerIds = targetPeerIds.filterTo(mutableSetOf()) { peerId ->
+                    voiceTransport.isReadyForPeers(setOf(peerId))
+                }
+                if (readyPeerIds.isEmpty()) {
+                    Log.w(TAG, "[startTalking] Нет участников с готовым прямым аудиоканалом targetCount=${targetPeerIds.size}")
+                    emitNotice("Прямой аудиоканал не установлен")
+                    return false
+                }
+                val skippedPeerCount = targetPeerIds.size - readyPeerIds.size
+                if (skippedPeerCount > 0) {
+                    Log.w(TAG, "[startTalking] Неготовые участники исключены из текущей передачи readyCount=${readyPeerIds.size} skippedCount=$skippedPeerCount")
+                }
+                if (voiceRuntime.startTalking(selfPeerId, readyPeerIds)) {
                     addTalkingPeer(selfPeerId)
                     return true
                 }
@@ -374,7 +386,13 @@ class RoomRuntime(
             }
 
             is RoomRuntimeState.Client -> {
-                if (voiceRuntime.startTalking(selfPeerId, setOf(currentState.room.host.peerId))) {
+                val targetPeerIds = setOf(currentState.room.host.peerId)
+                if (!voiceTransport.isReadyForPeers(targetPeerIds)) {
+                    Log.w(TAG, "[startTalking] Прямой аудиоканал с хостом еще не установлен")
+                    emitNotice("Прямой аудиоканал не установлен")
+                    return false
+                }
+                if (voiceRuntime.startTalking(selfPeerId, targetPeerIds)) {
                     addTalkingPeer(selfPeerId)
                     return true
                 }
@@ -515,11 +533,7 @@ class RoomRuntime(
     private fun handleLocalVoiceTransportInfoChanged(info: VoiceTransportControlInfo) {
         when (val currentState = _state.value) {
             is RoomRuntimeState.Hosting -> {
-                if (!currentState.room.isDirectAudioReady) {
-                    Log.i(TAG, "[handleLocalVoiceTransportInfoChanged] Host voice info готова, но direct-аудио комнаты еще не отмечено готовым")
-                    return
-                }
-                Log.i(TAG, "[handleLocalVoiceTransportInfoChanged] Host рассылает voice info memberCount=${currentState.members.size}")
+                Log.i(TAG, "[handleLocalVoiceTransportInfoChanged] Host рассылает voice info для запуска handshake memberCount=${currentState.members.size}")
                 sendToMembers(
                     currentState.members,
                     packet(
@@ -925,12 +939,8 @@ class RoomRuntime(
             ),
             excludedPeerIds = setOf(profileRepository.getOrCreatePeerId(), joiningPeer.peerId),
         )
-        if (currentState.room.isDirectAudioReady) {
-            voiceTransport.localControlInfo?.let { info ->
-                sendVoiceTransportInfoTo(joiningPeer.peerId, currentState.room.roomId, info)
-            }
-        } else {
-            Log.i(TAG, "[handleJoinRequest] Host direct-аудио еще не готово, voice info для нового участника будет отправлена позже peerId=${joiningPeer.peerId.value}")
+        voiceTransport.localControlInfo?.let { info ->
+            sendVoiceTransportInfoTo(joiningPeer.peerId, currentState.room.roomId, info)
         }
     }
 

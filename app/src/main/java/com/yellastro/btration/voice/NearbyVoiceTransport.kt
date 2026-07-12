@@ -66,6 +66,11 @@ class NearbyVoiceTransport(
     }
 
     /**
+     * Nearby endpoint registry уже подтвержден signaling-соединением комнаты.
+     */
+    override fun isReadyForPeers(peerIds: Set<PeerId>): Boolean = true
+
+    /**
      * Преобразует только voice-события Nearby в общий VoiceTransportEvent.
      */
     private fun handleNearbyEvent(event: NearbyEvent) {

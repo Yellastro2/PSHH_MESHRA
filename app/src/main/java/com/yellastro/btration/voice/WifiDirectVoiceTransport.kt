@@ -7,6 +7,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.wifi.WpsInfo
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pDevice
@@ -24,7 +26,9 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.SocketException
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -39,7 +43,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Экспериментальный VoiceTransport поверх Wi-Fi Direct group и UDP-датаграмм с уже закодированными Opus voice frames.
+ * Wi-Fi Direct voice transport с Network-bound UDP-сокетом, HELLO/ACK, резервным UDP-punch через Nearby и Opus frames.
  */
 class WifiDirectVoiceTransport(
     context: Context,
@@ -47,9 +51,14 @@ class WifiDirectVoiceTransport(
 ) : VoiceTransport {
     private val applicationContext = context.applicationContext
     private val wifiP2pManager = applicationContext.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
+    private val connectivityManager = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     private val channel = wifiP2pManager.initialize(applicationContext, Looper.getMainLooper(), null)
     private val _events = MutableSharedFlow<VoiceTransportEvent>(extraBufferCapacity = EVENT_BUFFER_CAPACITY)
     private val peerUdpEndpoints = ConcurrentHashMap<PeerId, InetSocketAddress>()
+    private val signaledControlInfos = ConcurrentHashMap<PeerId, VoiceTransportControlInfo>()
+    private val signaledUdpEndpoints = ConcurrentHashMap<PeerId, InetSocketAddress>()
+    private val fallbackPunchJobs = ConcurrentHashMap<PeerId, Job>()
+    private val warnedMissingPeerIds = ConcurrentHashMap.newKeySet<PeerId>()
     private val receiver = WifiDirectReceiver()
 
     private var selfPeerId: PeerId? = null
@@ -64,11 +73,15 @@ class WifiDirectVoiceTransport(
     private var udpSocket: DatagramSocket? = null
     private var receiveJob: Job? = null
     private var helloJob: Job? = null
+    private var socketBindingJob: Job? = null
+    private var boundNetwork: Network? = null
+    private var boundLocalAddress: InetAddress? = null
     private var connectRetryJob: Job? = null
     private var connectAttemptCount = 0
     private var pendingConnectDeviceAddress: String? = null
     private var connectCooldownUntilMillis = 0L
     private var cachedLocalControlInfo: VoiceTransportControlInfo? = null
+    private var socketUnavailableReported = false
 
     /**
      * События Wi-Fi Direct voice transport для RoomRuntime.
@@ -92,7 +105,6 @@ class WifiDirectVoiceTransport(
     override fun startSession(selfPeerId: PeerId, role: VoiceTransportSessionRole) {
         this.selfPeerId = selfPeerId
         sessionRole = role
-        startUdpSocket()
         requestLocalDeviceInfo()
         publishLocalControlInfoIfReady()
         when (role) {
@@ -106,12 +118,14 @@ class WifiDirectVoiceTransport(
     }
 
     /**
-     * Останавливает UDP media-plane и просит Android выйти из Wi-Fi Direct group.
+     * Останавливает UDP media-plane, резервные punch-задачи и просит Android выйти из Wi-Fi Direct group.
      */
     override fun stopSession() {
         Log.i(TAG, "[stopSession] Останавливаем Wi-Fi Direct voice session role=$sessionRole")
         helloJob?.cancel()
         helloJob = null
+        socketBindingJob?.cancel()
+        socketBindingJob = null
         connectRetryJob?.cancel()
         connectRetryJob = null
         connectAttemptCount = 0
@@ -121,7 +135,15 @@ class WifiDirectVoiceTransport(
         receiveJob = null
         runCatching { udpSocket?.close() }
         udpSocket = null
+        boundNetwork = null
+        boundLocalAddress = null
         peerUdpEndpoints.clear()
+        signaledControlInfos.clear()
+        signaledUdpEndpoints.clear()
+        fallbackPunchJobs.values.forEach { job -> job.cancel() }
+        fallbackPunchJobs.clear()
+        warnedMissingPeerIds.clear()
+        socketUnavailableReported = false
         groupOwnerAddress = null
         hostDeviceAddress = null
         expectedHostPeerId = null
@@ -135,15 +157,23 @@ class WifiDirectVoiceTransport(
     }
 
     /**
-     * Принимает служебную информацию от Nearby signaling и запускает поиск DNS-SD service нужного hostPeerId.
+     * Принимает Nearby signaling, сохраняет проверенный fallback UDP endpoint и запускает discovery нужного host-а.
      */
     override fun handleControlInfo(fromPeerId: PeerId, info: VoiceTransportControlInfo) {
         if (info.mode != MODE) {
             Log.i(TAG, "[handleControlInfo] Игнорируем voice info другого mode=${info.mode} fromPeerId=${fromPeerId.value}")
             return
         }
+        if (info.peerId != fromPeerId) {
+            Log.w(TAG, "[handleControlInfo] Отклонен voice info с несовпадающим peerId fromPeerId=${fromPeerId.value} infoPeerId=${info.peerId.value}")
+            return
+        }
+        if (info.p2pAddress != null && info.udpPort != null) {
+            signaledControlInfos[fromPeerId] = info
+            refreshSignaledUdpEndpoint(fromPeerId)
+        }
         if (sessionRole != VoiceTransportSessionRole.CLIENT || !info.isGroupOwner) {
-            Log.i(TAG, "[handleControlInfo] Wi-Fi Direct info сохранен без connect role=$sessionRole fromPeerId=${fromPeerId.value} isGroupOwner=${info.isGroupOwner}")
+            Log.i(TAG, "[handleControlInfo] Wi-Fi Direct info принят без connect role=$sessionRole fromPeerId=${fromPeerId.value} isGroupOwner=${info.isGroupOwner}")
             return
         }
         expectedHostPeerId = fromPeerId
@@ -155,31 +185,37 @@ class WifiDirectVoiceTransport(
     }
 
     /**
+     * Считает peer готовым только после получения HELLO от него либо HELLO_ACK хоста.
+     */
+    override fun isReadyForPeers(peerIds: Set<PeerId>): Boolean {
+        return peerIds.all(peerUdpEndpoints::containsKey)
+    }
+
+    /**
      * Отправляет Opus voice frame через UDP: client шлет group owner-у, host шлет известным client endpoint-ам.
      */
     override fun sendFrameToPeers(peerIds: Set<PeerId>, frame: VoiceFrame) {
         val socket = udpSocket
         val senderPeerId = selfPeerId
         if (socket == null || senderPeerId == null) {
-            Log.w(TAG, "[sendFrameToPeers] UDP socket еще не готов peerCount=${peerIds.size}")
-            emitEvent(VoiceTransportEvent.FrameSendFailed(peerIds, IllegalStateException("Wi-Fi Direct UDP socket is not ready")))
+            if (!socketUnavailableReported) {
+                socketUnavailableReported = true
+                Log.w(TAG, "[sendFrameToPeers] UDP socket еще не готов peerCount=${peerIds.size}")
+            }
             return
         }
         val payload = WifiDirectVoiceDatagramCodec.encodeFrame(senderPeerId, frame)
-        val failedPeerIds = mutableSetOf<PeerId>()
         peerIds.forEach { peerId ->
             val endpoint = resolveUdpEndpoint(peerId)
             if (endpoint == null) {
-                failedPeerIds += peerId
-                Log.w(TAG, "[sendFrameToPeers] Нет UDP endpoint для peerId=${peerId.value} role=$sessionRole")
+                if (warnedMissingPeerIds.add(peerId)) {
+                    Log.w(TAG, "[sendFrameToPeers] Нет подтвержденного UDP endpoint для peerId=${peerId.value} role=$sessionRole")
+                }
             } else if (Looper.myLooper() == Looper.getMainLooper()) {
                 sendDatagramOffMain(socket, endpoint, payload, peerId)
             } else {
                 sendDatagram(socket, endpoint, payload, peerId)
             }
-        }
-        if (failedPeerIds.isNotEmpty()) {
-            emitEvent(VoiceTransportEvent.FrameSendFailed(failedPeerIds, IllegalStateException("Wi-Fi Direct UDP endpoints $failedPeerIds are unknown")))
         }
     }
 
@@ -233,21 +269,112 @@ class WifiDirectVoiceTransport(
     }
 
     /**
-     * Запускает UDP socket и receive loop, если они еще не активны.
+     * Пересоздает UDP socket после groupFormed, привязывает к P2P Network/IPv4 и публикует fallback endpoint.
      */
-    private fun startUdpSocket() {
-        if (udpSocket != null) {
-            return
+    private fun restartUdpSocketForGroup() {
+        socketBindingJob?.cancel()
+        socketBindingJob = externalScope.launch(Dispatchers.IO) {
+            val binding = awaitWifiDirectBinding()
+            if (binding == null) {
+                Log.w(TAG, "[restartUdpSocketForGroup] Не найдены ни Wi-Fi Direct Network, ни локальный P2P-адрес")
+                emitEvent(VoiceTransportEvent.TransportUnavailable(DIRECT_AUDIO_UNAVAILABLE_MESSAGE))
+                return@launch
+            }
+            val network = binding.first
+            val localAddress = binding.second
+            if (boundNetwork == network && boundLocalAddress == localAddress && udpSocket?.isClosed == false) {
+                Log.i(TAG, "[restartUdpSocketForGroup] UDP socket уже привязан к актуальному P2P-интерфейсу")
+                return@launch
+            }
+
+            receiveJob?.cancel()
+            receiveJob = null
+            runCatching { udpSocket?.close() }
+            peerUdpEndpoints.clear()
+            signaledUdpEndpoints.clear()
+            fallbackPunchJobs.values.forEach { job -> job.cancel() }
+            fallbackPunchJobs.clear()
+            warnedMissingPeerIds.clear()
+            val socket = DatagramSocket(null)
+            runCatching {
+                network?.bindSocket(socket)
+                socket.reuseAddress = true
+                socket.bind(InetSocketAddress(localAddress, UDP_PORT))
+            }.onFailure { cause ->
+                socket.close()
+                Log.w(TAG, "[restartUdpSocketForGroup] Не удалось привязать UDP socket к P2P-интерфейсу: ${cause.message}", cause)
+                emitEvent(VoiceTransportEvent.TransportUnavailable(DIRECT_AUDIO_UNAVAILABLE_MESSAGE))
+                return@launch
+            }
+            udpSocket = socket
+            boundNetwork = network
+            boundLocalAddress = localAddress
+            socketUnavailableReported = false
+            receiveJob = externalScope.launch(Dispatchers.IO) { receiveLoop(socket) }
+            Log.i(
+                TAG,
+                "[restartUdpSocketForGroup] UDP socket привязан network=${network != null} localAddress=${localAddress.hostAddress} port=$UDP_PORT",
+            )
+            publishLocalControlInfoIfReady()
+            signaledControlInfos.keys.forEach { peerId -> refreshSignaledUdpEndpoint(peerId) }
+            if (sessionRole == VoiceTransportSessionRole.CLIENT) {
+                startHelloLoop()
+            }
         }
-        val socket = DatagramSocket(null).apply {
-            reuseAddress = true
-            bind(InetSocketAddress(UDP_PORT))
+    }
+
+    /**
+     * Ждет локальный P2P IPv4 и по возможности соответствующую системную Network для точного bind и signaling.
+     */
+    private suspend fun awaitWifiDirectBinding(): Pair<Network?, InetAddress>? {
+        repeat(NETWORK_LOOKUP_ATTEMPTS) {
+            val network = connectivityManager.allNetworks.firstOrNull { network ->
+                connectivityManager.getLinkProperties(network)
+                    ?.interfaceName
+                    ?.contains(WIFI_DIRECT_INTERFACE_MARKER, ignoreCase = true) == true
+            }
+            val localAddress = findLocalP2pAddress()
+            if (localAddress != null) {
+                return network to localAddress
+            }
+            delay(NETWORK_LOOKUP_DELAY_MILLIS)
         }
-        udpSocket = socket
-        receiveJob = externalScope.launch(Dispatchers.IO) {
-            receiveLoop(socket)
+        return null
+    }
+
+    /**
+     * Находит локальный IPv4 P2P-интерфейса по подсети group owner через совместимое сравнение байтов адреса.
+     */
+    private fun findLocalP2pAddress(): InetAddress? {
+        val ownerAddress = groupOwnerAddress ?: return null
+        val ownerBytes = ownerAddress.address
+        return runCatching {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return@runCatching null
+            Collections.list(interfaces)
+                .asSequence()
+                .filter { networkInterface -> networkInterface.isUp && !networkInterface.isLoopback }
+                .flatMap { networkInterface -> Collections.list(networkInterface.inetAddresses).asSequence() }
+                .filter { address -> address.address.size == ownerBytes.size && !address.isLoopbackAddress }
+                .firstOrNull { address -> address.isInSameIpv4Subnet(ownerBytes) }
+        }.onFailure { cause ->
+            Log.w(TAG, "[findLocalP2pAddress] Не удалось прочитать локальные сетевые интерфейсы: ${cause.message}")
+        }.getOrNull()
+    }
+
+    /**
+     * Проверяет совпадение первых трех байтов IPv4-адреса без Kotlin API, отсутствующих в старом окружении.
+     */
+    private fun InetAddress.isInSameIpv4Subnet(ownerBytes: ByteArray): Boolean {
+        val localBytes = address
+        if (localBytes.size != IPV4_ADDRESS_BYTES || ownerBytes.size != IPV4_ADDRESS_BYTES) {
+            return false
         }
-        Log.i(TAG, "[startUdpSocket] UDP socket запущен port=$UDP_PORT")
+        for (index in 0 until IPV4_SUBNET_PREFIX_BYTES) {
+            if (localBytes[index] != ownerBytes[index]) {
+                return false
+            }
+        }
+        return true
     }
 
     /**
@@ -270,18 +397,37 @@ class WifiDirectVoiceTransport(
     }
 
     /**
-     * Обрабатывает HELLO или FRAME UDP datagram и обновляет таблицу peerId -> UDP endpoint.
+     * Обрабатывает UDP handshake: client становится готов только по ACK на свой HELLO, host — по HELLO либо ACK.
      */
     private fun handleUdpPacket(packet: DatagramPacket) {
         val endpoint = InetSocketAddress(packet.address, packet.port)
         when (val datagram = WifiDirectVoiceDatagramCodec.decode(packet.data, packet.length)) {
             is WifiDirectVoiceDatagram.Hello -> {
-                peerUdpEndpoints[datagram.senderPeerId] = endpoint
+                if (sessionRole == VoiceTransportSessionRole.HOST) {
+                    val wasReady = peerUdpEndpoints.put(datagram.senderPeerId, endpoint) != null
+                    warnedMissingPeerIds.remove(datagram.senderPeerId)
+                    if (!wasReady) {
+                        emitEvent(VoiceTransportEvent.DirectAudioReady)
+                    }
+                }
                 Log.i(TAG, "[handleUdpPacket] Получен Wi-Fi Direct HELLO peerId=${datagram.senderPeerId.value} endpoint=$endpoint")
+                sendHelloAck(endpoint, datagram.senderPeerId)
+            }
+
+            is WifiDirectVoiceDatagram.HelloAck -> {
+                val wasReady = peerUdpEndpoints.put(datagram.senderPeerId, endpoint) != null
+                warnedMissingPeerIds.remove(datagram.senderPeerId)
+                helloJob?.cancel()
+                helloJob = null
+                if (!wasReady) {
+                    emitEvent(VoiceTransportEvent.DirectAudioReady)
+                }
+                Log.i(TAG, "[handleUdpPacket] Получен Wi-Fi Direct HELLO_ACK peerId=${datagram.senderPeerId.value} endpoint=$endpoint")
             }
 
             is WifiDirectVoiceDatagram.Frame -> {
                 peerUdpEndpoints[datagram.senderPeerId] = endpoint
+                warnedMissingPeerIds.remove(datagram.senderPeerId)
                 emitEvent(
                     VoiceTransportEvent.FrameReceived(
                         transportPeerId = datagram.senderPeerId,
@@ -316,13 +462,92 @@ class WifiDirectVoiceTransport(
     }
 
     /**
-     * Возвращает UDP endpoint для peer: client всегда шлет group owner-у, host использует HELLO-таблицу.
+     * Возвращает только endpoint, подтвержденный входящим handshake или voice frame.
      */
     private fun resolveUdpEndpoint(peerId: PeerId): InetSocketAddress? {
-        if (sessionRole == VoiceTransportSessionRole.CLIENT) {
-            return groupOwnerAddress?.let { address -> InetSocketAddress(address, UDP_PORT) }
-        }
         return peerUdpEndpoints[peerId]
+    }
+
+    /**
+     * Подтверждает HELLO, чтобы client знал о двусторонней UDP-доступности.
+     */
+    private fun sendHelloAck(endpoint: InetSocketAddress, clientPeerId: PeerId) {
+        val socket = udpSocket ?: return
+        val peerId = selfPeerId ?: return
+        val payload = WifiDirectVoiceDatagramCodec.encodeHelloAck(peerId)
+        sendDatagram(socket, endpoint, payload, clientPeerId)
+        Log.i(TAG, "[sendHelloAck] HELLO_ACK отправлен peerId=${clientPeerId.value} endpoint=$endpoint")
+    }
+
+    /**
+     * Проверяет P2P IPv4 и UDP-порт из Nearby, не позволяя использовать endpoint вне подсети текущей Direct group.
+     */
+    private fun parseSignaledUdpEndpoint(info: VoiceTransportControlInfo): InetSocketAddress? {
+        val addressText = info.p2pAddress ?: return null
+        val port = info.udpPort ?: return null
+        if (port !in MIN_UDP_PORT..MAX_UDP_PORT) {
+            Log.w(TAG, "[parseSignaledUdpEndpoint] Отклонен некорректный UDP-порт port=$port peerId=${info.peerId.value}")
+            return null
+        }
+        val parts = addressText.split('.')
+        if (parts.size != IPV4_ADDRESS_BYTES) {
+            Log.w(TAG, "[parseSignaledUdpEndpoint] Отклонен некорректный P2P IPv4 address=$addressText peerId=${info.peerId.value}")
+            return null
+        }
+        val addressBytes = ByteArray(IPV4_ADDRESS_BYTES)
+        for (index in parts.indices) {
+            val octet = parts[index].toIntOrNull()
+            if (octet == null || octet !in MIN_IPV4_OCTET..MAX_IPV4_OCTET) {
+                Log.w(TAG, "[parseSignaledUdpEndpoint] Отклонен некорректный P2P IPv4 address=$addressText peerId=${info.peerId.value}")
+                return null
+            }
+            addressBytes[index] = octet.toByte()
+        }
+        val ownerBytes = groupOwnerAddress?.address ?: return null
+        val address = InetAddress.getByAddress(addressBytes)
+        if (!address.isInSameIpv4Subnet(ownerBytes)) {
+            Log.w(TAG, "[parseSignaledUdpEndpoint] P2P IPv4 вне подсети group owner address=$addressText peerId=${info.peerId.value}")
+            return null
+        }
+        return InetSocketAddress(address, port)
+    }
+
+    /**
+     * Повторно проверяет отложенный Nearby endpoint, когда group owner и UDP socket уже могли стать доступны.
+     */
+    private fun refreshSignaledUdpEndpoint(peerId: PeerId) {
+        val info = signaledControlInfos[peerId] ?: return
+        val endpoint = parseSignaledUdpEndpoint(info) ?: return
+        signaledUdpEndpoints[peerId] = endpoint
+        scheduleFallbackPunch(peerId)
+        Log.i(TAG, "[refreshSignaledUdpEndpoint] Подготовлен резервный UDP endpoint peerId=${peerId.value} endpoint=$endpoint")
+    }
+
+    /**
+     * После задержки запускает резервный двусторонний HELLO к endpoint, полученному через Nearby signaling.
+     */
+    private fun scheduleFallbackPunch(peerId: PeerId) {
+        if (udpSocket == null || signaledUdpEndpoints[peerId] == null || peerUdpEndpoints.containsKey(peerId)) {
+            return
+        }
+        fallbackPunchJobs.remove(peerId)?.cancel()
+        fallbackPunchJobs[peerId] = externalScope.launch(Dispatchers.IO) {
+            delay(FALLBACK_PUNCH_DELAY_MILLIS)
+            repeat(FALLBACK_PUNCH_REPEAT_COUNT) { index ->
+                if (peerUdpEndpoints.containsKey(peerId)) {
+                    fallbackPunchJobs.remove(peerId)
+                    return@launch
+                }
+                val socket = udpSocket ?: return@launch
+                val self = selfPeerId ?: return@launch
+                val endpoint = signaledUdpEndpoints[peerId] ?: return@launch
+                sendDatagram(socket, endpoint, WifiDirectVoiceDatagramCodec.encodeHello(self), peerId)
+                Log.i(TAG, "[scheduleFallbackPunch] Резервный UDP HELLO отправлен peerId=${peerId.value} endpoint=$endpoint index=$index")
+                delay(FALLBACK_PUNCH_REPEAT_DELAY_MILLIS)
+            }
+            fallbackPunchJobs.remove(peerId)
+            Log.w(TAG, "[scheduleFallbackPunch] Резервный UDP-punch не подтвержден peerId=${peerId.value}")
+        }
     }
 
     /**
@@ -374,11 +599,10 @@ class WifiDirectVoiceTransport(
             channel,
             object : WifiP2pManager.ActionListener {
                 /**
-                 * Сообщает runtime, что host Wi-Fi Direct group создана и direct-аудио можно анонсировать гостям.
+                 * Фиксирует создание group; готовность direct-аудио подтвердит только UDP HELLO от peer.
                  */
                 override fun onSuccess() {
-                    Log.i(TAG, "[createGroupAfterCleanup] Wi-Fi Direct group создана, direct-аудио готово")
-                    emitEvent(VoiceTransportEvent.DirectAudioReady)
+                    Log.i(TAG, "[createGroupAfterCleanup] Wi-Fi Direct group создана, ожидаем UDP handshake")
                 }
 
                 /**
@@ -866,7 +1090,7 @@ class WifiDirectVoiceTransport(
     }
 
     /**
-     * Обрабатывает group owner address и запускает HELLO от client-а.
+     * После формирования group сохраняет owner address и привязывает новый UDP socket к P2P Network.
      */
     private fun handleConnectionInfo(info: WifiP2pInfo) {
         if (!info.groupFormed) {
@@ -895,22 +1119,25 @@ class WifiDirectVoiceTransport(
             TAG,
             "[handleConnectionInfo] Wi-Fi Direct group сформирована isGroupOwner=${info.isGroupOwner} groupOwnerAddress=${info.groupOwnerAddress?.hostAddress}",
         )
-        if (!info.isGroupOwner) {
-            startHelloLoop()
-        }
+        restartUdpSocketForGroup()
     }
 
     /**
-     * Периодически отправляет HELLO group owner-у, чтобы host узнал UDP endpoint client-а.
+     * Отправляет HELLO до ACK или таймаута двустороннего handshake.
      */
     private fun startHelloLoop() {
         helloJob?.cancel()
         helloJob = externalScope.launch(Dispatchers.IO) {
             repeat(HELLO_REPEAT_COUNT) { index ->
+                if (expectedHostPeerId?.let(peerUdpEndpoints::containsKey) == true) {
+                    return@launch
+                }
                 sendHello()
                 Log.i(TAG, "[startHelloLoop] HELLO отправлен index=$index")
                 delay(HELLO_REPEAT_DELAY_MILLIS)
             }
+            Log.w(TAG, "[startHelloLoop] Таймаут HELLO/ACK, прямой аудиоканал не установлен")
+            emitEvent(VoiceTransportEvent.TransportUnavailable(DIRECT_AUDIO_UNAVAILABLE_MESSAGE))
         }
     }
 
@@ -947,7 +1174,7 @@ class WifiDirectVoiceTransport(
     }
 
     /**
-     * Публикует локальную Wi-Fi Direct визитку для Nearby signaling.
+     * Публикует Nearby-визитку, добавляя фактический P2P endpoint после привязки UDP socket-а.
      */
     private fun publishLocalControlInfoIfReady() {
         val peerId = selfPeerId ?: return
@@ -956,13 +1183,14 @@ class WifiDirectVoiceTransport(
             mode = MODE,
             peerId = peerId,
             wifiDirectDeviceAddress = localDeviceAddress,
+            p2pAddress = boundLocalAddress?.hostAddress,
             udpPort = UDP_PORT,
             isGroupOwner = role == VoiceTransportSessionRole.HOST,
             sentAtMillis = System.currentTimeMillis(),
         )
         cachedLocalControlInfo = info
         emitEvent(VoiceTransportEvent.LocalControlInfoChanged(info))
-        Log.i(TAG, "[publishLocalControlInfoIfReady] Wi-Fi Direct voice info обновлен role=$role diagnosticDeviceAddress=$localDeviceAddress")
+        Log.i(TAG, "[publishLocalControlInfoIfReady] Wi-Fi Direct voice info обновлен role=$role diagnosticDeviceAddress=$localDeviceAddress p2pAddress=${boundLocalAddress?.hostAddress}")
     }
 
     /**
@@ -1081,8 +1309,21 @@ class WifiDirectVoiceTransport(
         private const val UDP_PORT = 48982
         private const val MAX_DATAGRAM_BYTES = 16_384
         private const val EVENT_BUFFER_CAPACITY = 64
+        private const val NETWORK_LOOKUP_ATTEMPTS = 20
+        private const val NETWORK_LOOKUP_DELAY_MILLIS = 250L
+        private const val WIFI_DIRECT_INTERFACE_MARKER = "p2p"
+        private const val IPV4_ADDRESS_BYTES = 4
+        private const val IPV4_SUBNET_PREFIX_BYTES = 3
+        private const val MIN_IPV4_OCTET = 0
+        private const val MAX_IPV4_OCTET = 255
+        private const val MIN_UDP_PORT = 1
+        private const val MAX_UDP_PORT = 65_535
+        private const val DIRECT_AUDIO_UNAVAILABLE_MESSAGE = "Прямой аудиоканал не установлен"
         private const val HELLO_REPEAT_COUNT = 40
         private const val HELLO_REPEAT_DELAY_MILLIS = 500L
+        private const val FALLBACK_PUNCH_DELAY_MILLIS = 3_000L
+        private const val FALLBACK_PUNCH_REPEAT_COUNT = 20
+        private const val FALLBACK_PUNCH_REPEAT_DELAY_MILLIS = 500L
         private const val CONNECT_FORMATION_TIMEOUT_MILLIS = 60_000L
         private const val CONNECT_CANCEL_DELAY_MILLIS = 2_000L
         private const val DISCOVERY_RETRY_DELAY_MILLIS = 2_000L

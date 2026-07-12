@@ -50,6 +50,11 @@ interface VoiceTransport {
     fun handleControlInfo(fromPeerId: PeerId, info: VoiceTransportControlInfo)
 
     /**
+     * Проверяет, завершен ли media-plane handshake со всеми указанными получателями.
+     */
+    fun isReadyForPeers(peerIds: Set<PeerId>): Boolean
+
+    /**
      * Отправляет один voice frame выбранным соседям/участникам через текущий транспорт.
      */
     fun sendFrameToPeers(peerIds: Set<PeerId>, frame: VoiceFrame)

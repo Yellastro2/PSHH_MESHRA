@@ -42,6 +42,11 @@ class UnavailableVoiceTransport(
     override fun handleControlInfo(fromPeerId: PeerId, info: VoiceTransportControlInfo) = Unit
 
     /**
+     * Недоступный transport никогда не готов передавать voice frames.
+     */
+    override fun isReadyForPeers(peerIds: Set<PeerId>): Boolean = false
+
+    /**
      * Сообщает UI, что голосовые frames нельзя отправить выбранным transport-ом.
      */
     override fun sendFrameToPeers(peerIds: Set<PeerId>, frame: VoiceFrame) {

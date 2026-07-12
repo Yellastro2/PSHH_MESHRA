@@ -39,10 +39,11 @@ NearbyTransport.events + VoiceTransport.events
 Host:
 
 - создает `RoomInfo`;
-- держит `RoomInfo.isDirectAudioReady=false`, пока host Wi-Fi Direct group не создана;
+- держит `RoomInfo.isDirectAudioReady=false`, пока первый peer не завершил UDP `HELLO/HELLO_ACK` handshake;
 - останавливает discovery;
 - запускает advertising;
-- по `VoiceTransportEvent.DirectAudioReady` помечает комнату готовой к direct-аудио, отправляет snackbar host-у и только затем рассылает гостям обновленный `RoomInfo` и host `VOICE_TRANSPORT_INFO`;
+- рассылает host `VOICE_TRANSPORT_INFO` для запуска handshake независимо от флага готовности;
+- по `VoiceTransportEvent.DirectAudioReady` после handshake помечает комнату готовой к direct-аудио и рассылает обновленный `RoomInfo`;
 - принимает `JOIN_REQUEST`;
 - добавляет участника в `members`;
 - отправляет `JOIN_ACCEPTED`;
@@ -51,7 +52,7 @@ Host:
 - добавляет сообщение себе;
 - рассылает сообщение остальным участникам;
 - при закрытии комнаты рассылает `ROOM_CLOSED`.
-- при локальном PTT отправляет voice frames всем client-участникам через выбранный `VoiceTransport`;
+- при локальном PTT отправляет voice frames всем client-участникам с подтвержденным media-plane handshake; неготовый участник не блокирует остальных;
 - при входящих Opus voice frames помечает участника говорящим, запускает локальное декодирование/воспроизведение и ретранслирует сжатые frames другим client-участникам без decode/re-encode.
 
 ## Client MVP
@@ -64,7 +65,7 @@ Client:
 - по `joinRoom(roomId)` подключается к endpoint;
 - после успешного connection отправляет `JOIN_REQUEST` без реального `roomId`;
 - после `JOIN_ACCEPTED` получает настоящий `RoomInfo`, берет `RoomInfo.host.peerId` для Wi-Fi Direct DNS-SD matching, заменяет временный `RoomId -> endpointId` на реальный `RoomId -> endpointId` и переходит в `Client`;
-- ждет host `VOICE_TRANSPORT_INFO`, который host отправляет только после `RoomInfo.isDirectAudioReady=true`;
+- получает host `VOICE_TRANSPORT_INFO` сразу после входа и запускает direct-audio handshake;
 - по `MEMBER_LIST` обновляет участников;
 - свои сообщения добавляет локально и отправляет host-у;
 - сообщения от host-а добавляет в чат;
@@ -80,6 +81,7 @@ Client:
 ## PTT-индикация
 
 - `RoomRuntime.startTalking()` добавляет локальный `PeerId` в `talkingPeerIds`, только если `VoiceRuntime` реально начал передачу.
+- Перед стартом записи `RoomRuntime.startTalking()` выбирает адресатов с готовым handshake. Запись блокируется только когда нет ни одного готового адресата; неготовые участники пропускают текущую передачу.
 - `RoomRuntime.stopTalking()` убирает локальный `PeerId` из `talkingPeerIds`.
 - При `VoiceTransportEvent.FrameReceived` runtime добавляет `originPeerId` отправителя в `talkingPeerIds`, передает Opus frame в `VoiceRuntime.playIncomingFrame(...)` и снимает индикатор через callback после final-frame/EOF.
 - Для UDP media-plane есть fallback: каждый non-final voice frame продлевает таймер говорящего, а если final-frame потерялся, runtime гасит индикатор и закрывает входящую frame-сессию по таймауту тишины.

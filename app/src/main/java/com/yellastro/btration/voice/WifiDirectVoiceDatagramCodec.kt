@@ -6,13 +6,27 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 
 /**
- * Кодирует UDP-датаграммы Wi-Fi Direct voice transport: HELLO для привязки PeerId к IP и FRAME для Opus voice frame.
+ * Кодирует UDP-датаграммы Wi-Fi Direct voice transport: HELLO/ACK handshake и FRAME с Opus voice frame.
  */
 object WifiDirectVoiceDatagramCodec {
     /**
      * Кодирует HELLO-датаграмму, по которой host узнает IP участника.
      */
     fun encodeHello(senderPeerId: PeerId): ByteArray {
+        return encodeHandshake(senderPeerId, TYPE_HELLO)
+    }
+
+    /**
+     * Кодирует подтверждение HELLO, по которому client проверяет двустороннюю UDP-связность.
+     */
+    fun encodeHelloAck(senderPeerId: PeerId): ByteArray {
+        return encodeHandshake(senderPeerId, TYPE_HELLO_ACK)
+    }
+
+    /**
+     * Кодирует служебную handshake-датаграмму без voice payload.
+     */
+    private fun encodeHandshake(senderPeerId: PeerId, type: Int): ByteArray {
         val senderBytes = senderPeerId.value.encodeToByteArray()
         require(senderBytes.isNotEmpty() && senderBytes.size <= MAX_PEER_ID_BYTES) {
             "Некорректная длина PeerId Wi-Fi Direct HELLO: ${senderBytes.size}"
@@ -20,7 +34,7 @@ object WifiDirectVoiceDatagramCodec {
         return ByteArrayOutputStream(HEADER_BYTES + senderBytes.size).use { buffer ->
             DataOutputStream(buffer).use { output ->
                 output.writeInt(MAGIC)
-                output.writeByte(TYPE_HELLO)
+                output.writeByte(type)
                 output.writeShort(senderBytes.size)
                 output.writeInt(0)
                 output.write(senderBytes)
@@ -77,6 +91,7 @@ object WifiDirectVoiceDatagramCodec {
             val senderPeerId = PeerId(senderBytes.decodeToString())
             return when (type) {
                 TYPE_HELLO -> WifiDirectVoiceDatagram.Hello(senderPeerId)
+                TYPE_HELLO_ACK -> WifiDirectVoiceDatagram.HelloAck(senderPeerId)
                 TYPE_FRAME -> {
                     val frameBytes = ByteArray(frameLength)
                     input.readFully(frameBytes)
@@ -94,6 +109,7 @@ object WifiDirectVoiceDatagramCodec {
     private const val MAGIC = 0x42545655
     private const val TYPE_HELLO = 1
     private const val TYPE_FRAME = 2
+    private const val TYPE_HELLO_ACK = 3
     private const val MAX_PEER_ID_BYTES = 512
     private const val MAX_FRAME_BYTES = 8_192
     private val HEADER_BYTES = Int.SIZE_BYTES + 1 + Short.SIZE_BYTES + Int.SIZE_BYTES
@@ -107,6 +123,13 @@ sealed class WifiDirectVoiceDatagram {
      * HELLO от прямого участника, по которому запоминается его UDP endpoint.
      */
     data class Hello(
+        val senderPeerId: PeerId,
+    ) : WifiDirectVoiceDatagram()
+
+    /**
+     * Ответ host-а, подтверждающий получение HELLO и обратную UDP-доступность.
+     */
+    data class HelloAck(
         val senderPeerId: PeerId,
     ) : WifiDirectVoiceDatagram()
 

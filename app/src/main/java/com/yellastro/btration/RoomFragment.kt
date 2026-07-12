@@ -1,11 +1,13 @@
 package com.yellastro.btration
 
+import android.animation.ValueAnimator
 import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.provider.Settings
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
@@ -20,6 +22,10 @@ import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.doOnAttach
+import androidx.core.view.updateLayoutParams
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
 import androidx.lifecycle.Lifecycle
@@ -70,6 +76,8 @@ class RoomFragment : Fragment() {
     private var handledErrorAction: RoomRuntimeErrorAction? = null
     private var lastShownNoticeId = Long.MIN_VALUE
     private var lastShownSnackbarMessage: String? = null
+    private var pushToTalkSizeAnimator: ValueAnimator? = null
+    private var pushToTalkTargetSize = 0
     private lateinit var recordAudioPermissionLauncher: ActivityResultLauncher<String>
 
     /**
@@ -110,7 +118,7 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Настраивает списки участников, чат, кнопки и PTT-визуализацию.
+     * Настраивает списки участников, чат, кнопки, PTT-визуализацию и размер кнопки микрофона при IME.
      */
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
@@ -200,6 +208,66 @@ class RoomFragment : Fragment() {
 
         collectUiState()
         collectNotices()
+
+        val rootView = requireActivity().findViewById<View>(android.R.id.content)
+
+        ViewCompat.setOnApplyWindowInsetsListener(rootView) { _, insets ->
+            val keyboardVisible =
+                insets.isVisible(WindowInsetsCompat.Type.ime())
+
+            Log.d("Keyboard", "IME callback: $keyboardVisible")
+
+            resizePushToTalkForKeyboard(keyboardVisible)
+            insets
+        }
+
+        ViewCompat.requestApplyInsets(rootView)
+    }
+
+    /**
+     * Анимирует реальный layout-размер PTT-кнопки: с клавиатурой она маленькая, без клавиатуры большая.
+     */
+    private fun resizePushToTalkForKeyboard(keyboardVisible: Boolean) {
+        Log.d(
+            "Keyboard",
+            "visible=$keyboardVisible width=${btnPushToTalk.width}"
+        )
+        val targetSize = resources.getDimensionPixelSize(
+            if (keyboardVisible) {
+                R.dimen.micro_size_small
+            } else {
+                R.dimen.micro_size_big
+            }
+        )
+
+        btnPushToTalk.post {
+            pushToTalkSizeAnimator?.cancel()
+
+            val startSize = btnPushToTalk.width
+
+            if (startSize <= 0 || startSize == targetSize) {
+                btnPushToTalk.updateLayoutParams {
+                    width = targetSize
+                    height = targetSize
+                }
+                return@post
+            }
+
+            pushToTalkSizeAnimator = ValueAnimator.ofInt(startSize, targetSize).apply {
+                duration = 180L
+
+                addUpdateListener {
+                    val size = it.animatedValue as Int
+
+                    btnPushToTalk.updateLayoutParams {
+                        width = size
+                        height = size
+                    }
+                }
+
+                start()
+            }
+        }
     }
 
     /**
@@ -211,10 +279,13 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Останавливает передачу микрофона и скрывает клавиатуру при уничтожении view комнаты.
+     * Останавливает передачу микрофона, анимацию PTT-размера и скрывает клавиатуру при уничтожении view комнаты.
      */
     override fun onDestroyView() {
         stopTransmission()
+        pushToTalkSizeAnimator?.cancel()
+        pushToTalkSizeAnimator = null
+        pushToTalkTargetSize = 0
         hideMessageKeyboard()
         super.onDestroyView()
     }
