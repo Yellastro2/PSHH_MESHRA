@@ -23,6 +23,8 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.snackbar.Snackbar
+import com.yellastro.btration.domain.runtime.RoomRuntimeNotice
 import com.yellastro.btration.domain.runtime.RoomRuntimeErrorAction
 import com.yellastro.btration.ui.lobby.LobbyUiState
 import com.yellastro.btration.ui.lobby.LobbyViewModel
@@ -48,6 +50,8 @@ class LobbyFragment : Fragment() {
 
     private var openedRoom = false
     private var handledErrorAction: RoomRuntimeErrorAction? = null
+    private var lastShownNoticeId = Long.MIN_VALUE
+    private var lastShownSnackbarMessage: String? = null
     private var wasEditingName = false
     private var renderedScanCycleId = Long.MIN_VALUE
 
@@ -118,6 +122,7 @@ class LobbyFragment : Fragment() {
         }
 
         collectUiState()
+        collectNotices()
     }
 
     /**
@@ -149,6 +154,17 @@ class LobbyFragment : Fragment() {
     }
 
     /**
+     * Подписывается на одноразовые runtime-уведомления и показывает их через snackbar.
+     */
+    private fun collectNotices() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.notices.collect(::showNotice)
+            }
+        }
+    }
+
+    /**
      * Отрисовывает приветствие, ошибку, список комнат и переход в комнату.
      */
     private fun renderState(state: LobbyUiState) {
@@ -158,6 +174,7 @@ class LobbyFragment : Fragment() {
         renderScanProgress(state)
         tvLobbyError.text = state.errorMessage.orEmpty()
         tvLobbyError.visibility = if (state.errorMessage.isNullOrBlank()) View.GONE else View.VISIBLE
+        showSnackbarIfNeeded(state.errorMessage)
         showErrorActionIfNeeded(state.errorAction)
         roomsAdapter.submitItems(state.availableRooms)
         if (!state.isInRoom) {
@@ -193,6 +210,29 @@ class LobbyFragment : Fragment() {
                 hideNameKeyboard()
             }
         }
+    }
+
+    /**
+     * Показывает одноразовое runtime-уведомление, если оно еще не отображалось этим экраном.
+     */
+    private fun showNotice(notice: RoomRuntimeNotice) {
+        if (lastShownNoticeId == notice.id) {
+            return
+        }
+        lastShownNoticeId = notice.id
+        showSnackbarIfNeeded(notice.message)
+    }
+
+    /**
+     * Показывает snackbar с новым текстом ошибки и не дублирует последний показанный текст.
+     */
+    private fun showSnackbarIfNeeded(message: String?) {
+        val cleanMessage = message?.takeIf { it.isNotBlank() } ?: return
+        if (lastShownSnackbarMessage == cleanMessage) {
+            return
+        }
+        lastShownSnackbarMessage = cleanMessage
+        Snackbar.make(requireView(), cleanMessage, Snackbar.LENGTH_LONG).show()
     }
 
     /**

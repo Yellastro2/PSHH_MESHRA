@@ -35,6 +35,11 @@ class RoomRepository(
     val talkingPeerIds = roomRuntime.talkingPeerIds
 
     /**
+     * Одноразовые уведомления runtime для snackbar во ViewModel/UI.
+     */
+    val notices = roomRuntime.notices
+
+    /**
      * Возвращает PeerId локального пользователя для маппинга UI-состояний комнаты.
      */
     fun getSelfPeerId(): PeerId {

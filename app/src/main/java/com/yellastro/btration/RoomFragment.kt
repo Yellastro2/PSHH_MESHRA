@@ -27,6 +27,8 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.snackbar.Snackbar
+import com.yellastro.btration.domain.runtime.RoomRuntimeNotice
 import com.yellastro.btration.domain.runtime.RoomRuntimeErrorAction
 import com.yellastro.btration.ui.room.ChatMessageUi
 import com.yellastro.btration.ui.room.MemberUi
@@ -66,6 +68,8 @@ class RoomFragment : Fragment() {
     private var latestState = RoomUiState()
     private var closedHandled = false
     private var handledErrorAction: RoomRuntimeErrorAction? = null
+    private var lastShownNoticeId = Long.MIN_VALUE
+    private var lastShownSnackbarMessage: String? = null
     private lateinit var recordAudioPermissionLauncher: ActivityResultLauncher<String>
 
     /**
@@ -195,6 +199,7 @@ class RoomFragment : Fragment() {
         }
 
         collectUiState()
+        collectNotices()
     }
 
     /**
@@ -226,6 +231,17 @@ class RoomFragment : Fragment() {
     }
 
     /**
+     * Подписывается на одноразовые runtime-уведомления и показывает их через snackbar.
+     */
+    private fun collectNotices() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.notices.collect(::showNotice)
+            }
+        }
+    }
+
+    /**
      * Отрисовывает connecting-overlay, участников, чат, ошибку, PTT-состояние и закрытие комнаты.
      */
     private fun renderState(state: RoomUiState) {
@@ -236,6 +252,7 @@ class RoomFragment : Fragment() {
         btnSend.alpha = if (btnSend.isEnabled) 1.0f else 0.45f
         tvRoomError.text = state.errorMessage.orEmpty()
         tvRoomError.visibility = if (state.errorMessage.isNullOrBlank()) View.GONE else View.VISIBLE
+        showSnackbarIfNeeded(state.errorMessage)
         showErrorActionIfNeeded(state.errorAction)
         if (etMessage.text.toString() != state.inputText) {
             etMessage.setText(state.inputText)
@@ -254,6 +271,29 @@ class RoomFragment : Fragment() {
         if (!state.isTalking && isTransmitting) {
             stopTransmission()
         }
+    }
+
+    /**
+     * Показывает одноразовое runtime-уведомление, если оно еще не отображалось этим экраном.
+     */
+    private fun showNotice(notice: RoomRuntimeNotice) {
+        if (lastShownNoticeId == notice.id) {
+            return
+        }
+        lastShownNoticeId = notice.id
+        showSnackbarIfNeeded(notice.message)
+    }
+
+    /**
+     * Показывает snackbar с новым текстом ошибки и не дублирует последний показанный текст.
+     */
+    private fun showSnackbarIfNeeded(message: String?) {
+        val cleanMessage = message?.takeIf { it.isNotBlank() } ?: return
+        if (lastShownSnackbarMessage == cleanMessage) {
+            return
+        }
+        lastShownSnackbarMessage = cleanMessage
+        Snackbar.make(requireView(), cleanMessage, Snackbar.LENGTH_LONG).show()
     }
 
     /**

@@ -17,7 +17,8 @@ enum class WirePacketType {
     CHAT_MESSAGE,
     ROOM_CLOSED,
     PING,
-    PONG
+    PONG,
+    VOICE_TRANSPORT_INFO
 }
 
 /**
@@ -33,6 +34,7 @@ data class WirePacket(
     val peer: Peer? = null,
     val members: List<Peer> = emptyList(),
     val message: ChatMessage? = null,
+    val voiceTransportInfo: VoiceTransportControlInfo? = null,
     val reason: String? = null,
     val ttl: Int = 0,
     val sentAtMillis: Long = 0L,

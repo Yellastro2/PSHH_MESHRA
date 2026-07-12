@@ -691,6 +691,7 @@ class NearbyTransport(
             WirePacketType.PING,
             WirePacketType.PONG,
             WirePacketType.ROOM_INFO,
+            WirePacketType.VOICE_TRANSPORT_INFO,
             -> packet.sender?.peerId ?: packet.roomInfo?.host?.peerId
 
             WirePacketType.MEMBER_JOINED,
@@ -795,6 +796,7 @@ class NearbyTransport(
             WirePacketType.PING,
             WirePacketType.PONG,
             WirePacketType.ROOM_INFO,
+            WirePacketType.VOICE_TRANSPORT_INFO,
         )
         private val RECOVERABLE_CONNECTION_STATUS_CODES = setOf(
             ConnectionsStatusCodes.STATUS_RADIO_ERROR,

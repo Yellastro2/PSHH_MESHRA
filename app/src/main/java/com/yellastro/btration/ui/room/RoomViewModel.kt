@@ -54,6 +54,11 @@ class RoomViewModel(
     )
 
     /**
+     * Одноразовые уведомления runtime, которые экран комнаты показывает через snackbar.
+     */
+    val notices = roomRepository.notices
+
+    /**
      * Обновляет текст в поле ввода.
      */
     fun onMessageChanged(value: String) {

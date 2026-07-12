@@ -22,12 +22,16 @@
 ## BYTES payload для MVP-голоса
 
 - Актуальный PTT-голос отправляется короткими `Payload.fromBytes(...)` фреймами формата `BTVO`.
+- Nearby-реализация голоса изолирована в `NearbyVoiceTransport`, а `VoiceRuntime` работает через общий `VoiceTransport`.
+- В режиме `WIFI_DIRECT_UDP` Nearby больше не несет аудио, но продолжает передавать `JOIN_ACCEPTED` с полным `RoomInfo.host.peerId` и `VOICE_TRANSPORT_INFO` для запуска Wi-Fi Direct handshake.
+- Реальный Wi-Fi Direct `deviceAddress` не передается через Nearby: client находит host-а через DNS-SD TXT `hostPeerId=<RoomInfo.host.peerId>` и берет адрес из `srcDevice.deviceAddress`.
 - Один фрейм несет `originPeerId`, `sequence`, признак `isFinal` и Opus packet примерно на 40 ms речи.
 - На говорящем устройстве `AudioRecord` дает PCM16 mono 16 kHz, затем `OpusVoiceEncoder` кодирует его в Opus.
 - На слушающем устройстве `OpusVoiceDecoder` декодирует Opus обратно в PCM16 перед `PcmVoicePlayer` / `AudioTrack`.
 - Host при получении frame проверяет, что `originPeerId == directPeerId`, ретранслирует сжатый Opus-frame остальным участникам без decode/re-encode, а для собственного динамика декодирует отдельной локальной веткой.
 - Client принимает voice frame только от host endpoint-а и только если `originPeerId` есть в списке участников.
 - Ошибка отправки отдельного voice frame логируется, но не переводит комнату в Error: голос может потерять фрейм, а чат и сессия должны жить дальше.
+- Если Nearby API возвращает `ApiException` при discovery/advertising/connect/accept, `RoomRuntime` переводит состояние в Error и отправляет snackbar `Nearby Connections не поддерживается или недоступен на этом устройстве`.
 
 ## STREAM payload для старого MVP-голоса
 

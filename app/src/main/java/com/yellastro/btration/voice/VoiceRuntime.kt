@@ -1,29 +1,21 @@
 package com.yellastro.btration.voice
 
 import android.util.Log
-import com.yellastro.btration.data.nearby.NearbyTransport
 import com.yellastro.btration.domain.model.PeerId
-import java.io.InputStream
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Управляет MVP-голосом комнаты: кодирует локальный PCM в Opus BYTES-фреймы, проигрывает входящий Opus и ретранслирует его через host.
+ * Управляет MVP-голосом комнаты: кодирует локальный PCM в Opus frames, отдает их VoiceTransport и декодирует входящий Opus для playback.
  */
 class VoiceRuntime(
-    private val nearbyTransport: NearbyTransport,
+    private val voiceTransport: VoiceTransport,
     private val voiceCapture: PcmVoiceCapture,
     private val voicePlayer: PcmVoicePlayer,
     private val externalScope: CoroutineScope,
@@ -33,14 +25,12 @@ class VoiceRuntime(
     private var activeTalkingTargetPeerIds: Set<PeerId> = emptySet()
     private var activeOutgoingEncoder: OpusVoiceEncoder? = null
     private var outgoingVoiceSequence = 0L
-    private val incomingStreamIds = AtomicLong(0L)
-    private val activeIncomingStreams = ConcurrentHashMap<Long, ActiveIncomingStream>()
     private val activeFrameSessions = ConcurrentHashMap<PeerId, ActiveFrameSession>()
     private val frameSessionLock = Any()
     private val outgoingEncoderLock = Any()
 
     /**
-     * Начинает передачу микрофона от исходного участника выбранным адресатам через короткие Nearby BYTES-фреймы.
+     * Начинает передачу микрофона от исходного участника выбранным адресатам через текущий VoiceTransport.
      */
     fun startTalking(originPeerId: PeerId, targetPeerIds: Set<PeerId>): Boolean {
         if (isTalking) {
@@ -117,72 +107,6 @@ class VoiceRuntime(
     }
 
     /**
-     * Читает исходного автора stream, проверяет маршрут через callback, локально играет PCM и при необходимости ретранслирует его.
-     */
-    fun playIncoming(
-        directPeerId: PeerId,
-        inputStream: InputStream,
-        resolveRelayTargets: (directPeerId: PeerId, originPeerId: PeerId) -> Set<PeerId>?,
-        onStarted: (PeerId) -> Unit,
-        onFinished: (PeerId) -> Unit,
-    ) {
-        val incomingStreamId = incomingStreamIds.incrementAndGet()
-        val activeIncomingStream = ActiveIncomingStream(inputStream)
-        val job = externalScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
-            var inputOwnedByJob = true
-            var startedOriginPeerId: PeerId? = null
-            var completionOwnedByPlayer = false
-            try {
-                val originPeerId = VoiceStreamCodec.readOriginPeerId(inputStream)
-                val relayTargetPeerIds = resolveRelayTargets(directPeerId, originPeerId)
-                if (relayTargetPeerIds == null) {
-                    Log.w(
-                        TAG,
-                        "[playIncoming] Голосовой stream отклонен directPeerId=${directPeerId.value} originPeerId=${originPeerId.value}",
-                    )
-                    return@launch
-                }
-
-                Log.i(
-                    TAG,
-                    "[playIncoming] Голосовой stream принят directPeerId=${directPeerId.value} originPeerId=${originPeerId.value} relayTargetCount=${relayTargetPeerIds.size}",
-                )
-                onStarted(originPeerId)
-                startedOriginPeerId = originPeerId
-                if (relayTargetPeerIds.isEmpty()) {
-                    voicePlayer.play(originPeerId, inputStream, onFinished)
-                    completionOwnedByPlayer = true
-                    inputOwnedByJob = false
-                } else {
-                    relayAndPlay(
-                        originPeerId = originPeerId,
-                        sourceInputStream = inputStream,
-                        relayTargetPeerIds = relayTargetPeerIds,
-                        activeIncomingStream = activeIncomingStream,
-                        onFinished = onFinished,
-                        onPlayerStarted = { completionOwnedByPlayer = true },
-                    )
-                }
-            } catch (cause: Throwable) {
-                if (isActive) {
-                    Log.w(TAG, "[playIncoming] Не удалось обработать входящий голосовой stream: ${cause.message}", cause)
-                }
-                if (!completionOwnedByPlayer) {
-                    startedOriginPeerId?.let(onFinished)
-                }
-            } finally {
-                activeIncomingStreams.remove(incomingStreamId)
-                if (inputOwnedByJob) {
-                    runCatching { inputStream.close() }
-                }
-            }
-        }
-        activeIncomingStream.attachJob(job)
-        activeIncomingStreams[incomingStreamId] = activeIncomingStream
-        job.start()
-    }
-
-    /**
      * Принимает короткий Opus voice frame, проверяет маршрут, пишет декодированный PCM в player и при необходимости ретранслирует frame без decode/re-encode.
      */
     fun playIncomingFrame(
@@ -202,7 +126,7 @@ class VoiceRuntime(
         }
 
         if (relayTargetPeerIds.isNotEmpty()) {
-            nearbyTransport.sendVoiceFrameToPeers(relayTargetPeerIds, frame)
+            voiceTransport.sendFrameToPeers(relayTargetPeerIds, frame)
         }
 
         if (frame.isFinal) {
@@ -228,12 +152,10 @@ class VoiceRuntime(
     }
 
     /**
-     * Останавливает локальную передачу, старые входящие streams и новые Opus frame-сессии.
+     * Останавливает локальную передачу и входящие Opus frame-сессии.
      */
     fun stopAll() {
         stopTalking()
-        activeIncomingStreams.values.forEach { activeStream -> activeStream.close() }
-        activeIncomingStreams.clear()
         synchronized(frameSessionLock) {
             activeFrameSessions.values.forEach { frameSession -> frameSession.cancel() }
             activeFrameSessions.clear()
@@ -243,7 +165,14 @@ class VoiceRuntime(
             activeOutgoingEncoder = null
         }
         voicePlayer.stopAll()
-        Log.i(TAG, "[stopAll] Все голосовые streams остановлены")
+        Log.i(TAG, "[stopAll] Все голосовые frame-сессии остановлены")
+    }
+
+    /**
+     * Завершает входящую frame-сессию участника, если final-frame потерялся в UDP media-plane.
+     */
+    fun finishIncomingFrameSession(originPeerId: PeerId) {
+        finishFrameSession(originPeerId)
     }
 
     /**
@@ -266,7 +195,7 @@ class VoiceRuntime(
                 return
             }
         }
-        nearbyTransport.sendVoiceFrameToPeers(
+        voiceTransport.sendFrameToPeers(
             targetPeerIds,
             VoiceFrame(
                 originPeerId = originPeerId,
@@ -316,106 +245,6 @@ class VoiceRuntime(
             activeFrameSessions.remove(originPeerId)
         }?.close()
         Log.i(TAG, "[finishFrameSession] Входящая frame-сессия завершена originPeerId=${originPeerId.value}")
-    }
-
-    /**
-     * Разделяет входящий PCM на локальное воспроизведение и новый Nearby stream для остальных участников.
-     */
-    private suspend fun relayAndPlay(
-        originPeerId: PeerId,
-        sourceInputStream: InputStream,
-        relayTargetPeerIds: Set<PeerId>,
-        activeIncomingStream: ActiveIncomingStream,
-        onFinished: (PeerId) -> Unit,
-        onPlayerStarted: () -> Unit,
-    ) {
-        val localInputStream = PipedInputStream(PcmVoiceConfig.PIPE_BUFFER_BYTES)
-        val localOutputStream = PipedOutputStream(localInputStream)
-        val relayInputStream = PipedInputStream(PcmVoiceConfig.PIPE_BUFFER_BYTES)
-        val relayOutputStream = PipedOutputStream(relayInputStream)
-        activeIncomingStream.registerBranch(localInputStream)
-        activeIncomingStream.registerBranch(relayInputStream)
-        var localBranchOpen = true
-        var relayBranchOpen = true
-
-        try {
-            voicePlayer.play(originPeerId, localInputStream, onFinished)
-            onPlayerStarted()
-            nearbyTransport.sendStreamToPeers(relayTargetPeerIds, originPeerId, relayInputStream)
-            Log.i(
-                TAG,
-                "[relayAndPlay] Host начал ретрансляцию originPeerId=${originPeerId.value} relayTargetCount=${relayTargetPeerIds.size}",
-            )
-
-            val buffer = ByteArray(PcmVoiceConfig.FRAME_BYTES)
-            while (currentCoroutineContext().isActive && (localBranchOpen || relayBranchOpen)) {
-                val readBytes = sourceInputStream.read(buffer)
-                if (readBytes < 0) {
-                    break
-                }
-                if (readBytes == 0) {
-                    continue
-                }
-                if (localBranchOpen) {
-                    localBranchOpen = writeBranch(localOutputStream, buffer, readBytes, "локальное воспроизведение")
-                }
-                if (relayBranchOpen) {
-                    relayBranchOpen = writeBranch(relayOutputStream, buffer, readBytes, "ретрансляция")
-                }
-            }
-        } finally {
-            runCatching { sourceInputStream.close() }
-            runCatching { localOutputStream.close() }
-            runCatching { relayOutputStream.close() }
-            Log.i(TAG, "[relayAndPlay] Host завершил ретрансляцию originPeerId=${originPeerId.value}")
-        }
-    }
-
-    /**
-     * Пишет один PCM-фрагмент в ветку tee и отключает только эту ветку при ошибке потребителя.
-     */
-    private fun writeBranch(outputStream: PipedOutputStream, buffer: ByteArray, byteCount: Int, branchName: String): Boolean {
-        return runCatching {
-            outputStream.write(buffer, 0, byteCount)
-            true
-        }.onFailure { cause ->
-            Log.w(TAG, "[writeBranch] Ветка $branchName закрыта: ${cause.message}")
-            runCatching { outputStream.close() }
-        }.getOrDefault(false)
-    }
-
-    /**
-     * Активная задача чтения входящего stream, которую можно остановить закрытием источника.
-     */
-    private class ActiveIncomingStream(
-        private val inputStream: InputStream,
-    ) {
-        private val branchInputStreams = CopyOnWriteArrayList<InputStream>()
-        private var job: Job? = null
-
-        /**
-         * Привязывает coroutine обработки после ее создания в ленивом состоянии.
-         */
-        fun attachJob(job: Job) {
-            this.job = job
-        }
-
-        /**
-         * Регистрирует вход pipe-ветки, чтобы stopAll мог разблокировать соответствующий writer.
-         */
-        fun registerBranch(inputStream: InputStream) {
-            branchInputStreams += inputStream
-        }
-
-        /**
-         * Останавливает обработку и закрывает источник с pipe-ветками для разблокировки read/write.
-         */
-        fun close() {
-            job?.cancel()
-            runCatching { inputStream.close() }
-            branchInputStreams.forEach { branchInputStream -> runCatching { branchInputStream.close() } }
-            branchInputStreams.clear()
-        }
     }
 
     /**

@@ -50,6 +50,11 @@ class LobbyViewModel(
     )
 
     /**
+     * Одноразовые уведомления runtime, которые лобби показывает через snackbar.
+     */
+    val notices = roomRepository.notices
+
+    /**
      * Переводит приветствие в режим редактирования сохраненного имени.
      */
     fun onEditNameClicked() {

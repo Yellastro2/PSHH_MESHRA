@@ -1,6 +1,7 @@
 package com.yellastro.btration.domain.runtime
 
 import android.util.Log
+import com.google.android.gms.common.api.ApiException
 import com.yellastro.btration.data.nearby.NearbyEvent
 import com.yellastro.btration.data.nearby.NearbyRequirementException
 import com.yellastro.btration.data.nearby.NearbyRoomAdvertisement
@@ -13,16 +14,23 @@ import com.yellastro.btration.domain.model.RoomInfo
 import com.yellastro.btration.domain.model.WirePacket
 import com.yellastro.btration.domain.model.WirePacketId
 import com.yellastro.btration.domain.model.WirePacketType
+import com.yellastro.btration.domain.model.VoiceTransportControlInfo
 import com.yellastro.btration.domain.util.IdGenerator
 import com.yellastro.btration.repository.ProfileRepository
+import com.yellastro.btration.voice.VoiceTransport
+import com.yellastro.btration.voice.VoiceTransportEvent
 import com.yellastro.btration.voice.VoiceRuntime
+import com.yellastro.btration.voice.VoiceTransportSessionRole
 import java.io.InputStream
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -34,6 +42,7 @@ import kotlinx.coroutines.sync.withLock
 class RoomRuntime(
     private val profileRepository: ProfileRepository,
     private val nearbyTransport: NearbyTransport,
+    private val voiceTransport: VoiceTransport,
     private val voiceRuntime: VoiceRuntime,
     private val idGenerator: IdGenerator,
     private val externalScope: CoroutineScope,
@@ -42,6 +51,7 @@ class RoomRuntime(
     private val _availableRooms = MutableStateFlow<List<RoomInfo>>(emptyList())
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
     private val _talkingPeerIds = MutableStateFlow<Set<PeerId>>(emptySet())
+    private val _notices = MutableSharedFlow<RoomRuntimeNotice>(replay = 1, extraBufferCapacity = NOTICE_BUFFER_CAPACITY)
 
     private val roomEndpoints = mutableMapOf<RoomId, String>()
     private val endpointRooms = mutableMapOf<String, RoomId>()
@@ -53,6 +63,8 @@ class RoomRuntime(
     private var recoveringRoomId: RoomId? = null
     private var recoveryReconnectRequested = false
     private var connectionRecoveryAttemptCount = 0
+    private var noticeId = 0L
+    private val talkingPeerTimeoutJobs = ConcurrentHashMap<PeerId, Job>()
 
     /**
      * Текущее состояние runtime: idle/searching/hosting/joining/client/error.
@@ -70,9 +82,14 @@ class RoomRuntime(
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
 
     /**
-     * PeerId участников, чей голосовой stream сейчас передается или доигрывается локально.
+     * PeerId участников, чьи голосовые frames сейчас передаются или доигрываются локально.
      */
     val talkingPeerIds: StateFlow<Set<PeerId>> = _talkingPeerIds.asStateFlow()
+
+    /**
+     * Одноразовые уведомления для snackbar, которые не обязаны менять состояние комнаты.
+     */
+    val notices: SharedFlow<RoomRuntimeNotice> = _notices.asSharedFlow()
 
     /**
      * Возвращает PeerId локального пользователя для верхних слоев без доступа к ProfileRepository.
@@ -85,6 +102,10 @@ class RoomRuntime(
         externalScope.launch {
             Log.i(TAG, "[init] Подписываем RoomRuntime на события NearbyTransport")
             nearbyTransport.events.collect(::handleNearbyEvent)
+        }
+        externalScope.launch {
+            Log.i(TAG, "[init] Подписываем RoomRuntime на события VoiceTransport")
+            voiceTransport.events.collect(::handleVoiceTransportEvent)
         }
     }
 
@@ -178,6 +199,7 @@ class RoomRuntime(
         )
         _messages.value = emptyList()
         _state.value = RoomRuntimeState.Hosting(room = room, members = listOf(self))
+        voiceTransport.startSession(self.peerId, VoiceTransportSessionRole.HOST)
         Log.i(TAG, "[createRoom] Runtime переведен в Hosting roomId=${room.roomId.value} roomName=${room.name} hostPeerId=${self.peerId.value}")
         nearbyTransport.startAdvertising(room)
     }
@@ -381,10 +403,13 @@ class RoomRuntime(
     }
 
     /**
-     * Обрабатывает события NearbyTransport и маршрутизирует их в доменную логику.
+     * Обрабатывает signaling-события NearbyTransport и маршрутизирует их в доменную логику комнаты.
      */
     private fun handleNearbyEvent(event: NearbyEvent) {
-        if (event !is NearbyEvent.VoiceFrameReceived && event !is NearbyEvent.PayloadTransferUpdated) {
+        if (event !is NearbyEvent.PayloadTransferUpdated &&
+            event !is NearbyEvent.VoiceFrameReceived &&
+            event !is NearbyEvent.VoiceFrameSendFailed
+        ) {
             Log.i(TAG, "[handleNearbyEvent] Получено событие NearbyEvent type=${event.javaClass.simpleName} currentState=${_state.value.javaClass.simpleName}")
         }
         when (event) {
@@ -396,67 +421,127 @@ class RoomRuntime(
             is NearbyEvent.Disconnected -> handleDisconnected(event)
             is NearbyEvent.PacketReceived -> handlePacketReceived(event)
             is NearbyEvent.StreamReceived -> handleStreamReceived(event)
-            is NearbyEvent.VoiceFrameReceived -> handleVoiceFrameReceived(event)
-            is NearbyEvent.AdvertisingFailed -> setError(
-                message = "Не удалось запустить комнату: ${event.cause.message.orEmpty()}",
-                action = actionFor(event.cause),
-            )
-            is NearbyEvent.DiscoveryFailed -> setError(
-                message = "Не удалось начать поиск комнат: ${event.cause.message.orEmpty()}",
-                action = actionFor(event.cause),
-            )
-            is NearbyEvent.ConnectionRequestFailed -> setError("Не удалось подключиться к комнате: ${event.cause.message.orEmpty()}")
-            is NearbyEvent.ConnectionAcceptFailed -> setError("Не удалось принять подключение: ${event.cause.message.orEmpty()}")
+            is NearbyEvent.AdvertisingFailed -> {
+                val message = nearbyFailureMessage("запустить комнату", event.cause)
+                emitNotice(message)
+                setError(
+                    message = message,
+                    action = actionFor(event.cause),
+                )
+            }
+            is NearbyEvent.DiscoveryFailed -> {
+                val message = nearbyFailureMessage("начать поиск комнат", event.cause)
+                emitNotice(message)
+                setError(
+                    message = message,
+                    action = actionFor(event.cause),
+                )
+            }
+            is NearbyEvent.ConnectionRequestFailed -> {
+                val message = nearbyFailureMessage("подключиться к комнате", event.cause)
+                emitNotice(message)
+                setError(message)
+            }
+            is NearbyEvent.ConnectionAcceptFailed -> {
+                val message = nearbyFailureMessage("принять подключение", event.cause)
+                emitNotice(message)
+                setError(message)
+            }
             is NearbyEvent.PayloadDecodeFailed -> setError("Не удалось прочитать пакет: ${event.cause.message.orEmpty()}")
             is NearbyEvent.SendFailed -> setError("Не удалось отправить пакет: ${event.cause.message.orEmpty()}")
             is NearbyEvent.StreamSendFailed -> setError("Не удалось отправить голос: ${event.cause.message.orEmpty()}")
-            is NearbyEvent.VoiceFrameSendFailed -> Log.w(TAG, "[handleNearbyEvent] Voice frame не отправлен, не роняем комнату: ${event.cause.message}", event.cause)
             is NearbyEvent.ConnectionInitiated,
             is NearbyEvent.PayloadTransferUpdated,
             is NearbyEvent.UnsupportedPayloadReceived,
+            is NearbyEvent.VoiceFrameReceived,
+            is NearbyEvent.VoiceFrameSendFailed,
             -> Unit
         }
     }
 
     /**
-     * Передает входящий voice stream в VoiceRuntime, который проверит исходного автора и выполнит host relay.
+     * Обрабатывает события VoiceTransport и отделяет media-plane от signaling-событий комнаты.
      */
-    private fun handleStreamReceived(event: NearbyEvent.StreamReceived) {
-        val peerId = event.peerId
-        if (peerId == null) {
-            Log.w(TAG, "[handleStreamReceived] Голосовой stream без известного peerId endpointId=${event.endpointId}")
-            closeInputStream(event.inputStream)
-            return
+    private fun handleVoiceTransportEvent(event: VoiceTransportEvent) {
+        when (event) {
+            is VoiceTransportEvent.LocalControlInfoChanged -> handleLocalVoiceTransportInfoChanged(event.info)
+            is VoiceTransportEvent.FrameReceived -> handleVoiceFrameReceived(event)
+            is VoiceTransportEvent.TransportUnavailable -> emitNotice(event.message)
+            is VoiceTransportEvent.FrameSendFailed -> Log.w(
+                TAG,
+                "[handleVoiceTransportEvent] Voice frame не отправлен, не роняем комнату: ${event.cause.message}",
+                event.cause,
+            )
         }
-
-        if (_state.value !is RoomRuntimeState.Hosting && _state.value !is RoomRuntimeState.Client) {
-            Log.w(TAG, "[handleStreamReceived] Голосовой stream получен вне активной комнаты currentState=${_state.value.javaClass.simpleName}")
-            closeInputStream(event.inputStream)
-            return
-        }
-
-        voiceRuntime.playIncoming(
-            directPeerId = peerId,
-            inputStream = event.inputStream,
-            resolveRelayTargets = ::resolveVoiceRelayTargets,
-            onStarted = ::addTalkingPeer,
-            onFinished = ::removeTalkingPeer,
-        )
     }
 
     /**
-     * Передает входящий voice frame в VoiceRuntime после проверки прямого Nearby-соседа.
+     * Рассылает локальную voice transport info активным соседям через Nearby signaling.
      */
-    private fun handleVoiceFrameReceived(event: NearbyEvent.VoiceFrameReceived) {
-        val peerId = event.peerId
+    private fun handleLocalVoiceTransportInfoChanged(info: VoiceTransportControlInfo) {
+        when (val currentState = _state.value) {
+            is RoomRuntimeState.Hosting -> {
+                Log.i(TAG, "[handleLocalVoiceTransportInfoChanged] Host рассылает voice info memberCount=${currentState.members.size}")
+                sendToMembers(
+                    currentState.members,
+                    packet(
+                        type = WirePacketType.VOICE_TRANSPORT_INFO,
+                        roomId = currentState.room.roomId,
+                        sender = profileRepository.getSelfPeer(),
+                        voiceTransportInfo = info,
+                    ),
+                    excludedPeerIds = setOf(profileRepository.getOrCreatePeerId()),
+                )
+            }
+
+            is RoomRuntimeState.Client -> {
+                Log.i(TAG, "[handleLocalVoiceTransportInfoChanged] Client отправляет voice info hostPeerId=${currentState.room.host.peerId.value}")
+                nearbyTransport.sendToPeer(
+                    currentState.room.host.peerId,
+                    packet(
+                        type = WirePacketType.VOICE_TRANSPORT_INFO,
+                        roomId = currentState.room.roomId,
+                        sender = profileRepository.getSelfPeer(),
+                        voiceTransportInfo = info,
+                    ),
+                )
+            }
+
+            RoomRuntimeState.Idle,
+            RoomRuntimeState.Searching,
+            is RoomRuntimeState.Joining,
+            is RoomRuntimeState.Error,
+            -> Log.i(TAG, "[handleLocalVoiceTransportInfoChanged] Voice info пока не отправлена currentState=${currentState.javaClass.simpleName}")
+        }
+    }
+
+    /**
+     * Закрывает legacy voice stream, потому что актуальный media-plane работает через VoiceTransport frames.
+     */
+    private fun handleStreamReceived(event: NearbyEvent.StreamReceived) {
+        Log.i(TAG, "[handleStreamReceived] Legacy voice stream закрыт endpointId=${event.endpointId} peerId=${event.peerId?.value}")
+        closeInputStream(event.inputStream)
+    }
+
+    /**
+     * Передает входящий voice frame в VoiceRuntime после проверки прямого соседа транспорта.
+     */
+    private fun handleVoiceFrameReceived(event: VoiceTransportEvent.FrameReceived) {
+        val peerId = event.transportPeerId
         if (peerId == null) {
-            Log.w(TAG, "[handleVoiceFrameReceived] Voice frame без известного peerId endpointId=${event.endpointId}")
+            Log.w(TAG, "[handleVoiceFrameReceived] Voice frame без известного peerId endpointId=${event.transportEndpointId}")
             return
         }
 
         if (_state.value !is RoomRuntimeState.Hosting && _state.value !is RoomRuntimeState.Client) {
             Log.w(TAG, "[handleVoiceFrameReceived] Voice frame получен вне активной комнаты currentState=${_state.value.javaClass.simpleName}")
             return
+        }
+        if (event.frame.isFinal) {
+            cancelTalkingPeerTimeout(event.frame.originPeerId)
+        } else {
+            addTalkingPeer(event.frame.originPeerId)
+            scheduleTalkingPeerTimeout(event.frame.originPeerId)
         }
 
         voiceRuntime.playIncomingFrame(
@@ -469,7 +554,7 @@ class RoomRuntime(
     }
 
     /**
-     * Проверяет заявленного автора voice stream и возвращает адресатов host relay либо null при недопустимом маршруте.
+     * Проверяет заявленного автора voice frame и возвращает адресатов host relay либо null при недопустимом маршруте.
      */
     private fun resolveVoiceRelayTargets(directPeerId: PeerId, originPeerId: PeerId): Set<PeerId>? {
         return when (val currentState = _state.value) {
@@ -676,6 +761,7 @@ class RoomRuntime(
             return
         }
         Log.i(TAG, "[handleDisconnected] Peer отключился endpointId=${event.endpointId} peerId=${peerId.value} currentState=${_state.value.javaClass.simpleName}")
+        cancelTalkingPeerTimeout(peerId)
         removeTalkingPeer(peerId)
         when (val currentState = _state.value) {
             is RoomRuntimeState.Hosting -> {
@@ -706,6 +792,7 @@ class RoomRuntime(
     private fun beginClientReconnectAfterHostDisconnect(currentState: RoomRuntimeState.Client) {
         clearConnectionRecovery()
         voiceRuntime.stopAll()
+        voiceTransport.stopSession()
         _talkingPeerIds.value = emptySet()
         val reconnectRoom = realRoomToAdvertisedRoom[currentState.room.roomId] ?: currentState.room
         val oldEndpointId = roomEndpoints.remove(currentState.room.roomId)
@@ -748,6 +835,7 @@ class RoomRuntime(
             WirePacketType.CHAT_MESSAGE -> handleChatMessage(event.packet)
             WirePacketType.ROOM_CLOSED -> handleRoomClosed()
             WirePacketType.PING -> handlePing(event.packet)
+            WirePacketType.VOICE_TRANSPORT_INFO -> handleVoiceTransportInfo(event.packet)
             WirePacketType.PONG,
             WirePacketType.ROOM_INFO,
             -> Unit
@@ -778,6 +866,7 @@ class RoomRuntime(
                 roomId = currentState.room.roomId,
                 sender = profileRepository.getSelfPeer(),
                 roomInfo = currentState.room,
+                voiceTransportInfo = voiceTransport.localControlInfo,
             ),
         )
         nearbyTransport.sendToPeer(
@@ -799,6 +888,9 @@ class RoomRuntime(
             ),
             excludedPeerIds = setOf(profileRepository.getOrCreatePeerId(), joiningPeer.peerId),
         )
+        voiceTransport.localControlInfo?.let { info ->
+            sendVoiceTransportInfoTo(joiningPeer.peerId, currentState.room.roomId, info)
+        }
     }
 
     /**
@@ -815,6 +907,13 @@ class RoomRuntime(
         replaceAdvertisedRoomMappingIfNeeded(advertisedRoom = currentState.room, realRoom = room)
         _state.value = RoomRuntimeState.Client(room = room, members = listOf(room.host, profileRepository.getSelfPeer()))
         clearConnectionRecovery()
+        voiceTransport.startSession(profileRepository.getOrCreatePeerId(), VoiceTransportSessionRole.CLIENT)
+        packet.voiceTransportInfo?.let { info ->
+            voiceTransport.handleControlInfo(room.host.peerId, info)
+        }
+        voiceTransport.localControlInfo?.let { info ->
+            sendVoiceTransportInfoTo(room.host.peerId, room.roomId, info)
+        }
         Log.i(TAG, "[handleJoinAccepted] Runtime переведен в Client roomId=${room.roomId.value}")
     }
 
@@ -973,6 +1072,24 @@ class RoomRuntime(
     }
 
     /**
+     * Передает служебную voice transport info текущему media-plane.
+     */
+    private fun handleVoiceTransportInfo(packet: WirePacket) {
+        val info = packet.voiceTransportInfo
+        val senderPeerId = packet.sender?.peerId ?: info?.peerId
+        if (info == null || senderPeerId == null) {
+            Log.w(TAG, "[handleVoiceTransportInfo] Некорректный VOICE_TRANSPORT_INFO senderPeerId=${senderPeerId?.value}")
+            return
+        }
+        if (!isPacketForCurrentRoom(packet.roomId)) {
+            Log.w(TAG, "[handleVoiceTransportInfo] VOICE_TRANSPORT_INFO не для текущей комнаты roomId=${packet.roomId?.value}")
+            return
+        }
+        voiceTransport.handleControlInfo(senderPeerId, info)
+        Log.i(TAG, "[handleVoiceTransportInfo] Voice transport info передан media-plane fromPeerId=${senderPeerId.value} mode=${info.mode}")
+    }
+
+    /**
      * Отправляет JOIN_REJECTED, если host может определить адресата.
      */
     private fun sendJoinRejected(peer: Peer?, roomId: RoomId?, reason: String) {
@@ -988,6 +1105,22 @@ class RoomRuntime(
                 roomId = roomId,
                 sender = profileRepository.getSelfPeer(),
                 reason = reason,
+            ),
+        )
+    }
+
+    /**
+     * Отправляет voice transport info одному участнику через Nearby signaling.
+     */
+    private fun sendVoiceTransportInfoTo(peerId: PeerId, roomId: RoomId, info: VoiceTransportControlInfo) {
+        Log.i(TAG, "[sendVoiceTransportInfoTo] Отправляем voice info peerId=${peerId.value} mode=${info.mode}")
+        nearbyTransport.sendToPeer(
+            peerId,
+            packet(
+                type = WirePacketType.VOICE_TRANSPORT_INFO,
+                roomId = roomId,
+                sender = profileRepository.getSelfPeer(),
+                voiceTransportInfo = info,
             ),
         )
     }
@@ -1056,7 +1189,7 @@ class RoomRuntime(
     }
 
     /**
-     * Добавляет участника в набор говорящих, если его voice stream активен.
+     * Добавляет участника в набор говорящих, если его voice frames активны.
      */
     private fun addTalkingPeer(peerId: PeerId) {
         if (peerId in _talkingPeerIds.value) {
@@ -1067,7 +1200,7 @@ class RoomRuntime(
     }
 
     /**
-     * Убирает участника из набора говорящих после остановки передачи или завершения входящего stream.
+     * Убирает участника из набора говорящих после остановки передачи или завершения входящих frames.
      */
     private fun removeTalkingPeer(peerId: PeerId) {
         if (peerId !in _talkingPeerIds.value) {
@@ -1075,6 +1208,35 @@ class RoomRuntime(
         }
         _talkingPeerIds.value = _talkingPeerIds.value - peerId
         Log.i(TAG, "[removeTalkingPeer] Участник больше не говорит peerId=${peerId.value} talkingCount=${_talkingPeerIds.value.size}")
+    }
+
+    /**
+     * Перезапускает fallback-таймер говорящего участника на случай потери final voice frame в UDP media-plane.
+     */
+    private fun scheduleTalkingPeerTimeout(peerId: PeerId) {
+        talkingPeerTimeoutJobs.remove(peerId)?.cancel()
+        talkingPeerTimeoutJobs[peerId] = externalScope.launch {
+            delay(TALKING_PEER_TIMEOUT_MILLIS)
+            talkingPeerTimeoutJobs.remove(peerId)
+            voiceRuntime.finishIncomingFrameSession(peerId)
+            removeTalkingPeer(peerId)
+            Log.i(TAG, "[scheduleTalkingPeerTimeout] Индикатор эфира погашен по таймауту peerId=${peerId.value}")
+        }
+    }
+
+    /**
+     * Отменяет fallback-таймер говорящего участника, если его поток завершился штатно или peer отключился.
+     */
+    private fun cancelTalkingPeerTimeout(peerId: PeerId) {
+        talkingPeerTimeoutJobs.remove(peerId)?.cancel()
+    }
+
+    /**
+     * Отменяет все fallback-таймеры говорящих участников при сбросе комнаты.
+     */
+    private fun clearTalkingPeerTimeouts() {
+        talkingPeerTimeoutJobs.values.forEach { job -> job.cancel() }
+        talkingPeerTimeoutJobs.clear()
     }
 
     /**
@@ -1106,6 +1268,7 @@ class RoomRuntime(
         peer: Peer? = null,
         members: List<Peer> = emptyList(),
         message: ChatMessage? = null,
+        voiceTransportInfo: VoiceTransportControlInfo? = null,
         reason: String? = null,
     ): WirePacket {
         return WirePacket(
@@ -1117,10 +1280,27 @@ class RoomRuntime(
             peer = peer,
             members = members,
             message = message,
+            voiceTransportInfo = voiceTransportInfo,
             reason = reason,
             ttl = DEFAULT_PACKET_TTL,
             sentAtMillis = now(),
         )
+    }
+
+    /**
+     * Проверяет, относится ли packet к текущей комнате, если в нем есть roomId.
+     */
+    private fun isPacketForCurrentRoom(roomId: RoomId?): Boolean {
+        val currentRoomId = when (val currentState = _state.value) {
+            is RoomRuntimeState.Hosting -> currentState.room.roomId
+            is RoomRuntimeState.Joining -> currentState.room.roomId
+            is RoomRuntimeState.Client -> currentState.room.roomId
+            RoomRuntimeState.Idle,
+            RoomRuntimeState.Searching,
+            is RoomRuntimeState.Error,
+            -> null
+        }
+        return roomId == null || currentRoomId == null || roomId == currentRoomId
     }
 
     /**
@@ -1131,8 +1311,10 @@ class RoomRuntime(
         clearConnectionRecovery()
         _state.value = RoomRuntimeState.Idle
         voiceRuntime.stopAll()
+        voiceTransport.stopSession()
         _messages.value = emptyList()
         _talkingPeerIds.value = emptySet()
+        clearTalkingPeerTimeouts()
         nearbyTransport.stopAllEndpointsAndClearState(reason = "runtime_reset_session")
         realRoomToAdvertisedRoom.clear()
         Log.i(TAG, "[resetSession] Runtime переведен в Idle")
@@ -1156,7 +1338,9 @@ class RoomRuntime(
             action = action,
         )
         voiceRuntime.stopAll()
+        voiceTransport.stopSession()
         _talkingPeerIds.value = emptySet()
+        clearTalkingPeerTimeouts()
         nearbyTransport.stopAllEndpointsAndClearState(reason = "runtime_error")
         realRoomToAdvertisedRoom.clear()
     }
@@ -1183,6 +1367,28 @@ class RoomRuntime(
     }
 
     /**
+     * Формирует пользовательское сообщение для ошибок Nearby API и отдельно помечает ApiException как недоступность Nearby.
+     */
+    private fun nearbyFailureMessage(operation: String, cause: Throwable): String {
+        return if (cause is ApiException) {
+            "Nearby Connections не поддерживается или недоступен на этом устройстве"
+        } else {
+            "Не удалось $operation: ${cause.message.orEmpty()}"
+        }
+    }
+
+    /**
+     * Отправляет одноразовое уведомление в UI snackbar без изменения состояния комнаты.
+     */
+    private fun emitNotice(message: String) {
+        noticeId += 1L
+        val notice = RoomRuntimeNotice(id = noticeId, message = message)
+        if (!_notices.tryEmit(notice)) {
+            Log.w(TAG, "[emitNotice] Не удалось отправить snackbar-уведомление message=$message")
+        }
+    }
+
+    /**
      * Возвращает текущее системное время в миллисекундах.
      */
     private fun now(): Long {
@@ -1196,5 +1402,7 @@ class RoomRuntime(
         private const val CONNECTION_RECOVERY_COOLDOWN_MILLIS = 750L
         private const val CONNECTION_RECOVERY_DISCOVERY_TIMEOUT_MILLIS = 15_000L
         private const val CLIENT_RECONNECT_DISCOVERY_TIMEOUT_MILLIS = 20_000L
+        private const val NOTICE_BUFFER_CAPACITY = 8
+        private const val TALKING_PEER_TIMEOUT_MILLIS = 1_500L
     }
 }
