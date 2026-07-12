@@ -38,9 +38,11 @@ Wi-Fi Direct transport занимается только голосом:
 4. `RoomRuntime` отправляет `JOIN_ACCEPTED` через Nearby, где лежит полный `RoomInfo`.
 5. Client после `JOIN_ACCEPTED` берет `room.host.peerId` из `RoomInfo` и вызывает `VoiceTransport.startSession(CLIENT)`.
 6. Client получает host `VOICE_TRANSPORT_INFO`, запоминает ожидаемый `hostPeerId` и запускает Wi-Fi Direct DNS-SD discovery.
-7. Client принимает DNS-SD TXT record, сравнивает `hostPeerId` с `RoomInfo.host.peerId`, берет `srcDevice.deviceAddress` из Android callback и вызывает Wi-Fi Direct `connect(deviceAddress)`.
-8. После `groupFormed` client отправляет несколько UDP `HELLO` на group owner address.
-9. Host запоминает `PeerId -> InetSocketAddress` и может слать voice frames клиентам.
+7. Client принимает DNS-SD TXT record, сравнивает `hostPeerId` с `RoomInfo.host.peerId` и сохраняет `srcDevice.deviceAddress`.
+8. Client запускает обычный Wi-Fi Direct peer discovery, на `WIFI_P2P_PEERS_CHANGED_ACTION` вызывает `requestPeers()` и ищет host device в Android peer table.
+9. Только после появления host-а в peer table client вызывает Wi-Fi Direct `connect(deviceAddress)`.
+10. После `groupFormed` client отправляет несколько UDP `HELLO` на group owner address.
+11. Host запоминает `PeerId -> InetSocketAddress` и может слать voice frames клиентам.
 
 Локальный `WifiP2pDevice.deviceAddress` host-а не является источником истины. Android может вернуть `02:00:00:00:00:00`,
 поэтому поле `wifiDirectDeviceAddress` в `VOICE_TRANSPORT_INFO` используется только как диагностическое.
@@ -66,11 +68,17 @@ Wi-Fi Direct transport занимается только голосом:
 - Для первого теста режим включен в `AppContainer` как `VoiceTransportMode.WIFI_DIRECT_UDP`.
 - Если устройство не заявляет `PackageManager.FEATURE_WIFI_DIRECT` или не отдает `WifiP2pManager`, `AppContainer` включает `UnavailableVoiceTransport`, а UI показывает snackbar `Wi-Fi Direct не поддерживается на этом устройстве`.
 - Если client не видит DNS-SD service host-а, он не получит `srcDevice.deviceAddress` и не сможет подключиться.
-- Если первый `connect()` попал в системный pairing/accept, client держит его как pending до таймаута и не запускает новые `connect()` поверх старого.
+- Если первый `connect()` попал в системный pairing/accept, client держит его как pending до длинного таймаута и не запускает новые `connect()` поверх старого.
+- Watchdog подключения намеренно около минуты: на реальных прошивках системный Wi-Fi Direct dialog может появляться через десятки секунд после принятого `connect()`.
 - Если group не сформировалась за watchdog-окно, client вызывает `cancelConnect()`, затем возвращается к DNS-SD discovery/connect без выхода из комнаты.
+- Если client после `groupFormed` сам стал Wi-Fi Direct group owner, это некорректная для комнаты топология; transport удаляет group и пробует подключиться заново как client.
+- Перед `connect()` client обязательно проводит host через обычный Wi-Fi Direct peer table, потому что некоторые прошивки отклоняют `connect()` к deviceAddress, найденному только через DNS-SD.
+- В `WifiP2pConfig` client ставит `groupOwnerIntent=0`, чтобы Android не выбирал client-а group owner-ом.
+- После `WifiP2pManager.ERROR` / `reason=0` client делает cooldown перед следующим connect, чтобы DNS-SD callbacks не заспамили системный P2P стек.
 - Если client не отправит UDP `HELLO`, host не будет знать IP/порт клиента и не сможет отправить ему голос.
 - После `groupFormed` client дольше шлет UDP `HELLO`, чтобы host увидел endpoint даже после медленного первого pairing-а.
 - UDP final-frame может потеряться; `RoomRuntime` дополнительно гасит talking-индикатор по таймауту тишины и закрывает входящую frame-сессию.
+- Финальный voice frame может отправляться из UI callback отпускания PTT, поэтому Wi-Fi Direct transport переносит UDP send с main thread на IO.
 - Пока нет настройки UI для выбора `NEARBY_BYTES` / `WIFI_DIRECT_UDP`; переключение сделано в composition root.
 
 ## Диагностика
@@ -85,8 +93,13 @@ Wi-Fi Direct transport занимается только голосом:
 
 - `[addHostService]` — host опубликовал DNS-SD service с `hostPeerId`;
 - `[handleDnsSdTxtRecord] Найден host Wi-Fi Direct service` — client сопоставил service с `RoomInfo.host.peerId`;
+- `[discoverPeersBeforeConnect]` — client запустил обычный Wi-Fi Direct peer discovery после DNS-SD;
+- `[requestPeersForPendingHost]` — client запросил Android peer table;
+- `[handlePeerTableForConnect] Host device найден в peer table` — host появился в peer table, теперь можно вызывать `connect()`;
 - `[connectToHost]` — client запросил Wi-Fi Direct connect к host;
+- `[connectToHost] ... reason=0` — Android вернул `WifiP2pManager.ERROR`; после этого нужен cooldown перед новой попыткой;
 - `[connectToHost] ... reason=2` — Android вернул `WifiP2pManager.BUSY`; новый `connect()` нельзя запускать поверх pending попытки;
 - `[handleConnectionInfo]` — group сформирована, известен group owner IP;
+- `[handleConnectionInfo] Client стал Wi-Fi Direct group owner` — client попал в неверную P2P-топологию, group будет пересоздана;
 - `[startHelloLoop]` и `[handleUdpPacket] Получен Wi-Fi Direct HELLO` — UDP endpoint клиента появился у host-а;
 - `[sendFrameToPeers] Нет UDP endpoint` — host еще не знает, куда отправлять голос.
