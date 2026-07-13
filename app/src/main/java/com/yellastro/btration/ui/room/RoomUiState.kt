@@ -1,5 +1,6 @@
 package com.yellastro.btration.ui.room
 
+import androidx.annotation.ColorRes
 import com.yellastro.btration.domain.model.MessageId
 import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.runtime.RoomRuntimeErrorAction
@@ -29,24 +30,26 @@ data class RoomUiState(
 )
 
 /**
- * UI-модель участника комнаты с voice-активностью и прямым mesh-connect статусом.
+ * UI-модель участника комнаты с participant-цветом, voice-активностью и прямым mesh-connect статусом.
  */
 data class MemberUi(
     val peerId: PeerId,
     val name: String,
     val isSelf: Boolean,
+    @ColorRes val participantColorResId: Int? = null,
     val isConnectIndicatorVisible: Boolean = false,
     val isDirectlyConnected: Boolean = false,
     val isTalking: Boolean = false,
 )
 
 /**
- * UI-модель сообщения чата.
+ * UI-модель сообщения чата с опциональным цветом автора для чужих сообщений.
  */
 data class ChatMessageUi(
     val id: MessageId,
     val senderName: String,
     val text: String,
     val isOwn: Boolean,
+    @ColorRes val participantColorResId: Int? = null,
     val timeText: String,
 )

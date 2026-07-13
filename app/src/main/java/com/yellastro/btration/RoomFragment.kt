@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
@@ -418,7 +419,7 @@ class RoomFragment : Fragment() {
      */
     private fun channelStatusColor(state: RoomUiState): Int {
         return when {
-            state.isConnecting -> Color.parseColor("#94A3B8")
+            state.isConnecting -> ContextCompat.getColor(requireContext(), R.color.greywhite)
             state.directAudioIssueMessage != null -> ContextCompat.getColor(requireContext(), android.R.color.holo_red_light)
             state.directAudioStatusText.isNotBlank() -> ContextCompat.getColor(requireContext(), R.color.second_accent_green)
             else -> ContextCompat.getColor(requireContext(), R.color.second_accent_green)
@@ -586,6 +587,7 @@ class RoomFragment : Fragment() {
                 holder.tvSender.text = item.senderName
                 holder.tvTime.text = item.timeText
                 holder.tvText.text = item.text
+                holder.applyAuthorColor(item)
             }
         }
 
@@ -601,6 +603,63 @@ class RoomFragment : Fragment() {
             val tvSender: TextView = view.findViewById(R.id.tv_sender_name)
             val tvTime: TextView = view.findViewById(R.id.tv_message_time)
             val tvText: TextView = view.findViewById(R.id.tv_message_text)
+
+            /**
+             * Красит bubble чужого сообщения в цвет участника, а self-сообщения возвращает к штатной стилистике.
+             */
+            fun applyAuthorColor(item: ChatMessageUi) {
+                val colorResId = item.participantColorResId
+                if (colorResId == null || item.isOwn) {
+                    tvSender.setTextColor(Color.parseColor(if (item.isOwn) "#3B82F6" else "#94A3B8"))
+                    tvText.setTextColor(Color.parseColor(if (item.isOwn) "#FFFFFF" else "#E2E8F0"))
+                    tvText.setBackgroundResource(if (item.isOwn) R.drawable.bg_msg_me else R.drawable.bg_msg_other)
+                    return
+                }
+
+                val participantColor = ContextCompat.getColor(itemView.context, colorResId)
+                tvSender.setTextColor(participantColor)
+                tvText.setTextColor(readableTextColor(participantColor))
+                tvText.background = otherMessageBubbleBackground(participantColor)
+            }
+
+            /**
+             * Создает bubble чужого сообщения с теми же скруглениями, что и XML bg_msg_other.
+             */
+            private fun otherMessageBubbleBackground(color: Int): GradientDrawable {
+                val tinyRadius = dp(2)
+                val largeRadius = dp(14)
+                return GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    setColor(color)
+                    cornerRadii = floatArrayOf(
+                        tinyRadius, tinyRadius,
+                        largeRadius, largeRadius,
+                        largeRadius, largeRadius,
+                        largeRadius, largeRadius,
+                    )
+                }
+            }
+
+            /**
+             * Возвращает светлый или темный цвет текста в зависимости от яркости фона.
+             */
+            private fun readableTextColor(backgroundColor: Int): Int {
+                val luminance = 0.299 * Color.red(backgroundColor) +
+                    0.587 * Color.green(backgroundColor) +
+                    0.114 * Color.blue(backgroundColor)
+                return if (luminance > 150.0) {
+                    Color.parseColor("#090A0C")
+                } else {
+                    Color.WHITE
+                }
+            }
+
+            /**
+             * Переводит dp в px для динамического message drawable.
+             */
+            private fun dp(value: Int): Float {
+                return value * itemView.resources.displayMetrics.density
+            }
         }
     }
 
@@ -648,6 +707,7 @@ class RoomFragment : Fragment() {
 
             val subtitle = if (member.isSelf) "Вы" else "Участник"
             holder.tvStatus.text = subtitle
+            holder.applyParticipantFrame(member)
 
             if (member.isTalking) {
                 holder.viewTalkIndicator.setBackgroundResource(R.drawable.bg_dot_talking)
@@ -677,5 +737,39 @@ class RoomFragment : Fragment() {
          * Возвращает количество участников в текущей комнате.
          */
         override fun getItemCount(): Int = items.size
+
+        /**
+         * Красит рамку карточки участника в назначенный цвет или возвращает стандартную серую рамку.
+         */
+        private fun ViewHolder.applyParticipantFrame(member: MemberUi) {
+            val strokeColor = member.participantColorResId
+                ?.let { colorResId -> ContextCompat.getColor(itemView.context, colorResId) }
+                ?: Color.parseColor(DEFAULT_MEMBER_STROKE_COLOR)
+            val horizontalPadding = itemView.paddingLeft
+            val topPadding = itemView.paddingTop
+            val rightPadding = itemView.paddingRight
+            val bottomPadding = itemView.paddingBottom
+            itemView.background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                setColor(Color.parseColor("#12141A"))
+                cornerRadius = dp(itemView, 20)
+                setStroke(dp(itemView, 1).toInt(), strokeColor)
+            }
+            itemView.setPadding(horizontalPadding, topPadding, rightPadding, bottomPadding)
+        }
+
+        private companion object {
+            /**
+             * Цвет штатной рамки карточки участника без персонального participant-цвета.
+             */
+            private const val DEFAULT_MEMBER_STROKE_COLOR = "#2D3139"
+
+            /**
+             * Переводит dp в px для динамической рамки карточки участника.
+             */
+            private fun dp(view: View, value: Int): Float {
+                return value * view.resources.displayMetrics.density
+            }
+        }
     }
 }

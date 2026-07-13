@@ -10,4 +10,17 @@
     <color name="accent_green">#059669</color>
     <color name="second_accent_green">#10B981</color>
     <color name="hacker_black">#090A0C</color>
+    <color name="greywhite">#94A3B8</color>
+    <color name="blue">#3B82F6</color>
+
+    <!-- Стильная контрастная палетка для визуального различения участников чата на темном фоне. -->
+    <color name="participant_color_03">#34D399</color>
+    <color name="participant_color_04">#A3E635</color>
+    <color name="participant_color_05">#FBBF24</color>
+    <color name="participant_color_06">#FB923C</color>
+    <color name="participant_color_07">#FB7185</color>
+    <color name="participant_color_08">#E879F9</color>
+    <color name="participant_color_09">#A78BFA</color>
+    <color name="participant_color_10">#818CF8</color>
+
 </resources>

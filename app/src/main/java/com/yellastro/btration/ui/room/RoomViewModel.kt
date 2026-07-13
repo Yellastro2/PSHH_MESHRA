@@ -2,6 +2,7 @@ package com.yellastro.btration.ui.room
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.yellastro.btration.R
 import com.yellastro.btration.domain.model.ChatMessage
 import com.yellastro.btration.domain.model.Peer
 import com.yellastro.btration.domain.model.PeerId
@@ -30,6 +31,7 @@ class RoomViewModel(
 ) : ViewModel() {
     private val inputText = MutableStateFlow("")
     private val isTalking = MutableStateFlow(false)
+    private val participantColorByPeerId = mutableMapOf<PeerId, Int>()
 
     private val roomUiInputs = combine(
         roomRepository.runtimeState,
@@ -177,12 +179,13 @@ class RoomViewModel(
             is RoomRuntimeState.Hosting -> {
                 val roomVoiceTransportPreference = VoiceTransportPreference.fromTransportMode(runtimeState.room.voiceTransportMode)
                 val isMeshRoom = runtimeState.room.roomTransportMode == RoomTransportMode.MESHRA
+                val participantColors = ensureParticipantColors(runtimeState.members, selfPeerId)
                 RoomUiState(
                     roomName = runtimeState.room.name,
                     isHost = true,
                     isMeshRoom = isMeshRoom,
-                    members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, directMeshPeerIds, talking, isMeshRoom) },
-                    messages = messages.map { mapMessage(it, selfPeerId) },
+                    members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, directMeshPeerIds, participantColors, talking, isMeshRoom) },
+                    messages = messages.map { mapMessage(it, selfPeerId, participantColors.values.toSet()) },
                     inputText = input,
                     canSend = canSend,
                     canTalk = canTalk,
@@ -199,12 +202,13 @@ class RoomViewModel(
             is RoomRuntimeState.Client -> {
                 val roomVoiceTransportPreference = VoiceTransportPreference.fromTransportMode(runtimeState.room.voiceTransportMode)
                 val isMeshRoom = runtimeState.room.roomTransportMode == RoomTransportMode.MESHRA
+                val participantColors = ensureParticipantColors(runtimeState.members, selfPeerId)
                 RoomUiState(
                     roomName = runtimeState.room.name,
                     isHost = false,
                     isMeshRoom = isMeshRoom,
-                    members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, directMeshPeerIds, talking, isMeshRoom) },
-                    messages = messages.map { mapMessage(it, selfPeerId) },
+                    members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, directMeshPeerIds, participantColors, talking, isMeshRoom) },
+                    messages = messages.map { mapMessage(it, selfPeerId, participantColors.values.toSet()) },
                     inputText = input,
                     canSend = canSend,
                     canTalk = canTalk,
@@ -307,13 +311,14 @@ class RoomViewModel(
     }
 
     /**
-     * Преобразует участника в UI-модель с признаком локального пользователя и активности voice stream.
+     * Преобразует участника в UI-модель с локальной ролью, цветом, mesh-connect и voice stream состояниями.
      */
     private fun mapMember(
         peer: Peer,
         selfPeerId: PeerId,
         talkingPeerIds: Set<PeerId>,
         directMeshPeerIds: Set<PeerId>,
+        participantColors: Map<PeerId, Int>,
         selfTalking: Boolean,
         isMeshRoom: Boolean,
     ): MemberUi {
@@ -321,23 +326,80 @@ class RoomViewModel(
             peerId = peer.peerId,
             name = peer.name,
             isSelf = peer.peerId == selfPeerId,
+            participantColorResId = participantColors[peer.peerId],
             isConnectIndicatorVisible = isMeshRoom,
-            isDirectlyConnected = peer.peerId in directMeshPeerIds,
+            isDirectlyConnected = peer.peerId in directMeshPeerIds || (peer.peerId == selfPeerId && directMeshPeerIds.isNotEmpty()),
             isTalking = peer.peerId in talkingPeerIds || (peer.peerId == selfPeerId && selfTalking),
         )
     }
 
     /**
-     * Преобразует доменное сообщение в UI-модель чата.
+     * Преобразует доменное сообщение в UI-модель чата и назначает цвет bubble для чужого автора.
      */
-    private fun mapMessage(message: ChatMessage, selfPeerId: PeerId): ChatMessageUi {
+    private fun mapMessage(message: ChatMessage, selfPeerId: PeerId, reservedColorResIds: Set<Int>): ChatMessageUi {
         return ChatMessageUi(
             id = message.messageId,
             senderName = message.author.name,
             text = message.text,
             isOwn = message.author.peerId == selfPeerId,
+            participantColorResId = colorForMessageAuthor(message.author.peerId, selfPeerId, reservedColorResIds),
             timeText = formatTime(message.createdAtMillis),
         )
+    }
+
+    /**
+     * Назначает текущим не-self участникам случайные цвета без повторов, пока участников не больше палетки.
+     */
+    private fun ensureParticipantColors(members: List<Peer>, selfPeerId: PeerId): Map<PeerId, Int> {
+        val currentPeerIds = members
+            .map { peer -> peer.peerId }
+            .filterNot { peerId -> peerId == selfPeerId }
+            .distinct()
+        val usedColorResIds = mutableSetOf<Int>()
+        val currentColors = mutableMapOf<PeerId, Int>()
+
+        currentPeerIds.forEach { peerId ->
+            val existingColor = participantColorByPeerId[peerId]
+            if (existingColor != null && existingColor !in usedColorResIds) {
+                currentColors[peerId] = existingColor
+                usedColorResIds.add(existingColor)
+            }
+        }
+
+        currentPeerIds
+            .filterNot { peerId -> peerId in currentColors }
+            .forEach { peerId ->
+                val nextColor = randomParticipantColorExcept(usedColorResIds)
+                participantColorByPeerId[peerId] = nextColor
+                currentColors[peerId] = nextColor
+                usedColorResIds.add(nextColor)
+            }
+
+        return currentColors
+    }
+
+    /**
+     * Возвращает цвет автора сообщения; self-сообщения остаются в собственной стандартной стилистике.
+     */
+    private fun colorForMessageAuthor(peerId: PeerId, selfPeerId: PeerId, reservedColorResIds: Set<Int>): Int? {
+        if (peerId == selfPeerId) {
+            return null
+        }
+        val existingColor = participantColorByPeerId[peerId]
+        if (existingColor != null) {
+            return existingColor
+        }
+        val nextColor = randomParticipantColorExcept(reservedColorResIds)
+        participantColorByPeerId[peerId] = nextColor
+        return nextColor
+    }
+
+    /**
+     * Выбирает случайный цвет из палетки, избегая уже занятых цветов, если свободные еще есть.
+     */
+    private fun randomParticipantColorExcept(usedColorResIds: Set<Int>): Int {
+        val availableColors = PARTICIPANT_COLOR_RES_IDS.filterNot { colorResId -> colorResId in usedColorResIds }
+        return (availableColors.ifEmpty { PARTICIPANT_COLOR_RES_IDS }).random()
     }
 
     /**
@@ -362,5 +424,15 @@ class RoomViewModel(
         private const val STOP_TIMEOUT_MILLIS = 5_000L
         private const val TIME_PATTERN = "HH:mm"
         private const val DIRECT_AUDIO_UNAVAILABLE_MESSAGE = "Прямой аудиоканал не установлен"
+        private val PARTICIPANT_COLOR_RES_IDS = listOf(
+            R.color.participant_color_03,
+            R.color.participant_color_04,
+            R.color.participant_color_05,
+            R.color.participant_color_06,
+            R.color.participant_color_07,
+            R.color.participant_color_08,
+            R.color.participant_color_09,
+            R.color.participant_color_10,
+        )
     }
 }
