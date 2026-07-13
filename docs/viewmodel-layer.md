@@ -37,7 +37,7 @@ ViewModel-слой готовит состояние для XML-фрагмент
 - `onCreateRoomClicked(name, roomTransportMode, voiceTransportPreference)`;
 - `onJoinRoomClicked(room)`;
 - `onIgnoreRoomClicked(room)`;
-- `onClearIgnoredHostsConfirmed()`.
+- `onClearIgnoredPeersConfirmed()`.
 
 Диалог создания комнаты передает в `LobbyViewModel` имя комнаты, выбранный тип комнаты (`Nearby Star` / `MESHRA`) и выбранный voice transport. ViewModel сохраняет оба transport-выбора в prefs до вызова `RoomRepository.createRoom(...)`, чтобы host runtime положил эти режимы в meta комнаты.
 
@@ -46,6 +46,8 @@ ViewModel-слой готовит состояние для XML-фрагмент
 Для тестирования nearby/mesh-сценариев лобби умеет локально игнорировать прямой gateway найденной комнаты. `LobbyViewModel` берет `RoomInfo.gateway?.peerId ?: RoomInfo.host.peerId`, сохраняет его через `IgnoredNearbyRepository` и фильтрует найденные комнаты до маппинга в `RoomItemUi`. `endpointId` не сохраняется, потому что это временный идентификатор нижнего транспорта.
 
 Для MESHRA ignore применяется к прямому `RoomInfo.gateway`, а не к логическому `RoomInfo.host`. Поэтому если C игнорит gateway A, реклама A скрывается и вход через A блокируется, но та же mesh-комната через gateway B остается видимой. Для Nearby Star `gateway == host`, так что старое поведение сохраняется.
+
+Карточка комнаты в лобби получает от `RoomInfo` временный `discoveryEndpointId` и `memberCount`. `LobbyViewModel` собирает подпись `tv_member_count` в формате `endpointId • N участников`, например `WVTA • 3 участников`.
 
 ## RoomViewModel
 
@@ -66,3 +68,4 @@ ViewModel-слой готовит состояние для XML-фрагмент
 
 `RoomViewModel` получает локальный `PeerId` через `RoomRepository.getSelfPeerId()`, чтобы вычислять `MemberUi.isSelf` и `ChatMessageUi.isOwn`.
 Выбранный transport активной комнаты отображается на экране комнаты как read-only пункт меню; после старта комнаты он не меняется из этого меню.
+Для MESHRA-комнат `RoomViewModel` также combine-ит `RoomRepository.directMeshPeerIds` и помечает `MemberUi.isDirectlyConnected`. `RoomFragment` показывает `view_connect_indicator`: в MESHRA он фиолетовый (`bg_dot_connect`) для прямого mesh-соседа и серый для участника без прямого link-а, а в Nearby Star скрыт.

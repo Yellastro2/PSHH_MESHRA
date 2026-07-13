@@ -26,9 +26,9 @@
 ## Потоки данных
 
 ```text
-RoomTransport.events + VoiceTransport.events
+RoomTransport.events + MeshTransport.events + VoiceTransport.events
   -> RoomRuntime
-  -> state / availableRooms / messages / talkingPeerIds
+  -> state / availableRooms / messages / talkingPeerIds / directMeshPeerIds
 ```
 
 `RoomRuntime` получает `CoroutineScope` снаружи, например из application-level контейнера, и в `init` подписывается на события room signaling из `RoomTransport.events` и media-события `VoiceTransport.events`.
@@ -36,6 +36,7 @@ RoomTransport.events + VoiceTransport.events
 `RoomTransport` держит Nearby Star room-level протокол поверх `NeighborTransport`: декодирует/кодирует `WirePacket`, разбирает короткую визитку комнаты, ведет связь `PeerId <-> linkId` и прячет детали конкретного нижнего транспорта от `RoomRuntime`.
 
 `MeshTransport` держит MESHRA room-level протокол поверх того же `NeighborTransport`: принимает gateway-рекламу, snapshot-ы и durable room events, дедупит их по `eventId` и flood-ит соседям.
+Для live-UI он также держит `directPeerIds` — набор `PeerId`, с которыми есть прямой mesh link. Эта информация строится из gateway-рекламы и служебного `PEER_HELLO`, а не из `endpointId` в UI.
 
 ## StateFlow
 
@@ -43,6 +44,7 @@ RoomTransport.events + VoiceTransport.events
 - `availableRooms: StateFlow<List<RoomInfo>>` — комнаты из discovery.
 - `messages: StateFlow<List<ChatMessage>>` — чат текущей комнаты.
 - `talkingPeerIds: StateFlow<Set<PeerId>>` — участники, чьи voice frames сейчас передаются или локально доигрываются.
+- `directMeshPeerIds: StateFlow<Set<PeerId>>` — участники, с которыми есть прямой mesh link; ViewModel использует это для connect-dot на карточке участника.
 
 ## Host MVP
 
@@ -67,7 +69,8 @@ Host:
 - принимает `CHAT_MESSAGE`;
 - добавляет сообщение себе;
 - рассылает сообщение остальным участникам;
-- при закрытии комнаты рассылает `ROOM_CLOSED`.
+- в `Nearby Star` при закрытии комнаты рассылает `ROOM_CLOSED`;
+- в `MESHRA` при выходе/команде закрытия публикует только свой `MEMBER_LEFT`, сбрасывает локальную сессию и не удаляет комнату у остальных узлов.
 - при локальном PTT отправляет voice frames всем client-участникам с подтвержденным media-plane handshake; неготовый участник не блокирует остальных;
 - при входящих Opus voice frames помечает участника говорящим, запускает локальное декодирование/воспроизведение и ретранслирует сжатые frames другим client-участникам без decode/re-encode.
 
@@ -78,11 +81,13 @@ Client:
 - запускает discovery;
 - получает из `RoomTransport` временный advertised `RoomId`, потому что короткая транспортная визитка не несет полный `roomId`;
 - хранит внутреннюю связь `RoomId -> endpointId`, где до входа `RoomId` может быть временным advertised-id;
+- кладет текущий discovery `endpointId` в `RoomInfo.discoveryEndpointId`, чтобы лобби могло показать, через какой физический endpoint/gateway будет вход;
 - по `joinRoom(roomId)` подключается к endpoint;
 - после успешного connection отправляет `JOIN_REQUEST` без реального `roomId`;
 - для `Nearby Star` после `JOIN_ACCEPTED` получает настоящий `RoomInfo`, берет `RoomInfo.roomTransportMode` как режим room transport комнаты, берет `RoomInfo.voiceTransportMode`, переключает локальный voice transport на режим host-а, берет `RoomInfo.host.peerId` для Wi-Fi Direct DNS-SD matching, заменяет временный `RoomId -> endpointId` на реальный `RoomId -> endpointId` и переходит в `Client`;
 - для `MESHRA` после подключения к gateway ждет `ROOM_SNAPSHOT`, заменяет временный `mesh_room_<token>` на настоящий `RoomInfo`, публикует свой `MEMBER_JOINED` и тоже начинает рекламировать комнату как gateway;
 - MESHRA gateway-кандидаты в discovery имеют разные временные `RoomId`, но общий `discoveryGroupId`, чтобы ignore одного gateway не скрывал ту же комнату через другой gateway;
+- на экране комнаты MESHRA-создатель выходит обычной командой выхода, а не через диалог закрытия комнаты для всех;
 - на экране комнаты видит выбранный host-ом voice transport как read-only пункт меню настроек; host видит такой же read-only пункт, потому что активный transport комнаты после старта не переключается;
 - получает host `VOICE_TRANSPORT_INFO` сразу после входа и запускает direct-audio handshake;
 - по `MEMBER_LIST` обновляет участников;
@@ -97,6 +102,8 @@ Client:
 
 - `STATUS_ENDPOINT_UNKNOWN` считается recoverable stale endpoint: runtime удаляет комнату из `availableRooms`, запускает clean discovery и при повторном `EndpointFound` автоматически повторяет connection.
 - Для MESHRA такой же recovery идет через `MeshTransport.GatewayFound`: runtime повторяет connection только к тому же временному `RoomId` выбранного gateway, чтобы ignore одного gateway/host-а не превратился в автоматическое подключение через него.
+- Для активной MESHRA-комнаты `stopSearch()` не выключает mesh discovery: оно нужно для фонового healing-а. При `GatewayFound` той же комнаты runtime добирает active/pending link-и до `min(участники - 1, 3)`, но не выше `64`.
+- Ошибка discovery во время активной MESHRA-комнаты считается ошибкой healing-а и не переводит комнату в `Error`; активные link-и и уже полученный snapshot должны жить дальше.
 - Если client внезапно теряет host-а не через `ROOM_CLOSED`, runtime не сбрасывает комнату в `Idle`, а переходит в `Joining` по сохраненной advertised-комнате и пробует переподключиться.
 - Если нижний Nearby API сразу после runtime-permission grant возвращает transient `MISSING_PERMISSION` при discovery/advertising, `NearbyTransport` тихо делает короткий retry и через `RoomTransport` отдает ошибку в `RoomRuntime` только после исчерпания попыток.
 

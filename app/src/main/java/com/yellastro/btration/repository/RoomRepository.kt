@@ -9,7 +9,7 @@ import com.yellastro.btration.domain.runtime.RoomRuntimeState
 import com.yellastro.btration.service.RoomServiceController
 
 /**
- * Фасад комнаты для ViewModel: прокидывает discovery-циклы, команды комнаты, чат и голос в runtime.
+ * Фасад комнаты для ViewModel: прокидывает discovery-циклы, команды комнаты, чат, голос и mesh-connect статусы в runtime.
  */
 class RoomRepository(
     private val roomRuntime: RoomRuntime,
@@ -34,6 +34,11 @@ class RoomRepository(
      * Участники, которые сейчас передают или локально доигрывают голос.
      */
     val talkingPeerIds = roomRuntime.talkingPeerIds
+
+    /**
+     * PeerId участников, с которыми у текущего устройства есть прямой mesh link.
+     */
+    val directMeshPeerIds = roomRuntime.directMeshPeerIds
 
     /**
      * Одноразовые уведомления runtime для snackbar во ViewModel/UI.

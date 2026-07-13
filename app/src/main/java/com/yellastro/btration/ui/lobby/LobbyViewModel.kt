@@ -256,8 +256,20 @@ class LobbyViewModel(
             roomName = roomInfo.name,
             hostName = roomInfo.host.name,
             gatewayName = gateway.name,
-            memberCountText = null,
+            memberCountText = memberCountText(roomInfo),
         )
+    }
+
+    /**
+     * Собирает короткую подпись найденного endpoint-а и количества участников для карточки комнаты.
+     */
+    private fun memberCountText(roomInfo: RoomInfo): String? {
+        val endpointId = roomInfo.discoveryEndpointId
+        val countText = roomInfo.memberCount?.let { count -> "$count участников" }
+            ?: endpointId?.let { "участники рядом" }
+        return listOfNotNull(endpointId, countText)
+            .takeIf { parts -> parts.isNotEmpty() }
+            ?.joinToString(" • ")
     }
 
     /**

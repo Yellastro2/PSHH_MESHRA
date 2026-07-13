@@ -4,7 +4,7 @@ import com.yellastro.btration.voice.VoiceTransportMode
 import kotlinx.serialization.Serializable
 
 /**
- * Публичное описание комнаты, ее gateway в discovery, room transport, voice transport и capabilities.
+ * Публичное описание комнаты, ее gateway/endpoint в discovery, room transport, voice transport и capabilities.
  */
 @Serializable
 data class RoomInfo(
@@ -17,4 +17,6 @@ data class RoomInfo(
     val isDirectAudioReady: Boolean = false,
     val gateway: Peer? = null,
     val discoveryGroupId: String? = null,
+    val discoveryEndpointId: String? = null,
+    val memberCount: Int? = null,
 )

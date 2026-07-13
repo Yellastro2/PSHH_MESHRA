@@ -31,13 +31,15 @@
 - `PEER_DISCONNECTED`;
 - `CHAT_MESSAGE`.
 
-События дедупятся по `MeshRoomEventId`. Отдельного `envelopeId` сейчас нет: mesh envelope только несет событие или snapshot через соседский transport.
+События дедупятся по `MeshRoomEventId`. Отдельного `envelopeId` сейчас нет: mesh envelope несет событие, snapshot или служебный `PEER_HELLO` через соседский transport.
 
 ## Payload
 
 `MeshCodec` добавляет сигнатуру `BTME1\n` перед JSON `MeshEnvelope`.
 
 Это позволяет mesh-слою игнорировать обычные room/voice bytes, а будущим соседним слоям — аналогично игнорировать mesh payload.
+
+`PEER_HELLO` — ephemeral payload вне event-log комнаты. Он отправляется сразу после `LinkConnected`, содержит `previousHopPeerId=selfPeerId` и нужен только для live-мапы `NeighborLinkId -> PeerId`. Если hello не отправился, комната не падает: связь может определиться позже по любому входящему mesh envelope от этого же link-а.
 
 ## Advertising / discovery
 
@@ -59,6 +61,7 @@
 
 Временный `RoomId` mesh-рекламы включает и `roomToken`, и `gatewayShortId`. Это нужно для ignore-сценариев: если телефон C игнорит gateway A, реклама A скрывается, но реклама той же комнаты через gateway B остается отдельным кандидатом для входа.
 Для UI-дедупликации после фильтрации ignored gateway-ев `RoomInfo.discoveryGroupId` хранит только `roomToken`. Проверка соответствия временного и реального `RoomId` матчится по форме `mesh_room_<roomToken>_gw_...`, чтобы разные gateway одной комнаты считались одной логической комнатой, но похожие token-ы не склеивались случайно.
+Для подписи карточки комнаты `RoomInfo.discoveryEndpointId` хранит текущий Nearby `endpointId`, а `RoomInfo.memberCount` для MESHRA берется из `MeshRoomAdvertisement.memberCount`.
 
 На нижнем room/transport уровне найденный endpoint считается прямым gateway (`RoomInfo.gateway ?: RoomInfo.host`). Это важно для ignore-list-а: он запрещает физический соседский link, но не банит логическую комнату и не выкидывает события того же known host-а, пришедшие через другой gateway.
 
@@ -75,6 +78,10 @@
 
 Если выбранный gateway успел протухнуть и Nearby вернул `STATUS_ENDPOINT_UNKNOWN`, `RoomRuntime` запускает clean discovery и повторяет connection при новом `GatewayFound` только для того же временного `mesh_room_<token>_gw_<gateway>` `RoomId`. Это не дает recovery перескочить на другой gateway той же комнаты, например на ignored host.
 
+После создания или входа в MESHRA-комнату mesh discovery остается активным как простой healing-механизм. Runtime не делит link-и на inbound/outbound: flooding использует все активные link-и, а healing добирает любые link-и той же комнаты до `min(участники - 1, 3)` при hard cap `64`. Если участников меньше четырех, узел старается соединиться со всеми известными gateway этой комнаты; если больше — держит минимум три активных/pending link-а. Ошибки отдельных healing connection request-ов логируются, но не роняют активную комнату.
+
+Для UI-индикатора прямого соседства `MeshTransport` публикует `directPeerIds: StateFlow<Set<PeerId>>`. Outgoing link привязывается к `PeerId` сразу по `gatewayPeerId` из рекламы, incoming link — после `PEER_HELLO` или первого другого mesh envelope от соседа. UI не получает `endpointId`/`linkId`, только доменный `PeerId`.
+
 Для MESHRA-комнат voice сейчас явно помечается как недоступный: текстовый mesh уже включен, но отдельная realtime voice-политика еще не реализована.
 
 ## Flooding
@@ -87,7 +94,9 @@
 4. Snapshot комнаты обновляется инкрементально.
 5. Если `ttl` еще живой, событие пересылается всем активным соседям, кроме link-а, с которого оно пришло.
 
-`ROOM_SNAPSHOT` принимается локально и не flood-ится дальше. Он нужен для будущего сценария, где новый peer входит через mesh gateway и должен быстро получить состояние комнаты.
+`ROOM_SNAPSHOT` принимается локально и не flood-ится дальше. Он нужен для сценария, где новый peer входит через mesh gateway и должен быстро получить состояние комнаты.
+
+`PEER_HELLO` принимается локально, не flood-ится и не меняет snapshot комнаты.
 
 ## Ограничения
 

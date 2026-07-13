@@ -6,11 +6,12 @@ import com.yellastro.btration.domain.runtime.RoomRuntimeErrorAction
 import com.yellastro.btration.voice.VoiceTransportPreference
 
 /**
- * UI-состояние экрана комнаты, включая transport комнаты, локальную voice-настройку, direct-аудио статус, чат и ошибки.
+ * UI-состояние экрана комнаты, включая роль пользователя, mesh-режим комнаты, voice-настройку, чат и ошибки.
  */
 data class RoomUiState(
     val roomName: String = "",
     val isHost: Boolean = false,
+    val isMeshRoom: Boolean = false,
     val members: List<MemberUi> = emptyList(),
     val messages: List<ChatMessageUi> = emptyList(),
     val inputText: String = "",
@@ -28,12 +29,14 @@ data class RoomUiState(
 )
 
 /**
- * UI-модель участника комнаты.
+ * UI-модель участника комнаты с voice-активностью и прямым mesh-connect статусом.
  */
 data class MemberUi(
     val peerId: PeerId,
     val name: String,
     val isSelf: Boolean,
+    val isConnectIndicatorVisible: Boolean = false,
+    val isDirectlyConnected: Boolean = false,
     val isTalking: Boolean = false,
 )
 

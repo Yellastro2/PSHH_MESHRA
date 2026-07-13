@@ -28,6 +28,7 @@
 - `RoomTransport` автоматически принимает Nearby connection, а бизнес-решение входа в комнату остаётся выше, в `RoomRuntime`, через `JOIN_ACCEPTED` / `JOIN_REJECTED`.
 - Для будущего mesh/relay в `WirePacket` уже есть поля `packetId` и `ttl`, но Nearby-слой пока не делает dedup и relay.
 - При старте приложения, перед новой рекламой и при сбросе runtime вызывается полный cleanup Nearby: `stopDiscovery()`, `stopAdvertising()`, `stopAllEndpoints()` и очистка локального registry.
+- `STATUS_ALREADY_DISCOVERING` при повторном `startDiscovery()` считается идемпотентным успехом. Для MESHRA healing discovery может стартовать повторно после нескольких link disconnect-ов, и такой повтор не должен превращаться в fatal `DiscoveryFailed`.
 
 ## BYTES payload для MVP-голоса
 

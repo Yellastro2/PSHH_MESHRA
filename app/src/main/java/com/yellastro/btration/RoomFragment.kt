@@ -25,9 +25,6 @@ import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.core.content.ContextCompat
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.doOnAttach
 import androidx.core.view.updateLayoutParams
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
@@ -126,7 +123,7 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Настраивает списки участников, чат, меню комнаты, PTT-визуализацию и размер кнопки микрофона при IME.
+     * Настраивает списки участников, чат, меню комнаты, выход/закрытие по типу комнаты, PTT-визуализацию и размер кнопки микрофона при IME.
      */
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
@@ -168,7 +165,7 @@ class RoomFragment : Fragment() {
         rvMembers.adapter = memberAdapter
 
         btnBack.setOnClickListener {
-            if (latestState.isHost) {
+            if (latestState.isHost && !latestState.isMeshRoom) {
                 showCloseRoomConfirmationDialog()
             } else {
                 viewModel.onLeaveClicked()
@@ -429,7 +426,7 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Просит хоста подтвердить выход, потому что выход закрывает комнату для всех участников.
+     * Просит Nearby Star хоста подтвердить закрытие, потому что только в этом режиме выход удаляет комнату для всех.
      */
     private fun showCloseRoomConfirmationDialog() {
         AlertDialog.Builder(requireContext())
@@ -620,7 +617,8 @@ class RoomFragment : Fragment() {
         class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
             val tvName: TextView = view.findViewById(R.id.tv_member_name)
             val tvStatus: TextView = view.findViewById(R.id.tv_member_status)
-            val viewIndicator: View = view.findViewById(R.id.view_talking_indicator)
+            val viewTalkIndicator: View = view.findViewById(R.id.view_talking_indicator)
+            val viewConnectIndicator: View = view.findViewById(R.id.view_connect_indicator)
             val ivMuted: View = view.findViewById(R.id.iv_muted_icon)
         }
 
@@ -642,7 +640,7 @@ class RoomFragment : Fragment() {
         }
 
         /**
-         * Заполняет имя, роль и визуальное состояние участника.
+         * Заполняет имя, роль, voice-индикатор и индикатор прямого mesh-connect-а участника.
          */
         override fun onBindViewHolder(holder: ViewHolder, position: Int) {
             val member = items[position]
@@ -652,11 +650,24 @@ class RoomFragment : Fragment() {
             holder.tvStatus.text = subtitle
 
             if (member.isTalking) {
-                holder.viewIndicator.setBackgroundResource(R.drawable.bg_dot_talking)
-                holder.viewIndicator.visibility = View.VISIBLE
+                holder.viewTalkIndicator.setBackgroundResource(R.drawable.bg_dot_talking)
+                holder.viewTalkIndicator.visibility = View.VISIBLE
             } else {
-                holder.viewIndicator.setBackgroundResource(R.drawable.bg_dot_idle)
-                holder.viewIndicator.visibility = View.VISIBLE
+                holder.viewTalkIndicator.setBackgroundResource(R.drawable.bg_dot_idle)
+                holder.viewTalkIndicator.visibility = View.VISIBLE
+            }
+
+            if (member.isConnectIndicatorVisible) {
+                holder.viewConnectIndicator.setBackgroundResource(
+                    if (member.isDirectlyConnected) {
+                        R.drawable.bg_dot_connect
+                    } else {
+                        R.drawable.bg_dot_idle
+                    },
+                )
+                holder.viewConnectIndicator.visibility = View.VISIBLE
+            } else {
+                holder.viewConnectIndicator.visibility = View.GONE
             }
 
             holder.ivMuted.visibility = View.GONE

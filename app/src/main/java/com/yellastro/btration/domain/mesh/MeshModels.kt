@@ -63,20 +63,23 @@ data class MeshRoomSnapshot(
 )
 
 /**
- * Тип payload-а внутри mesh envelope.
+ * Тип payload-а внутри mesh envelope: durable room-события, snapshot комнаты или служебный hello соседнего peer-а.
  */
 @Serializable
 enum class MeshPayloadKind {
     ROOM_EVENT,
     ROOM_SNAPSHOT,
+    PEER_HELLO,
 }
 
 /**
- * Транспортная обертка mesh-слоя без собственного envelopeId: события дедупятся по eventId, snapshot не flood-ится.
+ * Транспортная обертка mesh-слоя без собственного envelopeId.
+ *
+ * Room-события дедупятся по eventId, snapshot не flood-ится, а PEER_HELLO используется только для live-мапы linkId -> PeerId.
  */
 @Serializable
 data class MeshEnvelope(
-    val roomId: RoomId,
+    val roomId: RoomId? = null,
     val previousHopPeerId: PeerId?,
     val ttl: Int,
     val payloadKind: MeshPayloadKind,

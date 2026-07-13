@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.yellastro.btration.domain.model.ChatMessage
 import com.yellastro.btration.domain.model.Peer
 import com.yellastro.btration.domain.model.PeerId
+import com.yellastro.btration.domain.model.RoomTransportMode
 import com.yellastro.btration.domain.runtime.DirectAudioStatus
 import com.yellastro.btration.domain.runtime.RoomRuntimeState
 import com.yellastro.btration.repository.RoomRepository
@@ -21,7 +22,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /**
- * ViewModel комнаты: собирает runtime, voice-настройки, статус выбранного media-plane, участников, чат и команды UI.
+ * ViewModel комнаты: собирает runtime, voice-настройки, mesh-connect статусы, участников, чат и команды UI.
  */
 class RoomViewModel(
     private val roomRepository: RoomRepository,
@@ -34,21 +35,24 @@ class RoomViewModel(
         roomRepository.runtimeState,
         roomRepository.messages,
         roomRepository.talkingPeerIds,
+        roomRepository.directMeshPeerIds,
         inputText,
     ) { runtimeState: RoomRuntimeState,
         messages: List<ChatMessage>,
         talkingPeerIds: Set<PeerId>,
+        directMeshPeerIds: Set<PeerId>,
         input: String ->
         RoomUiInputs(
             runtimeState = runtimeState,
             messages = messages,
             talkingPeerIds = talkingPeerIds,
+            directMeshPeerIds = directMeshPeerIds,
             input = input,
         )
     }
 
     /**
-     * UI-состояние комнаты, собранное из runtime, voice-настроек, сообщений, talking-состояния и ввода.
+     * UI-состояние комнаты, собранное из runtime, voice-настроек, сообщений, talking/direct-connect состояний и ввода.
      */
     val uiState: StateFlow<RoomUiState> = combine(
         roomUiInputs,
@@ -61,6 +65,7 @@ class RoomViewModel(
             runtimeState = inputs.runtimeState,
             messages = inputs.messages,
             talkingPeerIds = inputs.talkingPeerIds,
+            directMeshPeerIds = inputs.directMeshPeerIds,
             input = inputs.input,
             talking = talking,
             voiceTransportPreference = voiceTransportPreference,
@@ -72,6 +77,7 @@ class RoomViewModel(
             runtimeState = roomRepository.runtimeState.value,
             messages = roomRepository.messages.value,
             talkingPeerIds = roomRepository.talkingPeerIds.value,
+            directMeshPeerIds = roomRepository.directMeshPeerIds.value,
             input = inputText.value,
             talking = isTalking.value,
             voiceTransportPreference = voiceSettingsRepository.voiceTransportPreference.value,
@@ -149,12 +155,13 @@ class RoomViewModel(
     }
 
     /**
-     * Преобразует runtime-состояние комнаты в UI-состояние с явным статусом прямого аудиоканала.
+     * Преобразует runtime-состояние комнаты в UI-состояние с явным типом комнаты и статусом прямого аудиоканала.
      */
     private fun mapUiState(
         runtimeState: RoomRuntimeState,
         messages: List<ChatMessage>,
         talkingPeerIds: Set<PeerId>,
+        directMeshPeerIds: Set<PeerId>,
         input: String,
         talking: Boolean,
         voiceTransportPreference: VoiceTransportPreference,
@@ -169,10 +176,12 @@ class RoomViewModel(
         return when (runtimeState) {
             is RoomRuntimeState.Hosting -> {
                 val roomVoiceTransportPreference = VoiceTransportPreference.fromTransportMode(runtimeState.room.voiceTransportMode)
+                val isMeshRoom = runtimeState.room.roomTransportMode == RoomTransportMode.MESHRA
                 RoomUiState(
                     roomName = runtimeState.room.name,
                     isHost = true,
-                    members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, talking) },
+                    isMeshRoom = isMeshRoom,
+                    members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, directMeshPeerIds, talking, isMeshRoom) },
                     messages = messages.map { mapMessage(it, selfPeerId) },
                     inputText = input,
                     canSend = canSend,
@@ -189,10 +198,12 @@ class RoomViewModel(
 
             is RoomRuntimeState.Client -> {
                 val roomVoiceTransportPreference = VoiceTransportPreference.fromTransportMode(runtimeState.room.voiceTransportMode)
+                val isMeshRoom = runtimeState.room.roomTransportMode == RoomTransportMode.MESHRA
                 RoomUiState(
                     roomName = runtimeState.room.name,
                     isHost = false,
-                    members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, talking) },
+                    isMeshRoom = isMeshRoom,
+                    members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, directMeshPeerIds, talking, isMeshRoom) },
                     messages = messages.map { mapMessage(it, selfPeerId) },
                     inputText = input,
                     canSend = canSend,
@@ -211,6 +222,7 @@ class RoomViewModel(
                 val roomVoiceTransportPreference = VoiceTransportPreference.fromTransportMode(runtimeState.room.voiceTransportMode)
                 RoomUiState(
                     roomName = runtimeState.room.name,
+                    isMeshRoom = runtimeState.room.roomTransportMode == RoomTransportMode.MESHRA,
                     inputText = input,
                     canSend = false,
                     canTalk = false,
@@ -301,12 +313,16 @@ class RoomViewModel(
         peer: Peer,
         selfPeerId: PeerId,
         talkingPeerIds: Set<PeerId>,
+        directMeshPeerIds: Set<PeerId>,
         selfTalking: Boolean,
+        isMeshRoom: Boolean,
     ): MemberUi {
         return MemberUi(
             peerId = peer.peerId,
             name = peer.name,
             isSelf = peer.peerId == selfPeerId,
+            isConnectIndicatorVisible = isMeshRoom,
+            isDirectlyConnected = peer.peerId in directMeshPeerIds,
             isTalking = peer.peerId in talkingPeerIds || (peer.peerId == selfPeerId && selfTalking),
         )
     }
@@ -338,6 +354,7 @@ class RoomViewModel(
         val runtimeState: RoomRuntimeState,
         val messages: List<ChatMessage>,
         val talkingPeerIds: Set<PeerId>,
+        val directMeshPeerIds: Set<PeerId>,
         val input: String,
     )
 

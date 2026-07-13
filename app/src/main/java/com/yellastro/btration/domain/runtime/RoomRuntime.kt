@@ -42,7 +42,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
- * Рабочая машина комнаты: ведет discovery, Nearby Star/MESHRA room transport, выбор voice transport, чат, PTT и статус media-plane.
+ * Рабочая машина комнаты: ведет discovery, Nearby Star/MESHRA room transport, direct mesh-connect статусы, выбор voice transport, чат, PTT и статус media-plane.
  */
 class RoomRuntime(
     private val profileRepository: ProfileRepository,
@@ -53,6 +53,7 @@ class RoomRuntime(
     private val voiceSettingsRepository: VoiceSettingsRepository,
     private val idGenerator: IdGenerator,
     private val externalScope: CoroutineScope,
+    private val shouldUseMeshGateway: (PeerId) -> Boolean = { true },
 ) {
     private val _state = MutableStateFlow<RoomRuntimeState>(RoomRuntimeState.Idle)
     private val _availableRooms = MutableStateFlow<List<RoomInfo>>(emptyList())
@@ -92,6 +93,11 @@ class RoomRuntime(
      * PeerId участников, чьи голосовые frames сейчас передаются или доигрываются локально.
      */
     val talkingPeerIds: StateFlow<Set<PeerId>> = _talkingPeerIds.asStateFlow()
+
+    /**
+     * PeerId участников, с которыми сейчас есть прямой mesh link; в Nearby Star не используется.
+     */
+    val directMeshPeerIds: StateFlow<Set<PeerId>> = meshTransport.directPeerIds
 
     /**
      * Одноразовые уведомления для snackbar, которые не обязаны менять состояние комнаты.
@@ -164,11 +170,16 @@ class RoomRuntime(
      */
     suspend fun stopSearch() {
         discoveryCycleMutex.withLock {
-            Log.i(TAG, "[stopSearch] Останавливаем поиск currentState=${_state.value.javaClass.simpleName}")
+            val currentState = _state.value
+            Log.i(TAG, "[stopSearch] Останавливаем поиск currentState=${currentState.javaClass.simpleName}")
             roomTransport.stopDiscovery()
-            meshTransport.stopDiscovery()
+            if (isActiveMeshState(currentState)) {
+                Log.i(TAG, "[stopSearch] Mesh discovery оставлен активным для healing")
+            } else {
+                meshTransport.stopDiscovery()
+            }
             roomIdsSeenInDiscoveryCycle = null
-            if (_state.value is RoomRuntimeState.Searching) {
+            if (currentState is RoomRuntimeState.Searching) {
                 _state.value = RoomRuntimeState.Idle
                 Log.i(TAG, "[stopSearch] Runtime переведен в Idle")
             }
@@ -262,6 +273,7 @@ class RoomRuntime(
             isDirectAudioReady = room.isDirectAudioReady,
         )
         advertiseMeshSnapshot(room.roomId, self)
+        startMeshHealingDiscovery(room.roomId, reason = "create_mesh_room")
         Log.i(TAG, "[createMeshRoom] Runtime переведен в Hosting MESHRA roomId=${room.roomId.value} roomName=${room.name} hostPeerId=${self.peerId.value}")
     }
 
@@ -331,7 +343,10 @@ class RoomRuntime(
             directAudioStatus = DirectAudioStatus.Unavailable(MESH_VOICE_UNAVAILABLE_MESSAGE),
         )
         Log.i(TAG, "[joinMeshRoom] Runtime переведен в Joining MESHRA roomId=${room.roomId.value} endpointId=$endpointId")
-        meshTransport.connectToGateway(NeighborCandidateId(endpointId))
+        meshTransport.connectToGateway(
+            candidateId = NeighborCandidateId(endpointId),
+            gatewayPeerId = (room.gateway ?: room.host).peerId,
+        )
     }
 
     /**
@@ -340,12 +355,16 @@ class RoomRuntime(
     suspend fun leaveRoom() {
         Log.i(TAG, "[leaveRoom] Команда выйти currentState=${_state.value.javaClass.simpleName}")
         when (val currentState = _state.value) {
-            is RoomRuntimeState.Hosting -> closeRoom()
+            is RoomRuntimeState.Hosting -> {
+                if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
+                    leaveMeshRoomLocally(currentState.room, role = "host")
+                    return
+                }
+                closeRoom()
+            }
             is RoomRuntimeState.Client -> {
                 if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
-                    publishMeshMemberLeft(currentState.room, profileRepository.getSelfPeer())
-                    Log.i(TAG, "[leaveRoom] Client отправил mesh MEMBER_LEFT roomId=${currentState.room.roomId.value}")
-                    resetSession()
+                    leaveMeshRoomLocally(currentState.room, role = "client")
                     return
                 }
                 val self = profileRepository.getSelfPeer()
@@ -371,7 +390,7 @@ class RoomRuntime(
     }
 
     /**
-     * Закрывает хостимую комнату и уведомляет всех участников.
+     * Закрывает хостимую Nearby Star комнату или локально выходит из MESHRA-комнаты без удаления общей mesh-сети.
      */
     suspend fun closeRoom() {
         Log.i(TAG, "[closeRoom] Команда закрыть комнату currentState=${_state.value.javaClass.simpleName}")
@@ -383,9 +402,7 @@ class RoomRuntime(
         }
 
         if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
-            publishMeshMemberLeft(currentState.room, profileRepository.getSelfPeer())
-            Log.i(TAG, "[closeRoom] Host покидает MESHRA-комнату без закрытия всей mesh-сети roomId=${currentState.room.roomId.value}")
-            resetSession()
+            leaveMeshRoomLocally(currentState.room, role = "host_close_command")
             return
         }
 
@@ -396,6 +413,18 @@ class RoomRuntime(
         )
         sendToMembers(currentState.members, roomClosed, excludedPeerIds = setOf(profileRepository.getOrCreatePeerId()))
         Log.i(TAG, "[closeRoom] ROOM_CLOSED разослан roomId=${currentState.room.roomId.value} memberCount=${currentState.members.size}")
+        resetSession()
+    }
+
+    /**
+     * Публикует штатный выход локального peer-а из MESHRA-комнаты и сбрасывает только локальную сессию.
+     *
+     * В MESHRA создатель комнаты не является владельцем жизни комнаты: его выход должен быть обычным
+     * `MEMBER_LEFT`, без `ROOM_CLOSED` и без удаления event-log/snapshot-а на остальных устройствах.
+     */
+    private fun leaveMeshRoomLocally(room: RoomInfo, role: String) {
+        publishMeshMemberLeft(room, profileRepository.getSelfPeer())
+        Log.i(TAG, "[leaveMeshRoomLocally] Локальный peer вышел из MESHRA-комнаты без ROOM_CLOSED role=$role roomId=${room.roomId.value}")
         resetSession()
     }
 
@@ -551,6 +580,10 @@ class RoomRuntime(
                 )
             }
             is RoomTransportEvent.DiscoveryFailed -> {
+                if (isActiveMeshState(_state.value)) {
+                    Log.w(TAG, "[handleRoomTransportEvent] Ошибка healing discovery в активной MESHRA-комнате не роняет комнату: ${event.cause.message}", event.cause)
+                    return
+                }
                 val message = nearbyFailureMessage("начать поиск комнат", event.cause)
                 emitNotice(message)
                 setError(
@@ -559,6 +592,10 @@ class RoomRuntime(
                 )
             }
             is RoomTransportEvent.ConnectionRequestFailed -> {
+                if (isActiveMeshState(_state.value)) {
+                    Log.w(TAG, "[handleRoomTransportEvent] Ошибка connection request в активной MESHRA-комнате не роняет комнату: ${event.cause.message}", event.cause)
+                    return
+                }
                 val message = nearbyFailureMessage("подключиться к комнате", event.cause)
                 emitNotice(message)
                 setError(message)
@@ -583,7 +620,7 @@ class RoomRuntime(
             is MeshTransportEvent.GatewayFound -> handleMeshGatewayFound(event)
             is MeshTransportEvent.GatewayLost -> handleMeshGatewayLost(event)
             is MeshTransportEvent.LinkConnected -> handleMeshLinkConnected(event)
-            is MeshTransportEvent.LinkDisconnected -> Log.i(TAG, "[handleMeshTransportEvent] Mesh link отключен linkId=${event.linkId.value}")
+            is MeshTransportEvent.LinkDisconnected -> handleMeshLinkDisconnected(event)
             is MeshTransportEvent.EventAccepted -> handleMeshRoomUpdated(event.event.roomId)
             is MeshTransportEvent.SnapshotReceived -> handleMeshSnapshotReceived(event.snapshot)
             is MeshTransportEvent.DecodeFailed -> {
@@ -593,10 +630,20 @@ class RoomRuntime(
                     Log.i(TAG, "[handleMeshTransportEvent] Ошибка decode mesh-пакета проигнорирована вне MESHRA-состояния: ${event.cause.message}")
                 }
             }
-            is MeshTransportEvent.SendFailed -> setError("Не удалось отправить mesh-пакет: ${event.cause.message.orEmpty()}")
+            is MeshTransportEvent.SendFailed -> {
+                if (event.roomId == null) {
+                    Log.w(TAG, "[handleMeshTransportEvent] Служебный mesh-пакет не отправлен, комнату не роняем: ${event.cause.message}", event.cause)
+                    return
+                }
+                setError("Не удалось отправить mesh-пакет: ${event.cause.message.orEmpty()}")
+            }
             is MeshTransportEvent.TransportFailed -> {
                 if (!isCurrentStateMesh()) {
                     Log.i(TAG, "[handleMeshTransportEvent] Ошибка MeshTransport проигнорирована вне MESHRA-состояния: ${event.cause.message}")
+                    return
+                }
+                if (_state.value !is RoomRuntimeState.Joining) {
+                    Log.w(TAG, "[handleMeshTransportEvent] Ошибка MeshTransport в активной MESHRA-комнате не роняет комнату: ${event.cause.message}", event.cause)
                     return
                 }
                 val message = nearbyFailureMessage("выполнить mesh-операцию", event.cause)
@@ -848,7 +895,7 @@ class RoomRuntime(
      * Добавляет найденную комнату и связывает ее RoomId с transport endpointId.
      */
     private fun handleEndpointFound(event: RoomTransportEvent.EndpointFound) {
-        val roomInfo = event.roomInfo
+        val roomInfo = event.roomInfo?.copy(discoveryEndpointId = event.endpointId)
         if (roomInfo == null) {
             Log.w(TAG, "[handleEndpointFound] Endpoint найден, но визитка комнаты отсутствует endpointId=${event.endpointId}")
             return
@@ -865,8 +912,8 @@ class RoomRuntime(
      * Добавляет найденный mesh gateway как MESHRA-комнату в общий список лобби и дедупит дубли по roomToken.
      */
     private fun handleMeshGatewayFound(event: MeshTransportEvent.GatewayFound) {
-        val roomInfo = event.advertisement.toRoomInfo()
         val endpointId = event.candidateId.value
+        val roomInfo = event.advertisement.toRoomInfo().copy(discoveryEndpointId = endpointId)
         roomIdsSeenInDiscoveryCycle?.add(roomInfo.roomId)
         roomEndpoints[roomInfo.roomId] = endpointId
         endpointRooms[endpointId] = roomInfo.roomId
@@ -876,6 +923,7 @@ class RoomRuntime(
             "[handleMeshGatewayFound] Mesh gateway добавлен roomId=${roomInfo.roomId.value} roomName=${roomInfo.name} endpointId=$endpointId memberCount=${event.advertisement.memberCount}",
         )
         reconnectAfterRecoveryIfNeeded(roomInfo.roomId, endpointId)
+        connectToMeshGatewayForHealingIfNeeded(roomInfo, endpointId)
     }
 
     /**
@@ -904,6 +952,16 @@ class RoomRuntime(
             return
         }
         Log.i(TAG, "[handleMeshLinkConnected] Mesh link готов, ждем snapshot roomId=${joiningState.room.roomId.value} linkId=${event.linkId.value} reused=${event.reused}")
+    }
+
+    /**
+     * Запускает mesh discovery после разрыва link-а, чтобы активная MESHRA-комната могла добрать соседей.
+     */
+    private fun handleMeshLinkDisconnected(event: MeshTransportEvent.LinkDisconnected) {
+        Log.i(TAG, "[handleMeshLinkDisconnected] Mesh link отключен linkId=${event.linkId.value} activeLinkCount=${meshTransport.activeLinkCount()}")
+        val roomId = activeMeshRoomId() ?: return
+        startMeshHealingDiscovery(roomId, reason = "link_disconnected")
+        connectToKnownMeshGatewaysForHealing(roomId)
     }
 
     /**
@@ -943,6 +1001,8 @@ class RoomRuntime(
             isDirectAudioReady = room.isDirectAudioReady,
         )
         advertiseMeshSnapshot(room.roomId, self)
+        startMeshHealingDiscovery(room.roomId, reason = "mesh_join_completed")
+        connectToKnownMeshGatewaysForHealing(room.roomId)
         Log.i(TAG, "[completeMeshJoinIfNeeded] Mesh-вход завершен roomId=${room.roomId.value} memberCount=${members.size}")
     }
 
@@ -964,6 +1024,7 @@ class RoomRuntime(
                     directAudioStatus = DirectAudioStatus.Unavailable(MESH_VOICE_UNAVAILABLE_MESSAGE),
                 )
                 advertiseMeshSnapshot(roomId, profileRepository.getSelfPeer())
+                connectToKnownMeshGatewaysForHealing(roomId)
                 Log.i(TAG, "[handleMeshRoomUpdated] Host MESHRA snapshot применен roomId=${roomId.value} memberCount=${snapshot.members.size} messageCount=${snapshot.messages.size}")
             }
 
@@ -978,6 +1039,7 @@ class RoomRuntime(
                     directAudioStatus = DirectAudioStatus.Unavailable(MESH_VOICE_UNAVAILABLE_MESSAGE),
                 )
                 advertiseMeshSnapshot(roomId, profileRepository.getSelfPeer())
+                connectToKnownMeshGatewaysForHealing(roomId)
                 Log.i(TAG, "[handleMeshRoomUpdated] Client MESHRA snapshot применен roomId=${roomId.value} memberCount=${snapshot.members.size} messageCount=${snapshot.messages.size}")
             }
 
@@ -986,6 +1048,129 @@ class RoomRuntime(
             RoomRuntimeState.Idle,
             is RoomRuntimeState.Error,
             -> Unit
+        }
+    }
+
+    /**
+     * Подключается к найденному gateway той же MESHRA-комнаты, если активных/pending link-ов меньше целевого числа.
+     */
+    private fun connectToMeshGatewayForHealingIfNeeded(roomInfo: RoomInfo, endpointId: String) {
+        val activeMeshState = activeMeshStateInfo() ?: return
+        if (!isSameMeshDiscoveryRoom(roomInfo, activeMeshState.room.roomId)) {
+            return
+        }
+        val candidateId = NeighborCandidateId(endpointId)
+        if (meshTransport.hasLinkOrPending(candidateId)) {
+            return
+        }
+        val gatewayPeerId = (roomInfo.gateway ?: roomInfo.host).peerId
+        if (!shouldUseMeshGateway(gatewayPeerId)) {
+            Log.i(TAG, "[connectToMeshGatewayForHealingIfNeeded] Gateway пропущен ignore-list endpointId=$endpointId gatewayPeerId=${gatewayPeerId.value}")
+            return
+        }
+        val knownMemberCount = maxOf(activeMeshState.memberCount, roomInfo.memberCount ?: 0)
+        val targetLinkCount = desiredMeshLinkCount(knownMemberCount)
+        val currentLinkOrPendingCount = meshTransport.linkOrPendingCount()
+        if (targetLinkCount <= 0 || currentLinkOrPendingCount >= targetLinkCount || currentLinkOrPendingCount >= MESH_MAX_LINKS) {
+            Log.i(
+                TAG,
+                "[connectToMeshGatewayForHealingIfNeeded] Mesh link не нужен endpointId=$endpointId current=$currentLinkOrPendingCount target=$targetLinkCount knownMembers=$knownMemberCount",
+            )
+            return
+        }
+        Log.i(
+            TAG,
+            "[connectToMeshGatewayForHealingIfNeeded] Добираем mesh link endpointId=$endpointId current=$currentLinkOrPendingCount target=$targetLinkCount knownMembers=$knownMemberCount",
+        )
+        meshTransport.connectToGateway(candidateId = candidateId, gatewayPeerId = gatewayPeerId)
+    }
+
+    /**
+     * Пробует добрать mesh link-и из уже известных discovery-кандидатов текущей комнаты.
+     */
+    private fun connectToKnownMeshGatewaysForHealing(roomId: RoomId) {
+        _availableRooms.value
+            .filter { roomInfo -> roomInfo.discoveryEndpointId != null && isSameMeshDiscoveryRoom(roomInfo, roomId) }
+            .forEach { roomInfo ->
+                connectToMeshGatewayForHealingIfNeeded(
+                    roomInfo = roomInfo,
+                    endpointId = roomInfo.discoveryEndpointId.orEmpty(),
+                )
+            }
+    }
+
+    /**
+     * Возвращает целевое количество активных mesh link-ов для текущего размера комнаты.
+     */
+    private fun desiredMeshLinkCount(memberCount: Int): Int {
+        return (memberCount - 1)
+            .coerceAtLeast(0)
+            .coerceAtMost(MESH_MIN_LINKS)
+            .coerceAtMost(MESH_MAX_LINKS)
+    }
+
+    /**
+     * Запускает discovery активной MESHRA-комнаты для фонового добора соседей.
+     */
+    private fun startMeshHealingDiscovery(roomId: RoomId, reason: String) {
+        meshTransport.startDiscovery()
+        Log.i(TAG, "[startMeshHealingDiscovery] Mesh discovery оставлен активным для healing roomId=${roomId.value} reason=$reason")
+    }
+
+    /**
+     * Возвращает true, если найденная discovery-комната относится к текущей активной MESHRA-комнате.
+     */
+    private fun isSameMeshDiscoveryRoom(discoveryRoom: RoomInfo, activeRoomId: RoomId): Boolean {
+        return discoveryRoom.roomTransportMode == RoomTransportMode.MESHRA &&
+            (discoveryRoom.roomId == activeRoomId || MeshRoomAdvertisement.matchesAdvertisedRoomId(discoveryRoom.roomId, activeRoomId))
+    }
+
+    /**
+     * Возвращает RoomId активной MESHRA-комнаты, если runtime сейчас находится в ней.
+     */
+    private fun activeMeshRoomId(): RoomId? {
+        return activeMeshStateInfo()?.room?.roomId
+    }
+
+    /**
+     * Возвращает true для Hosting/Client/Joining MESHRA-состояний, где mesh discovery нужен не только лобби.
+     */
+    private fun isActiveMeshState(state: RoomRuntimeState): Boolean {
+        return when (state) {
+            is RoomRuntimeState.Hosting -> state.room.roomTransportMode == RoomTransportMode.MESHRA
+            is RoomRuntimeState.Client -> state.room.roomTransportMode == RoomTransportMode.MESHRA
+            is RoomRuntimeState.Joining -> state.room.roomTransportMode == RoomTransportMode.MESHRA
+            RoomRuntimeState.Idle,
+            RoomRuntimeState.Searching,
+            is RoomRuntimeState.Error,
+            -> false
+        }
+    }
+
+    /**
+     * Возвращает комнату и известное количество участников для активного MESHRA-состояния.
+     */
+    private fun activeMeshStateInfo(): ActiveMeshStateInfo? {
+        return when (val currentState = _state.value) {
+            is RoomRuntimeState.Hosting -> {
+                if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
+                    ActiveMeshStateInfo(currentState.room, currentState.members.size)
+                } else {
+                    null
+                }
+            }
+            is RoomRuntimeState.Client -> {
+                if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
+                    ActiveMeshStateInfo(currentState.room, currentState.members.size)
+                } else {
+                    null
+                }
+            }
+            RoomRuntimeState.Idle,
+            RoomRuntimeState.Searching,
+            is RoomRuntimeState.Joining,
+            is RoomRuntimeState.Error,
+            -> null
         }
     }
 
@@ -1002,8 +1187,12 @@ class RoomRuntime(
         connectionRecoveryJob = null
         roomTransport.stopDiscovery()
         if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
+            val gatewayPeerId = (_availableRooms.value.firstOrNull { roomInfo -> roomInfo.roomId == roomId }?.gateway ?: currentState.room.gateway ?: currentState.room.host).peerId
             Log.i(TAG, "[reconnectAfterRecoveryIfNeeded] Mesh gateway найден заново, повторяем connection roomId=${roomId.value} endpointId=$endpointId")
-            meshTransport.connectToGateway(NeighborCandidateId(endpointId))
+            meshTransport.connectToGateway(
+                candidateId = NeighborCandidateId(endpointId),
+                gatewayPeerId = gatewayPeerId,
+            )
         } else {
             Log.i(TAG, "[reconnectAfterRecoveryIfNeeded] Комната найдена заново, повторяем connection roomId=${roomId.value} endpointId=$endpointId")
             roomTransport.connectToEndpoint(endpointId)
@@ -1909,6 +2098,14 @@ class RoomRuntime(
         return System.currentTimeMillis()
     }
 
+    /**
+     * Короткое описание активной MESHRA-комнаты для расчета healing-связности.
+     */
+    private data class ActiveMeshStateInfo(
+        val room: RoomInfo,
+        val memberCount: Int,
+    )
+
     private companion object {
         private const val TAG = "RoomRuntime"
         private const val DEFAULT_PACKET_TTL = 1
@@ -1918,6 +2115,8 @@ class RoomRuntime(
         private const val CLIENT_RECONNECT_DISCOVERY_TIMEOUT_MILLIS = 20_000L
         private const val NOTICE_BUFFER_CAPACITY = 8
         private const val TALKING_PEER_TIMEOUT_MILLIS = 1_500L
+        private const val MESH_MIN_LINKS = 3
+        private const val MESH_MAX_LINKS = 64
         private const val DIRECT_AUDIO_UNAVAILABLE_MESSAGE = "Прямой аудиоканал не установлен"
         private const val MESH_VOICE_UNAVAILABLE_MESSAGE = "Голос в MESHRA-комнатах пока не поддерживается"
     }

@@ -23,7 +23,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Текстовый mesh-слой поверх NeighborTransport: принимает room events, дедупит по eventId и flood-ит соседям.
+ * Текстовый mesh-слой поверх NeighborTransport: принимает room events, дедупит, flood-ит соседям и ведет live-мапу прямых PeerId.
  *
  * Runtime включает этот слой для MESHRA-комнат; Nearby Star продолжает работать через обычный RoomTransport.
  */
@@ -36,12 +36,16 @@ class MeshTransport(
     private val acceptIncomingConnections: Boolean = true,
 ) {
     private val activeLinks = mutableSetOf<NeighborLinkId>()
+    private val pendingGatewayConnections = mutableSetOf<NeighborCandidateId>()
+    private val pendingGatewayPeerIds = mutableMapOf<NeighborCandidateId, PeerId>()
+    private val linkPeerIds = mutableMapOf<NeighborLinkId, PeerId>()
     private val seenEventIds = mutableSetOf<MeshRoomEventId>()
     private val roomSnapshots = mutableMapOf<RoomId, MeshRoomSnapshot>()
     private val advertisingLock = Any()
     private var advertisedEndpointName: String? = null
     private val _events = MutableSharedFlow<MeshTransportEvent>(extraBufferCapacity = EVENT_BUFFER_CAPACITY)
     private val _rooms = MutableStateFlow<Map<RoomId, MeshRoomSnapshot>>(emptyMap())
+    private val _directPeerIds = MutableStateFlow<Set<PeerId>>(emptySet())
 
     /**
      * События mesh-слоя для будущего runtime: принятые room events, snapshot-ы и ошибки.
@@ -52,6 +56,11 @@ class MeshTransport(
      * Текущие snapshot-ы известных mesh-комнат, рассчитанные инкрементально по принятым событиям.
      */
     val rooms: StateFlow<Map<RoomId, MeshRoomSnapshot>> = _rooms.asStateFlow()
+
+    /**
+     * PeerId соседей, с которыми у локального устройства сейчас есть прямой mesh link.
+     */
+    val directPeerIds: StateFlow<Set<PeerId>> = _directPeerIds.asStateFlow()
 
     init {
         externalScope.launch {
@@ -107,10 +116,39 @@ class MeshTransport(
     }
 
     /**
-     * Запрашивает соединение с mesh gateway, найденным через discovery.
+     * Запрашивает соединение с mesh gateway, найденным через discovery, и заранее запоминает PeerId gateway-а.
      */
-    fun connectToGateway(candidateId: NeighborCandidateId) {
+    fun connectToGateway(candidateId: NeighborCandidateId, gatewayPeerId: PeerId? = null) {
+        if (hasLinkOrPending(candidateId)) {
+            Log.i(TAG, "[connectToGateway] Mesh gateway уже подключен или ожидает connection candidateId=${candidateId.value}")
+            return
+        }
+        pendingGatewayConnections.add(candidateId)
+        if (gatewayPeerId != null) {
+            pendingGatewayPeerIds[candidateId] = gatewayPeerId
+        }
         neighborTransport.connect(candidateId)
+    }
+
+    /**
+     * Возвращает количество готовых mesh link-ов.
+     */
+    fun activeLinkCount(): Int {
+        return activeLinks.size
+    }
+
+    /**
+     * Возвращает количество готовых и уже запрошенных mesh link-ов.
+     */
+    fun linkOrPendingCount(): Int {
+        return activeLinks.size + pendingGatewayConnections.size
+    }
+
+    /**
+     * Возвращает true, если gateway уже подключен или ожидает завершения connection request.
+     */
+    fun hasLinkOrPending(candidateId: NeighborCandidateId): Boolean {
+        return NeighborLinkId(candidateId.value) in activeLinks || candidateId in pendingGatewayConnections
     }
 
     /**
@@ -119,6 +157,10 @@ class MeshTransport(
     fun disconnectAll() {
         neighborTransport.disconnectAll()
         activeLinks.clear()
+        pendingGatewayConnections.clear()
+        pendingGatewayPeerIds.clear()
+        linkPeerIds.clear()
+        publishDirectPeerIds()
         Log.i(TAG, "[disconnectAll] Все mesh link-и разорваны")
     }
 
@@ -128,12 +170,16 @@ class MeshTransport(
     fun stopAll(reason: String) {
         neighborTransport.stopAll(reason)
         activeLinks.clear()
+        pendingGatewayConnections.clear()
+        pendingGatewayPeerIds.clear()
+        linkPeerIds.clear()
         seenEventIds.clear()
         roomSnapshots.clear()
         synchronized(advertisingLock) {
             advertisedEndpointName = null
         }
         publishRooms()
+        publishDirectPeerIds()
         Log.i(TAG, "[stopAll] MeshTransport остановлен и очищен reason=$reason")
     }
 
@@ -301,20 +347,43 @@ class MeshTransport(
                 }
             }
             is NeighborTransportEvent.ConnectionAcceptFailed -> emitEvent(MeshTransportEvent.TransportFailed(event.cause))
-            is NeighborTransportEvent.ConnectionRequestFailed -> emitEvent(MeshTransportEvent.TransportFailed(event.cause))
-            is NeighborTransportEvent.LinkConnectionFailed -> emitEvent(
-                MeshTransportEvent.TransportFailed(
-                    IllegalStateException("Mesh link connection failed statusCode=${event.statusCode}"),
-                ),
-            )
+            is NeighborTransportEvent.ConnectionRequestFailed -> {
+                pendingGatewayConnections.remove(event.candidateId)
+                pendingGatewayPeerIds.remove(event.candidateId)
+                emitEvent(MeshTransportEvent.TransportFailed(event.cause))
+            }
+            is NeighborTransportEvent.ConnectionRecoveryRequired -> {
+                val candidateId = NeighborCandidateId(event.linkId.value)
+                pendingGatewayConnections.remove(candidateId)
+                pendingGatewayPeerIds.remove(candidateId)
+            }
+            is NeighborTransportEvent.LinkConnectionFailed -> {
+                val candidateId = NeighborCandidateId(event.linkId.value)
+                pendingGatewayConnections.remove(candidateId)
+                pendingGatewayPeerIds.remove(candidateId)
+                emitEvent(
+                    MeshTransportEvent.TransportFailed(
+                        IllegalStateException("Mesh link connection failed statusCode=${event.statusCode}"),
+                    ),
+                )
+            }
             is NeighborTransportEvent.LinkConnected -> {
+                val candidateId = NeighborCandidateId(event.linkId.value)
+                pendingGatewayConnections.remove(candidateId)
                 activeLinks.add(event.linkId)
+                bindLinkPeer(event.linkId, pendingGatewayPeerIds.remove(candidateId), source = "pending_gateway")
                 Log.i(TAG, "[handleNeighborEvent] Mesh link готов linkId=${event.linkId.value} activeLinkCount=${activeLinks.size}")
+                sendPeerHello(event.linkId)
                 sendKnownSnapshots(event.linkId)
                 emitEvent(MeshTransportEvent.LinkConnected(event.linkId, reused = event.reused))
             }
             is NeighborTransportEvent.LinkDisconnected -> {
+                val candidateId = NeighborCandidateId(event.linkId.value)
+                pendingGatewayConnections.remove(candidateId)
+                pendingGatewayPeerIds.remove(candidateId)
                 activeLinks.remove(event.linkId)
+                linkPeerIds.remove(event.linkId)
+                publishDirectPeerIds()
                 Log.i(TAG, "[handleNeighborEvent] Mesh link отключен linkId=${event.linkId.value} activeLinkCount=${activeLinks.size}")
                 emitEvent(MeshTransportEvent.LinkDisconnected(event.linkId))
             }
@@ -347,6 +416,22 @@ class MeshTransport(
     }
 
     /**
+     * Отправляет соседу служебный hello, чтобы обе стороны быстро связали физический link с PeerId.
+     */
+    private fun sendPeerHello(linkId: NeighborLinkId) {
+        val envelope = MeshEnvelope(
+            previousHopPeerId = selfPeerId,
+            ttl = 0,
+            payloadKind = MeshPayloadKind.PEER_HELLO,
+            sentAtMillis = now(),
+        )
+        neighborTransport.sendMessage(linkId, codec.encode(envelope)) { cause ->
+            emitEvent(MeshTransportEvent.SendFailed(roomId = null, eventId = null, cause = cause))
+        }
+        Log.i(TAG, "[sendPeerHello] Mesh hello отправлен linkId=${linkId.value} peerId=${selfPeerId.value}")
+    }
+
+    /**
      * Декодирует mesh envelope, принимает новые события и пересылает их дальше с уменьшенным ttl.
      */
     private fun handleMessageReceived(linkId: NeighborLinkId, bytes: ByteArray) {
@@ -361,10 +446,24 @@ class MeshTransport(
             .getOrNull()
             ?: return
 
+        bindLinkPeer(linkId, envelope.previousHopPeerId, source = envelope.payloadKind.name)
         when (envelope.payloadKind) {
             MeshPayloadKind.ROOM_EVENT -> handleRoomEventEnvelope(linkId, envelope)
             MeshPayloadKind.ROOM_SNAPSHOT -> handleSnapshotEnvelope(linkId, envelope)
+            MeshPayloadKind.PEER_HELLO -> handlePeerHelloEnvelope(linkId, envelope)
         }
+    }
+
+    /**
+     * Принимает служебный hello; основная работа уже сделана через previousHopPeerId в bindLinkPeer.
+     */
+    private fun handlePeerHelloEnvelope(linkId: NeighborLinkId, envelope: MeshEnvelope) {
+        val peerId = envelope.previousHopPeerId
+        if (peerId == null) {
+            Log.w(TAG, "[handlePeerHelloEnvelope] Mesh hello без peerId linkId=${linkId.value}")
+            return
+        }
+        Log.i(TAG, "[handlePeerHelloEnvelope] Mesh hello принят linkId=${linkId.value} peerId=${peerId.value}")
     }
 
     /**
@@ -373,7 +472,7 @@ class MeshTransport(
     private fun handleRoomEventEnvelope(linkId: NeighborLinkId, envelope: MeshEnvelope) {
         val event = envelope.event
         if (event == null) {
-            Log.w(TAG, "[handleRoomEventEnvelope] Mesh envelope без room event linkId=${linkId.value} roomId=${envelope.roomId.value}")
+            Log.w(TAG, "[handleRoomEventEnvelope] Mesh envelope без room event linkId=${linkId.value} roomId=${envelope.roomId?.value}")
             return
         }
         if (!acceptEvent(event, sourceLinkId = linkId)) {
@@ -391,7 +490,7 @@ class MeshTransport(
     private fun handleSnapshotEnvelope(linkId: NeighborLinkId, envelope: MeshEnvelope) {
         val snapshot = envelope.snapshot
         if (snapshot == null) {
-            Log.w(TAG, "[handleSnapshotEnvelope] Mesh envelope без snapshot linkId=${linkId.value} roomId=${envelope.roomId.value}")
+            Log.w(TAG, "[handleSnapshotEnvelope] Mesh envelope без snapshot linkId=${linkId.value} roomId=${envelope.roomId?.value}")
             return
         }
         mergeSnapshot(snapshot)
@@ -547,6 +646,28 @@ class MeshTransport(
     }
 
     /**
+     * Привязывает физический mesh link к PeerId соседа и обновляет live-набор прямых peer-ов для UI.
+     */
+    private fun bindLinkPeer(linkId: NeighborLinkId, peerId: PeerId?, source: String) {
+        if (peerId == null || peerId == selfPeerId) {
+            return
+        }
+        val previousPeerId = linkPeerIds.put(linkId, peerId)
+        if (previousPeerId == peerId) {
+            return
+        }
+        publishDirectPeerIds()
+        Log.i(TAG, "[bindLinkPeer] Mesh link привязан к peerId linkId=${linkId.value} peerId=${peerId.value} source=$source")
+    }
+
+    /**
+     * Публикует immutable-набор PeerId, с которыми сейчас есть прямой mesh link.
+     */
+    private fun publishDirectPeerIds() {
+        _directPeerIds.value = linkPeerIds.values.toSet()
+    }
+
+    /**
      * Публикует событие mesh-слоя без подвешивания callback-потока.
      */
     private fun emitEvent(event: MeshTransportEvent) {
@@ -571,7 +692,7 @@ class MeshTransport(
 
     private companion object {
         private const val TAG = "MeshTransport"
-        private const val DEFAULT_TTL = 4
+        private const val DEFAULT_TTL = 16
         private const val EVENT_BUFFER_CAPACITY = 64
     }
 }
@@ -619,9 +740,9 @@ sealed class MeshTransportEvent {
     data class DecodeFailed(val linkId: NeighborLinkId, val cause: Throwable) : MeshTransportEvent()
 
     /**
-     * Отправка mesh payload-а завершилась ошибкой.
+     * Отправка mesh payload-а завершилась ошибкой; roomId null означает служебный payload вне комнаты.
      */
-    data class SendFailed(val roomId: RoomId, val eventId: MeshRoomEventId?, val cause: Throwable) : MeshTransportEvent()
+    data class SendFailed(val roomId: RoomId?, val eventId: MeshRoomEventId?, val cause: Throwable) : MeshTransportEvent()
 
     /**
      * Нижний транспорт сообщил ошибку connection lifecycle.

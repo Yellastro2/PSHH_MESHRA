@@ -142,6 +142,11 @@ internal class NearbyConnectionLayer(
                 Log.i(TAG, "[startDiscovery] Nearby discovery запущен")
             }
             .addOnFailureListener { cause ->
+                if (cause is ApiException && cause.statusCode == ConnectionsStatusCodes.STATUS_ALREADY_DISCOVERING) {
+                    cancelDiscoveryPermissionRetry()
+                    Log.i(TAG, "[startDiscovery] Nearby discovery уже запущен, повторный старт пропущен")
+                    return@addOnFailureListener
+                }
                 if (shouldRetryTransientPermissionFailure(
                         cause = cause,
                         permissionRetryAttempt = permissionRetryAttempt,

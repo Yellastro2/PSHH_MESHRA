@@ -120,6 +120,7 @@ class AppContainer(context: Context) {
         voiceSettingsRepository = voiceSettingsRepository,
         idGenerator = idGenerator,
         externalScope = applicationScope,
+        shouldUseMeshGateway = { peerId -> !ignoredNearbyRepository.isPeerIgnored(peerId) },
     )
 
     /**

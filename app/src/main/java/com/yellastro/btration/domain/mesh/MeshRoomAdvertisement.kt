@@ -101,6 +101,7 @@ data class MeshRoomAdvertisement(
             voiceTransportMode = VoiceTransportMode.WIFI_DIRECT_UDP,
             gateway = toAdvertisedGateway(),
             discoveryGroupId = toDiscoveryGroupId(),
+            memberCount = memberCount,
         )
     }
 
