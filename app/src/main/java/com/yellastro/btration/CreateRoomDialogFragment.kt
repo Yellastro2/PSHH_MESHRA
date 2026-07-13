@@ -12,18 +12,21 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.fragment.app.DialogFragment
+import com.yellastro.btration.domain.model.RoomTransportMode
 import com.yellastro.btration.voice.VoiceTransportPreference
 
 /**
- * Диалог создания комнаты с предзаполнением последнего имени, выбором voice transport и возвратом результата через Fragment Result API.
+ * Диалог создания комнаты с предзаполнением последнего имени, выбором типа комнаты, voice transport и возвратом результата.
  */
 class CreateRoomDialogFragment : DialogFragment() {
 
     private lateinit var etRoomName: EditText
+    private lateinit var spRoomTransport: Spinner
     private lateinit var spVoiceTransport: Spinner
     private lateinit var btnCancel: Button
     private lateinit var btnCreate: Button
     private lateinit var tvError: TextView
+    private val roomTransportModes = RoomTransportMode.values()
     private val voiceTransportModes = VoiceTransportPreference.values()
     private var lastSelectableVoiceTransportPosition = 0
 
@@ -53,11 +56,13 @@ class CreateRoomDialogFragment : DialogFragment() {
         super.onViewCreated(view, savedInstanceState)
 
         etRoomName = view.findViewById(R.id.et_room_name)
+        spRoomTransport = view.findViewById(R.id.sp_room_transport)
         spVoiceTransport = view.findViewById(R.id.sp_voice_transport)
         btnCancel = view.findViewById(R.id.btn_cancel)
         btnCreate = view.findViewById(R.id.btn_create)
         tvError = view.findViewById(R.id.tv_error)
         applyInitialRoomName()
+        setupRoomTransportSpinner()
         setupVoiceTransportSpinner()
 
         btnCancel.setOnClickListener {
@@ -77,6 +82,7 @@ class CreateRoomDialogFragment : DialogFragment() {
                     REQUEST_KEY,
                     Bundle().apply {
                         putString(RESULT_ROOM_NAME, name)
+                        putString(RESULT_ROOM_TRANSPORT_MODE, selectedRoomTransportMode().prefValue)
                         putString(RESULT_VOICE_TRANSPORT_PREF, selectedVoiceTransportPreference().prefValue)
                     },
                 )
@@ -98,27 +104,21 @@ class CreateRoomDialogFragment : DialogFragment() {
     }
 
     /**
+     * Настраивает список типа комнаты и выставляет сохраненный режим.
+     */
+    private fun setupRoomTransportSpinner() {
+        val initialMode = initialRoomTransportMode()
+        spRoomTransport.adapter = createWhiteTextAdapter(roomTransportModes.map { mode -> mode.fullName })
+        spRoomTransport.setSelection(roomTransportModes.indexOf(initialMode).coerceAtLeast(0))
+    }
+
+    /**
      * Настраивает список voice transport и блокирует пока неподдержанные варианты.
      */
     private fun setupVoiceTransportSpinner() {
         val initialPreference = initialVoiceTransportPreference()
         lastSelectableVoiceTransportPosition = voiceTransportModes.indexOf(initialPreference).coerceAtLeast(0)
-        spVoiceTransport.adapter = object : ArrayAdapter<String>(
-            requireContext(),
-            android.R.layout.simple_spinner_item,
-            voiceTransportModes.map { mode -> mode.fullName },
-        ) {
-            /**
-             * Подкрашивает закрытое значение spinner под темную карточку диалога.
-             */
-            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-                return super.getView(position, convertView, parent).also { itemView ->
-                    (itemView as? TextView)?.setTextColor(android.graphics.Color.WHITE)
-                }
-            }
-        }.also { adapter ->
-            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        }
+        spVoiceTransport.adapter = createWhiteTextAdapter(voiceTransportModes.map { mode -> mode.fullName })
         spVoiceTransport.setSelection(lastSelectableVoiceTransportPosition)
         spVoiceTransport.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             /**
@@ -139,6 +139,37 @@ class CreateRoomDialogFragment : DialogFragment() {
              */
             override fun onNothingSelected(parent: AdapterView<*>?) = Unit
         }
+    }
+
+    /**
+     * Создает spinner adapter с белым текстом выбранного значения на темной карточке.
+     */
+    private fun createWhiteTextAdapter(items: List<String>): ArrayAdapter<String> {
+        return object : ArrayAdapter<String>(
+            requireContext(),
+            android.R.layout.simple_spinner_item,
+            items,
+        ) {
+            /**
+             * Подкрашивает закрытое значение spinner под темную карточку диалога.
+             */
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                return super.getView(position, convertView, parent).also { itemView ->
+                    (itemView as? TextView)?.setTextColor(android.graphics.Color.WHITE)
+                }
+            }
+        }.also { adapter ->
+            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+    }
+
+    /**
+     * Читает начальный тип комнаты из аргументов диалога.
+     */
+    private fun initialRoomTransportMode(): RoomTransportMode {
+        return RoomTransportMode.fromPrefValue(
+            arguments?.getString(ARG_INITIAL_ROOM_TRANSPORT_MODE),
+        )
     }
 
     /**
@@ -165,6 +196,15 @@ class CreateRoomDialogFragment : DialogFragment() {
     }
 
     /**
+     * Возвращает выбранный тип транспорта комнаты.
+     */
+    private fun selectedRoomTransportMode(): RoomTransportMode {
+        val defaultPosition = roomTransportModes.indexOf(RoomTransportMode.MESHRA).coerceAtLeast(0)
+        val position = spRoomTransport.selectedItemPosition.takeIf { it in roomTransportModes.indices } ?: defaultPosition
+        return roomTransportModes[position]
+    }
+
+    /**
      * Делает окно диалога широким и оставляет прозрачный фон вокруг кастомной карточки.
      */
     override fun onStart() {
@@ -180,18 +220,21 @@ class CreateRoomDialogFragment : DialogFragment() {
      */
     companion object {
         private const val ARG_INITIAL_ROOM_NAME = "initial_room_name"
+        private const val ARG_INITIAL_ROOM_TRANSPORT_MODE = "initial_room_transport_mode"
         private const val ARG_INITIAL_VOICE_TRANSPORT_PREF = "initial_voice_transport_pref"
 
         /**
-         * Создает диалог с начальным названием комнаты и сохраненным voice transport.
+         * Создает диалог с начальным названием комнаты, типом комнаты и сохраненным voice transport.
          */
         fun newInstance(
             initialRoomName: String,
+            initialRoomTransportMode: RoomTransportMode,
             initialVoiceTransportPreference: VoiceTransportPreference,
         ): CreateRoomDialogFragment {
             return CreateRoomDialogFragment().apply {
                 arguments = Bundle().apply {
                     putString(ARG_INITIAL_ROOM_NAME, initialRoomName)
+                    putString(ARG_INITIAL_ROOM_TRANSPORT_MODE, initialRoomTransportMode.prefValue)
                     putString(ARG_INITIAL_VOICE_TRANSPORT_PREF, initialVoiceTransportPreference.prefValue)
                 }
             }
@@ -206,6 +249,11 @@ class CreateRoomDialogFragment : DialogFragment() {
          * Ключ имени комнаты внутри результата.
          */
         const val RESULT_ROOM_NAME = "room_name"
+
+        /**
+         * Ключ выбранного типа комнаты внутри результата.
+         */
+        const val RESULT_ROOM_TRANSPORT_MODE = "room_transport_mode"
 
         /**
          * Ключ выбранного voice transport внутри результата.

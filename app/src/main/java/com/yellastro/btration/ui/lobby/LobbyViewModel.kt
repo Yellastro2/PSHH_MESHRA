@@ -5,10 +5,12 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.RoomInfo
+import com.yellastro.btration.domain.model.RoomTransportMode
 import com.yellastro.btration.domain.runtime.RoomRuntimeState
 import com.yellastro.btration.repository.IgnoredNearbyRepository
 import com.yellastro.btration.repository.ProfileRepository
 import com.yellastro.btration.repository.RoomRepository
+import com.yellastro.btration.repository.RoomSettingsRepository
 import com.yellastro.btration.repository.VoiceSettingsRepository
 import com.yellastro.btration.voice.VoiceTransportPreference
 import kotlinx.coroutines.flow.SharingStarted
@@ -28,6 +30,7 @@ class LobbyViewModel(
     private val roomRepository: RoomRepository,
     private val profileRepository: ProfileRepository,
     private val ignoredNearbyRepository: IgnoredNearbyRepository,
+    private val roomSettingsRepository: RoomSettingsRepository,
     private val voiceSettingsRepository: VoiceSettingsRepository,
 ) : ViewModel() {
     private var searchRefreshJob: Job? = null
@@ -42,9 +45,9 @@ class LobbyViewModel(
         roomRepository.availableRooms,
         nameEditorState,
         scanCycleId,
-        ignoredNearbyRepository.ignoredHostPeerIds,
-    ) { runtimeState, rooms, nameEditor, cycleId, ignoredHostPeerIds ->
-        mapUiState(runtimeState, rooms, nameEditor, cycleId, ignoredHostPeerIds)
+        ignoredNearbyRepository.ignoredPeerIds,
+    ) { runtimeState, rooms, nameEditor, cycleId, ignoredPeerIds ->
+        mapUiState(runtimeState, rooms, nameEditor, cycleId, ignoredPeerIds)
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
@@ -53,7 +56,7 @@ class LobbyViewModel(
             roomRepository.availableRooms.value,
             nameEditorState.value,
             scanCycleId.value,
-            ignoredNearbyRepository.ignoredHostPeerIds.value,
+            ignoredNearbyRepository.ignoredPeerIds.value,
         ),
     )
 
@@ -144,15 +147,20 @@ class LobbyViewModel(
     }
 
     /**
-     * Сохраняет выбранный voice transport и создает комнату с заданным именем.
+     * Сохраняет выбранные room/voice transport настройки и создает комнату с заданным именем.
      */
-    fun onCreateRoomClicked(name: String, voiceTransportPreference: VoiceTransportPreference) {
+    fun onCreateRoomClicked(
+        name: String,
+        roomTransportMode: RoomTransportMode,
+        voiceTransportPreference: VoiceTransportPreference,
+    ) {
         viewModelScope.launch {
             val cleanName = name.trim()
+            roomSettingsRepository.setRoomTransportMode(roomTransportMode)
             if (!voiceSettingsRepository.setVoiceTransportPreference(voiceTransportPreference)) {
                 return@launch
             }
-            roomRepository.createRoom(cleanName)
+            roomRepository.createRoom(cleanName, roomTransportMode)
             profileRepository.setLastRoomName(cleanName)
         }
     }
@@ -162,6 +170,13 @@ class LobbyViewModel(
      */
     fun lastRoomNameForDialog(): String {
         return profileRepository.getLastRoomName()
+    }
+
+    /**
+     * Возвращает сохраненный тип комнаты для предзаполнения диалога создания.
+     */
+    fun roomTransportModeForDialog(): RoomTransportMode {
+        return roomSettingsRepository.roomTransportMode.value
     }
 
     /**
@@ -176,8 +191,8 @@ class LobbyViewModel(
      */
     fun onJoinRoomClicked(room: RoomItemUi) {
         viewModelScope.launch {
-            if (ignoredNearbyRepository.isHostIgnored(room.hostPeerId)) {
-                Log.i(TAG, "[onJoinRoomClicked] Вход пропущен, host в ignore-list roomId=${room.roomId.value} hostPeerId=${room.hostPeerId.value}")
+            if (ignoredNearbyRepository.isPeerIgnored(room.gatewayPeerId)) {
+                Log.i(TAG, "[onJoinRoomClicked] Вход пропущен, gateway в ignore-list roomId=${room.roomId.value} gatewayPeerId=${room.gatewayPeerId.value}")
                 return@launch
             }
             roomRepository.joinRoom(room.roomId)
@@ -185,17 +200,17 @@ class LobbyViewModel(
     }
 
     /**
-     * Добавляет host-а выбранной комнаты в ignore-list Nearby и скрывает его комнаты из лобби.
+     * Добавляет прямой gateway выбранной комнаты в ignore-list Nearby и скрывает только его рекламу.
      */
     fun onIgnoreRoomClicked(room: RoomItemUi) {
-        ignoredNearbyRepository.ignoreHost(room.hostPeerId)
+        ignoredNearbyRepository.ignorePeer(room.gatewayPeerId)
     }
 
     /**
-     * Очищает локальный ignore-list Nearby host-ов после подтверждения пользователя.
+     * Очищает локальный ignore-list Nearby peer-ов/gateway-ев после подтверждения пользователя.
      */
-    fun onClearIgnoredHostsConfirmed() {
-        ignoredNearbyRepository.clearIgnoredHosts()
+    fun onClearIgnoredPeersConfirmed() {
+        ignoredNearbyRepository.clearIgnoredPeers()
     }
 
     /**
@@ -206,9 +221,11 @@ class LobbyViewModel(
         rooms: List<RoomInfo>,
         nameEditor: NameEditorState,
         cycleId: Long,
-        ignoredHostPeerIds: Set<PeerId>,
+        ignoredPeerIds: Set<PeerId>,
     ): LobbyUiState {
-        val visibleRooms = rooms.filterNot { roomInfo -> roomInfo.host.peerId in ignoredHostPeerIds }
+        val visibleRooms = dedupeVisibleRooms(
+            rooms = rooms.filterNot { roomInfo -> gatewayPeer(roomInfo).peerId in ignoredPeerIds },
+        )
         return LobbyUiState(
             selfName = nameEditor.savedName,
             nameInput = nameEditor.inputName,
@@ -218,7 +235,7 @@ class LobbyViewModel(
             scanCycleDurationMillis = SEARCH_REFRESH_INTERVAL_MILLIS,
             isSearching = runtimeState is RoomRuntimeState.Searching,
             availableRooms = visibleRooms.map(::mapRoomItem),
-            ignoredHostCount = ignoredHostPeerIds.size,
+            ignoredPeerCount = ignoredPeerIds.size,
             isInRoom = runtimeState is RoomRuntimeState.Hosting ||
                 runtimeState is RoomRuntimeState.Joining ||
                 runtimeState is RoomRuntimeState.Client,
@@ -231,14 +248,39 @@ class LobbyViewModel(
      * Преобразует доменное описание комнаты в элемент списка.
      */
     private fun mapRoomItem(roomInfo: RoomInfo): RoomItemUi {
+        val gateway = gatewayPeer(roomInfo)
         return RoomItemUi(
             roomId = roomInfo.roomId,
             hostPeerId = roomInfo.host.peerId,
+            gatewayPeerId = gateway.peerId,
             roomName = roomInfo.name,
             hostName = roomInfo.host.name,
+            gatewayName = gateway.name,
             memberCountText = null,
         )
     }
+
+    /**
+     * Дедупит одну логическую mesh-комнату после фильтрации ignored gateway-ев, оставляя доступный gateway-кандидат.
+     */
+    private fun dedupeVisibleRooms(rooms: List<RoomInfo>): List<RoomInfo> {
+        val result = mutableListOf<RoomInfo>()
+        val seenGroups = mutableSetOf<String>()
+        rooms
+            .sortedByDescending { roomInfo -> roomInfo.createdAtMillis }
+            .forEach { roomInfo ->
+                val groupId = roomInfo.discoveryGroupId ?: roomInfo.roomId.value
+                if (seenGroups.add(groupId)) {
+                    result += roomInfo
+                }
+            }
+        return result.sortedBy { roomInfo -> roomInfo.name.lowercase() }
+    }
+
+    /**
+     * Возвращает прямой gateway комнаты; для Nearby Star gateway совпадает с host-ом.
+     */
+    private fun gatewayPeer(roomInfo: RoomInfo) = roomInfo.gateway ?: roomInfo.host
 
     /**
      * Создает начальное состояние редактора из сохраненного профиля.

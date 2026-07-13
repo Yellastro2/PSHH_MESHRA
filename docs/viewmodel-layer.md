@@ -34,14 +34,18 @@ ViewModel-слой готовит состояние для XML-фрагмент
 
 - `onStartSearchClicked()`;
 - `onStopSearchClicked()`;
-- `onCreateRoomClicked(name, voiceTransportPreference)`;
+- `onCreateRoomClicked(name, roomTransportMode, voiceTransportPreference)`;
 - `onJoinRoomClicked(room)`;
 - `onIgnoreRoomClicked(room)`;
 - `onClearIgnoredHostsConfirmed()`.
 
-Диалог создания комнаты передает в `LobbyViewModel` имя комнаты и выбранный voice transport; ViewModel сохраняет transport в prefs до вызова `RoomRepository.createRoom(...)`, чтобы host runtime положил этот режим в meta комнаты.
+Диалог создания комнаты передает в `LobbyViewModel` имя комнаты, выбранный тип комнаты (`Nearby Star` / `MESHRA`) и выбранный voice transport. ViewModel сохраняет оба transport-выбора в prefs до вызова `RoomRepository.createRoom(...)`, чтобы host runtime положил эти режимы в meta комнаты.
 
-Для тестирования nearby/mesh-сценариев лобби умеет локально игнорировать host-а найденной комнаты. `LobbyViewModel` берет `RoomInfo.host.peerId`, сохраняет его через `IgnoredNearbyRepository` и фильтрует найденные комнаты до маппинга в `RoomItemUi`. `endpointId` не сохраняется, потому что это временный идентификатор нижнего транспорта.
+Если выбран `MESHRA`, ViewModel не меняется: тот же `RoomRepository.createRoom(...)` приводит runtime в активную комнату, но внутри `RoomRuntime` выбирает `MeshTransport` вместо Nearby Star. Для UI это остается обычная комната с участниками и текстовым чатом.
+
+Для тестирования nearby/mesh-сценариев лобби умеет локально игнорировать прямой gateway найденной комнаты. `LobbyViewModel` берет `RoomInfo.gateway?.peerId ?: RoomInfo.host.peerId`, сохраняет его через `IgnoredNearbyRepository` и фильтрует найденные комнаты до маппинга в `RoomItemUi`. `endpointId` не сохраняется, потому что это временный идентификатор нижнего транспорта.
+
+Для MESHRA ignore применяется к прямому `RoomInfo.gateway`, а не к логическому `RoomInfo.host`. Поэтому если C игнорит gateway A, реклама A скрывается и вход через A блокируется, но та же mesh-комната через gateway B остается видимой. Для Nearby Star `gateway == host`, так что старое поведение сохраняется.
 
 ## RoomViewModel
 

@@ -3,6 +3,7 @@ package com.yellastro.btration.repository
 import android.util.Log
 import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.RoomId
+import com.yellastro.btration.domain.model.RoomTransportMode
 import com.yellastro.btration.domain.runtime.RoomRuntime
 import com.yellastro.btration.domain.runtime.RoomRuntimeState
 import com.yellastro.btration.service.RoomServiceController
@@ -76,11 +77,11 @@ class RoomRepository(
     }
 
     /**
-     * Создает комнату и поднимает foreground-обвязку для активного состояния.
+     * Создает комнату с выбранным типом room transport и поднимает foreground-обвязку для активного состояния.
      */
-    suspend fun createRoom(name: String) {
-        Log.i(TAG, "[createRoom] Создаем комнату через RoomRepository name=$name")
-        roomRuntime.createRoom(name)
+    suspend fun createRoom(name: String, roomTransportMode: RoomTransportMode) {
+        Log.i(TAG, "[createRoom] Создаем комнату через RoomRepository name=$name roomTransportMode=$roomTransportMode")
+        roomRuntime.createRoom(name, roomTransportMode)
         roomServiceController.startIfNeeded(roomRuntime.state.value.needsService())
         Log.i(TAG, "[createRoom] Создание комнаты обработано state=${roomRuntime.state.value.javaClass.simpleName}")
     }

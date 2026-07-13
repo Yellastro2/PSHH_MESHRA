@@ -3,15 +3,21 @@
 import android.util.Log
 import com.google.android.gms.common.api.ApiException
 import com.yellastro.btration.data.nearby.NearbyRequirementException
+import com.yellastro.btration.domain.mesh.MeshRoomAdvertisement
+import com.yellastro.btration.domain.mesh.MeshRoomSnapshot
+import com.yellastro.btration.domain.mesh.MeshTransport
+import com.yellastro.btration.domain.mesh.MeshTransportEvent
 import com.yellastro.btration.domain.model.ChatMessage
 import com.yellastro.btration.domain.model.Peer
 import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.RoomId
 import com.yellastro.btration.domain.model.RoomInfo
+import com.yellastro.btration.domain.model.RoomTransportMode
 import com.yellastro.btration.domain.model.WirePacket
 import com.yellastro.btration.domain.model.WirePacketId
 import com.yellastro.btration.domain.model.WirePacketType
 import com.yellastro.btration.domain.model.VoiceTransportControlInfo
+import com.yellastro.btration.domain.transport.NeighborCandidateId
 import com.yellastro.btration.domain.util.IdGenerator
 import com.yellastro.btration.repository.ProfileRepository
 import com.yellastro.btration.repository.VoiceSettingsRepository
@@ -36,11 +42,12 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
- * Рабочая машина комнаты: ведет discovery, room-соединения, выбор voice transport, чат, PTT, relay и статус голосового media-plane.
+ * Рабочая машина комнаты: ведет discovery, Nearby Star/MESHRA room transport, выбор voice transport, чат, PTT и статус media-plane.
  */
 class RoomRuntime(
     private val profileRepository: ProfileRepository,
     private val roomTransport: RoomTransport,
+    private val meshTransport: MeshTransport,
     private val voiceTransport: SwitchableVoiceTransport,
     private val voiceRuntime: VoiceRuntime,
     private val voiceSettingsRepository: VoiceSettingsRepository,
@@ -104,6 +111,10 @@ class RoomRuntime(
             roomTransport.events.collect(::handleRoomTransportEvent)
         }
         externalScope.launch {
+            Log.i(TAG, "[init] Подписываем RoomRuntime на события MeshTransport")
+            meshTransport.events.collect(::handleMeshTransportEvent)
+        }
+        externalScope.launch {
             Log.i(TAG, "[init] Подписываем RoomRuntime на события VoiceTransport")
             voiceTransport.events.collect(::handleVoiceTransportEvent)
         }
@@ -155,6 +166,7 @@ class RoomRuntime(
         discoveryCycleMutex.withLock {
             Log.i(TAG, "[stopSearch] Останавливаем поиск currentState=${_state.value.javaClass.simpleName}")
             roomTransport.stopDiscovery()
+            meshTransport.stopDiscovery()
             roomIdsSeenInDiscoveryCycle = null
             if (_state.value is RoomRuntimeState.Searching) {
                 _state.value = RoomRuntimeState.Idle
@@ -164,10 +176,10 @@ class RoomRuntime(
     }
 
     /**
-     * Создает локальную комнату и запускает room advertising.
+     * Создает локальную комнату, фиксирует выбранный room transport и запускает room advertising.
      */
-    suspend fun createRoom(name: String) {
-        Log.i(TAG, "[createRoom] Команда создать комнату name=$name currentState=${_state.value.javaClass.simpleName}")
+    suspend fun createRoom(name: String, roomTransportMode: RoomTransportMode) {
+        Log.i(TAG, "[createRoom] Команда создать комнату name=$name roomTransportMode=$roomTransportMode currentState=${_state.value.javaClass.simpleName}")
         when (_state.value) {
             is RoomRuntimeState.Hosting -> {
                 Log.w(TAG, "[createRoom] Создание отклонено, устройство уже хостит комнату")
@@ -189,22 +201,68 @@ class RoomRuntime(
             -> Unit
         }
 
+        if (roomTransportMode == RoomTransportMode.MESHRA) {
+            createMeshRoom(name)
+            return
+        }
+
         roomTransport.stopDiscovery()
         val self = profileRepository.getSelfPeer()
         val voiceTransportMode = preferredVoiceTransportMode()
+        activateRoomTransportMode(roomTransportMode, reason = "create_room")
         voiceTransport.setMode(voiceTransportMode, reason = "create_room")
         val room = RoomInfo(
             roomId = idGenerator.newRoomId(),
             name = name.trim(),
             host = self,
             createdAtMillis = now(),
+            roomTransportMode = roomTransportMode,
             voiceTransportMode = voiceTransportMode,
         )
         _messages.value = emptyList()
         _state.value = RoomRuntimeState.Hosting(room = room, members = listOf(self))
         voiceTransport.startSession(self.peerId, VoiceTransportSessionRole.HOST)
-        Log.i(TAG, "[createRoom] Runtime переведен в Hosting roomId=${room.roomId.value} roomName=${room.name} hostPeerId=${self.peerId.value} voiceTransportMode=$voiceTransportMode")
+        Log.i(TAG, "[createRoom] Runtime переведен в Hosting roomId=${room.roomId.value} roomName=${room.name} hostPeerId=${self.peerId.value} roomTransportMode=${room.roomTransportMode} voiceTransportMode=$voiceTransportMode")
         roomTransport.startAdvertising(room)
+    }
+
+    /**
+     * Создает MESHRA-комнату: локально публикует MEMBER_JOINED, запускает mesh-рекламу gateway и не поднимает voice media-plane.
+     */
+    private fun createMeshRoom(name: String) {
+        roomTransport.stopDiscovery()
+        meshTransport.stopDiscovery()
+        val self = profileRepository.getSelfPeer()
+        val voiceTransportMode = preferredVoiceTransportMode()
+        val room = RoomInfo(
+            roomId = idGenerator.newRoomId(),
+            name = name.trim(),
+            host = self,
+            createdAtMillis = now(),
+            roomTransportMode = RoomTransportMode.MESHRA,
+            voiceTransportMode = voiceTransportMode,
+            isDirectAudioReady = false,
+        )
+        activateRoomTransportMode(room.roomTransportMode, reason = "create_mesh_room")
+        voiceRuntime.stopAll()
+        voiceTransport.stopSession()
+        _messages.value = emptyList()
+        _state.value = RoomRuntimeState.Hosting(
+            room = room,
+            members = listOf(self),
+            directAudioStatus = DirectAudioStatus.Unavailable(MESH_VOICE_UNAVAILABLE_MESSAGE),
+        )
+        meshTransport.publishMemberJoined(
+            roomId = room.roomId,
+            roomName = room.name,
+            knownHost = room.host,
+            member = self,
+            roomTransportMode = room.roomTransportMode,
+            voiceTransportMode = room.voiceTransportMode,
+            isDirectAudioReady = room.isDirectAudioReady,
+        )
+        advertiseMeshSnapshot(room.roomId, self)
+        Log.i(TAG, "[createMeshRoom] Runtime переведен в Hosting MESHRA roomId=${room.roomId.value} roomName=${room.name} hostPeerId=${self.peerId.value}")
     }
 
     /**
@@ -245,6 +303,11 @@ class RoomRuntime(
             return
         }
 
+        if (room.roomTransportMode == RoomTransportMode.MESHRA) {
+            joinMeshRoom(room, endpointId)
+            return
+        }
+
         clearConnectionRecovery()
         roomTransport.stopDiscovery()
         roomIdsSeenInDiscoveryCycle = null
@@ -255,6 +318,23 @@ class RoomRuntime(
     }
 
     /**
+     * Начинает вход в MESHRA-комнату через выбранный gateway endpoint и ждет snapshot от соседнего узла.
+     */
+    private fun joinMeshRoom(room: RoomInfo, endpointId: String) {
+        clearConnectionRecovery()
+        roomTransport.stopDiscovery()
+        meshTransport.stopDiscovery()
+        roomIdsSeenInDiscoveryCycle = null
+        _messages.value = emptyList()
+        _state.value = RoomRuntimeState.Joining(
+            room = room,
+            directAudioStatus = DirectAudioStatus.Unavailable(MESH_VOICE_UNAVAILABLE_MESSAGE),
+        )
+        Log.i(TAG, "[joinMeshRoom] Runtime переведен в Joining MESHRA roomId=${room.roomId.value} endpointId=$endpointId")
+        meshTransport.connectToGateway(NeighborCandidateId(endpointId))
+    }
+
+    /**
      * Покидает текущую комнату или останавливает поиск.
      */
     suspend fun leaveRoom() {
@@ -262,6 +342,12 @@ class RoomRuntime(
         when (val currentState = _state.value) {
             is RoomRuntimeState.Hosting -> closeRoom()
             is RoomRuntimeState.Client -> {
+                if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
+                    publishMeshMemberLeft(currentState.room, profileRepository.getSelfPeer())
+                    Log.i(TAG, "[leaveRoom] Client отправил mesh MEMBER_LEFT roomId=${currentState.room.roomId.value}")
+                    resetSession()
+                    return
+                }
                 val self = profileRepository.getSelfPeer()
                 roomTransport.sendToPeer(
                     currentState.room.host.peerId,
@@ -296,6 +382,13 @@ class RoomRuntime(
             return
         }
 
+        if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
+            publishMeshMemberLeft(currentState.room, profileRepository.getSelfPeer())
+            Log.i(TAG, "[closeRoom] Host покидает MESHRA-комнату без закрытия всей mesh-сети roomId=${currentState.room.roomId.value}")
+            resetSession()
+            return
+        }
+
         val roomClosed = packet(
             type = WirePacketType.ROOM_CLOSED,
             roomId = currentState.room.roomId,
@@ -319,6 +412,10 @@ class RoomRuntime(
         val self = profileRepository.getSelfPeer()
         when (val currentState = _state.value) {
             is RoomRuntimeState.Hosting -> {
+                if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
+                    sendMeshMessage(currentState.room, self, cleanText)
+                    return
+                }
                 Log.i(TAG, "[sendMessage] Host отправляет сообщение roomId=${currentState.room.roomId.value} textLength=${cleanText.length}")
                 val message = newChatMessage(currentState.room.roomId, self, cleanText)
                 appendMessage(message)
@@ -332,6 +429,10 @@ class RoomRuntime(
             }
 
             is RoomRuntimeState.Client -> {
+                if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
+                    sendMeshMessage(currentState.room, self, cleanText)
+                    return
+                }
                 Log.i(TAG, "[sendMessage] Client отправляет сообщение hostPeerId=${currentState.room.host.peerId.value} roomId=${currentState.room.roomId.value} textLength=${cleanText.length}")
                 val message = newChatMessage(currentState.room.roomId, self, cleanText)
                 appendMessage(message)
@@ -470,6 +571,41 @@ class RoomRuntime(
             is RoomTransportEvent.PayloadDecodeFailed -> setError("Не удалось прочитать пакет: ${event.cause.message.orEmpty()}")
             is RoomTransportEvent.SendFailed -> setError("Не удалось отправить пакет: ${event.cause.message.orEmpty()}")
             is RoomTransportEvent.ConnectionInitiated -> Unit
+        }
+    }
+
+    /**
+     * Обрабатывает события MESHRA-транспорта и синхронизирует snapshot комнаты с runtime-состоянием.
+     */
+    private fun handleMeshTransportEvent(event: MeshTransportEvent) {
+        Log.i(TAG, "[handleMeshTransportEvent] Получено событие MeshTransportEvent type=${event.javaClass.simpleName} currentState=${_state.value.javaClass.simpleName}")
+        when (event) {
+            is MeshTransportEvent.GatewayFound -> handleMeshGatewayFound(event)
+            is MeshTransportEvent.GatewayLost -> handleMeshGatewayLost(event)
+            is MeshTransportEvent.LinkConnected -> handleMeshLinkConnected(event)
+            is MeshTransportEvent.LinkDisconnected -> Log.i(TAG, "[handleMeshTransportEvent] Mesh link отключен linkId=${event.linkId.value}")
+            is MeshTransportEvent.EventAccepted -> handleMeshRoomUpdated(event.event.roomId)
+            is MeshTransportEvent.SnapshotReceived -> handleMeshSnapshotReceived(event.snapshot)
+            is MeshTransportEvent.DecodeFailed -> {
+                if (isCurrentStateMesh()) {
+                    setError("Не удалось прочитать mesh-пакет: ${event.cause.message.orEmpty()}")
+                } else {
+                    Log.i(TAG, "[handleMeshTransportEvent] Ошибка decode mesh-пакета проигнорирована вне MESHRA-состояния: ${event.cause.message}")
+                }
+            }
+            is MeshTransportEvent.SendFailed -> setError("Не удалось отправить mesh-пакет: ${event.cause.message.orEmpty()}")
+            is MeshTransportEvent.TransportFailed -> {
+                if (!isCurrentStateMesh()) {
+                    Log.i(TAG, "[handleMeshTransportEvent] Ошибка MeshTransport проигнорирована вне MESHRA-состояния: ${event.cause.message}")
+                    return
+                }
+                val message = nearbyFailureMessage("выполнить mesh-операцию", event.cause)
+                emitNotice(message)
+                setError(
+                    message = message,
+                    action = actionFor(event.cause),
+                )
+            }
         }
     }
 
@@ -726,6 +862,134 @@ class RoomRuntime(
     }
 
     /**
+     * Добавляет найденный mesh gateway как MESHRA-комнату в общий список лобби и дедупит дубли по roomToken.
+     */
+    private fun handleMeshGatewayFound(event: MeshTransportEvent.GatewayFound) {
+        val roomInfo = event.advertisement.toRoomInfo()
+        val endpointId = event.candidateId.value
+        roomIdsSeenInDiscoveryCycle?.add(roomInfo.roomId)
+        roomEndpoints[roomInfo.roomId] = endpointId
+        endpointRooms[endpointId] = roomInfo.roomId
+        upsertAvailableRoom(roomInfo)
+        Log.i(
+            TAG,
+            "[handleMeshGatewayFound] Mesh gateway добавлен roomId=${roomInfo.roomId.value} roomName=${roomInfo.name} endpointId=$endpointId memberCount=${event.advertisement.memberCount}",
+        )
+        reconnectAfterRecoveryIfNeeded(roomInfo.roomId, endpointId)
+    }
+
+    /**
+     * Удаляет mesh gateway из списка лобби, если discovery потерял соответствующий endpoint.
+     */
+    private fun handleMeshGatewayLost(event: MeshTransportEvent.GatewayLost) {
+        val endpointId = event.candidateId.value
+        val roomId = endpointRooms[endpointId] ?: return
+        roomEndpoints.remove(roomId)
+        endpointRooms.remove(endpointId)
+        _availableRooms.value = _availableRooms.value.filterNot { roomInfo -> roomInfo.roomId == roomId }
+        Log.i(TAG, "[handleMeshGatewayLost] Mesh gateway удален roomId=${roomId.value} endpointId=$endpointId")
+    }
+
+    /**
+     * Подтверждает готовность mesh-link-а; вход в комнату завершается после получения snapshot-а.
+     */
+    private fun handleMeshLinkConnected(event: MeshTransportEvent.LinkConnected) {
+        val joiningState = _state.value as? RoomRuntimeState.Joining ?: return
+        if (joiningState.room.roomTransportMode != RoomTransportMode.MESHRA) {
+            return
+        }
+        val expectedEndpointId = roomEndpoints[joiningState.room.roomId]
+        if (expectedEndpointId != event.linkId.value) {
+            Log.w(TAG, "[handleMeshLinkConnected] Mesh link не совпал с выбранным gateway linkId=${event.linkId.value} expectedEndpointId=$expectedEndpointId")
+            return
+        }
+        Log.i(TAG, "[handleMeshLinkConnected] Mesh link готов, ждем snapshot roomId=${joiningState.room.roomId.value} linkId=${event.linkId.value} reused=${event.reused}")
+    }
+
+    /**
+     * Обрабатывает полученный snapshot: завершает mesh-вход или синхронизирует уже активную комнату.
+     */
+    private fun handleMeshSnapshotReceived(snapshot: MeshRoomSnapshot) {
+        completeMeshJoinIfNeeded(snapshot)
+        handleMeshRoomUpdated(snapshot.roomId)
+    }
+
+    /**
+     * Завершает вход в MESHRA-комнату после snapshot-а от gateway и публикует локальное MEMBER_JOINED.
+     */
+    private fun completeMeshJoinIfNeeded(snapshot: MeshRoomSnapshot) {
+        val currentState = _state.value as? RoomRuntimeState.Joining ?: return
+        if (!isJoiningSameMeshRoom(currentState.room, snapshot)) {
+            return
+        }
+        val self = profileRepository.getSelfPeer()
+        val room = roomInfoFromMeshSnapshot(snapshot)
+        val members = mergeMember(snapshot.members, self)
+        _messages.value = snapshot.messages
+        _state.value = RoomRuntimeState.Client(
+            room = room,
+            members = members,
+            directAudioStatus = DirectAudioStatus.Unavailable(MESH_VOICE_UNAVAILABLE_MESSAGE),
+        )
+        clearConnectionRecovery()
+        activateRoomTransportMode(room.roomTransportMode, reason = "mesh_snapshot_received")
+        meshTransport.publishMemberJoined(
+            roomId = room.roomId,
+            roomName = room.name,
+            knownHost = room.host,
+            member = self,
+            roomTransportMode = room.roomTransportMode,
+            voiceTransportMode = room.voiceTransportMode,
+            isDirectAudioReady = room.isDirectAudioReady,
+        )
+        advertiseMeshSnapshot(room.roomId, self)
+        Log.i(TAG, "[completeMeshJoinIfNeeded] Mesh-вход завершен roomId=${room.roomId.value} memberCount=${members.size}")
+    }
+
+    /**
+     * Синхронизирует runtime-состояние с актуальным mesh snapshot-ом и перезапускает gateway-рекламу активной комнаты.
+     */
+    private fun handleMeshRoomUpdated(roomId: RoomId) {
+        val snapshot = meshTransport.rooms.value[roomId] ?: return
+        val room = roomInfoFromMeshSnapshot(snapshot)
+        when (val currentState = _state.value) {
+            is RoomRuntimeState.Hosting -> {
+                if (currentState.room.roomTransportMode != RoomTransportMode.MESHRA || currentState.room.roomId != roomId) {
+                    return
+                }
+                _messages.value = snapshot.messages
+                _state.value = currentState.copy(
+                    room = room,
+                    members = snapshot.members,
+                    directAudioStatus = DirectAudioStatus.Unavailable(MESH_VOICE_UNAVAILABLE_MESSAGE),
+                )
+                advertiseMeshSnapshot(roomId, profileRepository.getSelfPeer())
+                Log.i(TAG, "[handleMeshRoomUpdated] Host MESHRA snapshot применен roomId=${roomId.value} memberCount=${snapshot.members.size} messageCount=${snapshot.messages.size}")
+            }
+
+            is RoomRuntimeState.Client -> {
+                if (currentState.room.roomTransportMode != RoomTransportMode.MESHRA || currentState.room.roomId != roomId) {
+                    return
+                }
+                _messages.value = snapshot.messages
+                _state.value = currentState.copy(
+                    room = room,
+                    members = snapshot.members,
+                    directAudioStatus = DirectAudioStatus.Unavailable(MESH_VOICE_UNAVAILABLE_MESSAGE),
+                )
+                advertiseMeshSnapshot(roomId, profileRepository.getSelfPeer())
+                Log.i(TAG, "[handleMeshRoomUpdated] Client MESHRA snapshot применен roomId=${roomId.value} memberCount=${snapshot.members.size} messageCount=${snapshot.messages.size}")
+            }
+
+            is RoomRuntimeState.Joining -> completeMeshJoinIfNeeded(snapshot)
+            RoomRuntimeState.Searching -> upsertAvailableRoom(room)
+            RoomRuntimeState.Idle,
+            is RoomRuntimeState.Error,
+            -> Unit
+        }
+    }
+
+    /**
      * После свежего обнаружения восстанавливаемой комнаты останавливает recovery discovery и повторяет connection один раз.
      */
     private fun reconnectAfterRecoveryIfNeeded(roomId: RoomId, endpointId: String) {
@@ -737,8 +1001,13 @@ class RoomRuntime(
         connectionRecoveryJob?.cancel()
         connectionRecoveryJob = null
         roomTransport.stopDiscovery()
-        Log.i(TAG, "[reconnectAfterRecoveryIfNeeded] Комната найдена заново, повторяем connection roomId=${roomId.value} endpointId=$endpointId")
-        roomTransport.connectToEndpoint(endpointId)
+        if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
+            Log.i(TAG, "[reconnectAfterRecoveryIfNeeded] Mesh gateway найден заново, повторяем connection roomId=${roomId.value} endpointId=$endpointId")
+            meshTransport.connectToGateway(NeighborCandidateId(endpointId))
+        } else {
+            Log.i(TAG, "[reconnectAfterRecoveryIfNeeded] Комната найдена заново, повторяем connection roomId=${roomId.value} endpointId=$endpointId")
+            roomTransport.connectToEndpoint(endpointId)
+        }
     }
 
     /**
@@ -798,6 +1067,10 @@ class RoomRuntime(
      * Проверяет результат нового room connection и передает готовый endpoint в общий обработчик входа.
      */
     private fun handleConnectionResult(event: RoomTransportEvent.ConnectionResult) {
+        if ((_state.value as? RoomRuntimeState.Joining)?.room?.roomTransportMode == RoomTransportMode.MESHRA) {
+            Log.i(TAG, "[handleConnectionResult] RoomTransport connection result проигнорирован для MESHRA endpointId=${event.endpointId}")
+            return
+        }
         if (!event.success) {
             Log.w(TAG, "[handleConnectionResult] Соединение не установлено endpointId=${event.endpointId} statusCode=${event.statusCode}")
             if (_state.value is RoomRuntimeState.Joining) {
@@ -814,6 +1087,10 @@ class RoomRuntime(
      */
     private fun handleConnectionReady(endpointId: String, reused: Boolean) {
         val currentState = _state.value as? RoomRuntimeState.Joining ?: return
+        if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
+            Log.i(TAG, "[handleConnectionReady] RoomTransport JOIN_REQUEST пропущен для MESHRA endpointId=$endpointId reused=$reused")
+            return
+        }
         val expectedEndpointId = roomEndpoints[currentState.room.roomId]
         if (expectedEndpointId != endpointId) {
             Log.w(TAG, "[handleConnectionReady] Готовое соединение не совпало с joining endpointId=$endpointId expectedEndpointId=$expectedEndpointId")
@@ -1021,6 +1298,7 @@ class RoomRuntime(
         replaceAdvertisedRoomMappingIfNeeded(advertisedRoom = currentState.room, realRoom = room)
         _state.value = RoomRuntimeState.Client(room = room, members = listOf(room.host, profileRepository.getSelfPeer()))
         clearConnectionRecovery()
+        activateRoomTransportMode(room.roomTransportMode, reason = "join_accepted")
         voiceTransport.setMode(room.voiceTransportMode, reason = "join_accepted")
         voiceTransport.startSession(profileRepository.getOrCreatePeerId(), VoiceTransportSessionRole.CLIENT)
         packet.voiceTransportInfo?.let { info ->
@@ -1029,7 +1307,7 @@ class RoomRuntime(
         voiceTransport.localControlInfo?.let { info ->
             sendVoiceTransportInfoTo(room.host.peerId, room.roomId, info)
         }
-        Log.i(TAG, "[handleJoinAccepted] Runtime переведен в Client roomId=${room.roomId.value} voiceTransportMode=${room.voiceTransportMode}")
+        Log.i(TAG, "[handleJoinAccepted] Runtime переведен в Client roomId=${room.roomId.value} roomTransportMode=${room.roomTransportMode} voiceTransportMode=${room.voiceTransportMode}")
     }
 
     /**
@@ -1324,6 +1602,90 @@ class RoomRuntime(
     }
 
     /**
+     * Публикует текстовое сообщение как MESHRA event и локально добавляет его без ожидания обратного события.
+     */
+    private fun sendMeshMessage(room: RoomInfo, self: Peer, text: String) {
+        val message = newChatMessage(room.roomId, self, text)
+        appendMessage(message)
+        meshTransport.publishChatMessage(
+            roomId = room.roomId,
+            roomName = room.name,
+            knownHost = room.host,
+            message = message,
+            roomTransportMode = room.roomTransportMode,
+            voiceTransportMode = room.voiceTransportMode,
+            isDirectAudioReady = room.isDirectAudioReady,
+        )
+        Log.i(TAG, "[sendMeshMessage] MESHRA-сообщение опубликовано roomId=${room.roomId.value} messageId=${message.messageId.value} textLength=${text.length}")
+    }
+
+    /**
+     * Публикует выход участника из MESHRA-комнаты через общий mesh event-log.
+     */
+    private fun publishMeshMemberLeft(room: RoomInfo, peer: Peer) {
+        meshTransport.publishMemberLeft(
+            roomId = room.roomId,
+            roomName = room.name,
+            knownHost = room.host,
+            member = peer,
+            roomTransportMode = room.roomTransportMode,
+            voiceTransportMode = room.voiceTransportMode,
+            isDirectAudioReady = room.isDirectAudioReady,
+        )
+        Log.i(TAG, "[publishMeshMemberLeft] MESHRA MEMBER_LEFT опубликован roomId=${room.roomId.value} peerId=${peer.peerId.value}")
+    }
+
+    /**
+     * Перезапускает mesh-рекламу текущего snapshot-а, чтобы новые гости видели этот peer как gateway.
+     */
+    private fun advertiseMeshSnapshot(roomId: RoomId, gateway: Peer) {
+        val snapshot = meshTransport.rooms.value[roomId]
+        if (snapshot == null) {
+            Log.w(TAG, "[advertiseMeshSnapshot] Mesh snapshot пока неизвестен roomId=${roomId.value}")
+            return
+        }
+        meshTransport.startAdvertising(snapshot, gateway)
+    }
+
+    /**
+     * Проверяет, что snapshot отвечает той MESHRA-комнате, в которую runtime сейчас входит.
+     */
+    private fun isJoiningSameMeshRoom(joiningRoom: RoomInfo, snapshot: MeshRoomSnapshot): Boolean {
+        return joiningRoom.roomTransportMode == RoomTransportMode.MESHRA &&
+            (joiningRoom.roomId == snapshot.roomId || MeshRoomAdvertisement.matchesAdvertisedRoomId(joiningRoom.roomId, snapshot.roomId))
+    }
+
+    /**
+     * Преобразует mesh snapshot в обычное RoomInfo, чтобы верхний слой не зависел от конкретного транспорта комнаты.
+     */
+    private fun roomInfoFromMeshSnapshot(snapshot: MeshRoomSnapshot): RoomInfo {
+        return RoomInfo(
+            roomId = snapshot.roomId,
+            name = snapshot.roomName,
+            host = snapshot.knownHost,
+            createdAtMillis = snapshot.updatedAtMillis,
+            roomTransportMode = snapshot.roomTransportMode,
+            voiceTransportMode = snapshot.voiceTransportMode,
+            isDirectAudioReady = snapshot.isDirectAudioReady,
+        )
+    }
+
+    /**
+     * Возвращает true, если текущее runtime-состояние относится к MESHRA-комнате.
+     */
+    private fun isCurrentStateMesh(): Boolean {
+        return when (val currentState = _state.value) {
+            is RoomRuntimeState.Hosting -> currentState.room.roomTransportMode == RoomTransportMode.MESHRA
+            is RoomRuntimeState.Joining -> currentState.room.roomTransportMode == RoomTransportMode.MESHRA
+            is RoomRuntimeState.Client -> currentState.room.roomTransportMode == RoomTransportMode.MESHRA
+            RoomRuntimeState.Idle,
+            RoomRuntimeState.Searching,
+            is RoomRuntimeState.Error,
+            -> false
+        }
+    }
+
+    /**
      * Добавляет участника в набор говорящих, если его voice frames активны.
      */
     private fun addTalkingPeer(peerId: PeerId) {
@@ -1451,6 +1813,7 @@ class RoomRuntime(
         _talkingPeerIds.value = emptySet()
         clearTalkingPeerTimeouts()
         roomTransport.stopAllEndpointsAndClearState(reason = "runtime_reset_session")
+        meshTransport.stopAll(reason = "runtime_reset_session")
         realRoomToAdvertisedRoom.clear()
         Log.i(TAG, "[resetSession] Runtime переведен в Idle")
     }
@@ -1477,6 +1840,7 @@ class RoomRuntime(
         _talkingPeerIds.value = emptySet()
         clearTalkingPeerTimeouts()
         roomTransport.stopAllEndpointsAndClearState(reason = "runtime_error")
+        meshTransport.stopAll(reason = "runtime_error")
         realRoomToAdvertisedRoom.clear()
     }
 
@@ -1507,6 +1871,13 @@ class RoomRuntime(
     private fun preferredVoiceTransportMode(): VoiceTransportMode {
         return voiceSettingsRepository.voiceTransportPreference.value.transportMode
             ?: VoiceTransportMode.WIFI_DIRECT_UDP
+    }
+
+    /**
+     * Фиксирует выбранный room transport для текущей комнаты; реальное переключение delegate будет добавлено при включении MESHRA.
+     */
+    private fun activateRoomTransportMode(mode: RoomTransportMode, reason: String) {
+        Log.i(TAG, "[activateRoomTransportMode] Выбран room transport mode=$mode reason=$reason")
     }
 
     /**
@@ -1548,5 +1919,6 @@ class RoomRuntime(
         private const val NOTICE_BUFFER_CAPACITY = 8
         private const val TALKING_PEER_TIMEOUT_MILLIS = 1_500L
         private const val DIRECT_AUDIO_UNAVAILABLE_MESSAGE = "Прямой аудиоканал не установлен"
+        private const val MESH_VOICE_UNAVAILABLE_MESSAGE = "Голос в MESHRA-комнатах пока не поддерживается"
     }
 }

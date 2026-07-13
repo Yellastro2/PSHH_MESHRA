@@ -69,7 +69,7 @@ Wi-Fi Direct transport занимается только голосом:
 ## Ограничения
 
 - Wi-Fi Direct поведение сильно зависит от прошивки и Google/Android Wi-Fi stack.
-- Host при `createRoom()` читает voice-настройку из prefs, кладет выбранный `voiceTransportMode` в `RoomInfo` и запускает комнату с этим media-plane. Client после `JOIN_ACCEPTED` смотрит `RoomInfo.voiceTransportMode` host-а и перед `startSession()` переключает свой локальный voice transport на тот же режим.
+- Host при `createRoom()` читает тип комнаты и voice-настройку из prefs, кладет выбранные `roomTransportMode` и `voiceTransportMode` в `RoomInfo` и запускает комнату с этим media-plane. Client после `JOIN_ACCEPTED` смотрит `RoomInfo.roomTransportMode` для выбора room transport комнаты, а затем `RoomInfo.voiceTransportMode` host-а и перед `startSession()` переключает свой локальный voice transport на тот же режим.
 - Если устройство не заявляет `PackageManager.FEATURE_WIFI_DIRECT` или не отдает `WifiP2pManager`, `AppContainer` включает `UnavailableVoiceTransport`, а UI показывает snackbar `Wi-Fi Direct не поддерживается на этом устройстве`.
 - Если client не видит DNS-SD service host-а, он не получит `srcDevice.deviceAddress` и не сможет подключиться.
 - Флаг `RoomInfo.isDirectAudioReady` ставится только после входящего UDP `HELLO`; создание group само по себе готовностью не считается.

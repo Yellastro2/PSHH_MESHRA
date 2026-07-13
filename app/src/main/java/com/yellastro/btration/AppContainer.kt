@@ -3,17 +3,24 @@ package com.yellastro.btration
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.wifi.p2p.WifiP2pManager
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.google.android.gms.nearby.Nearby
+import com.google.android.gms.nearby.connection.Strategy
+import com.yellastro.btration.data.nearby.NearbyRoomAdvertisement
 import com.yellastro.btration.data.nearby.NearbyTransport
 import com.yellastro.btration.data.wire.WireCodec
+import com.yellastro.btration.domain.mesh.MeshCodec
+import com.yellastro.btration.domain.mesh.MeshRoomAdvertisement
+import com.yellastro.btration.domain.mesh.MeshTransport
 import com.yellastro.btration.domain.runtime.RoomTransport
 import com.yellastro.btration.domain.runtime.RoomRuntime
 import com.yellastro.btration.domain.util.IdGenerator
 import com.yellastro.btration.repository.IgnoredNearbyRepository
 import com.yellastro.btration.repository.ProfileRepository
 import com.yellastro.btration.repository.RoomRepository
+import com.yellastro.btration.repository.RoomSettingsRepository
 import com.yellastro.btration.repository.VoiceSettingsRepository
 import com.yellastro.btration.service.RoomServiceController
 import com.yellastro.btration.ui.lobby.LobbyViewModel
@@ -35,7 +42,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.serialization.json.Json
 
 /**
- * Ручной composition root приложения: собирает prefs, signaling/voice transport, runtime, repository и ViewModel factories.
+ * Ручной composition root приложения: собирает prefs, star/mesh/voice transports, runtime, repository и ViewModel factories.
  */
 class AppContainer(context: Context) {
     private val applicationContext = context.applicationContext
@@ -45,22 +52,44 @@ class AppContainer(context: Context) {
         encodeDefaults = true
     }
     private val wireCodec = WireCodec(json)
+    private val meshCodec = MeshCodec(json)
     private val idGenerator = IdGenerator()
     private val prefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    /**
+     * Репозиторий локального профиля пользователя.
+     */
+    val profileRepository = ProfileRepository(
+        prefs = prefs,
+    )
+    private val ignoredNearbyRepository = IgnoredNearbyRepository(
+        prefs = prefs,
+    )
     private val nearbyTransport = NearbyTransport(
         context = applicationContext,
         connectionsClient = Nearby.getConnectionsClient(applicationContext),
+        strategy = Strategy.P2P_CLUSTER,
     )
     private val roomTransport = RoomTransport(
         neighborTransport = nearbyTransport,
         wireCodec = wireCodec,
         externalScope = applicationScope,
-        shouldIgnoreMessage = VoiceFrameCodec::isVoiceFrame,
+        shouldIgnoreMessage = { bytes -> VoiceFrameCodec.isVoiceFrame(bytes) || meshCodec.isMeshEnvelope(bytes) },
+        shouldAcceptConnection = ::shouldAcceptNeighborConnection,
+    )
+    private val meshTransport = MeshTransport(
+        selfPeerId = profileRepository.getOrCreatePeerId(),
+        neighborTransport = nearbyTransport,
+        codec = meshCodec,
+        externalScope = applicationScope,
+        acceptIncomingConnections = false,
     )
     /**
      * Репозиторий пользовательских voice-настроек, сохраненных в SharedPreferences.
      */
     val voiceSettingsRepository = VoiceSettingsRepository(
+        prefs = prefs,
+    )
+    private val roomSettingsRepository = RoomSettingsRepository(
         prefs = prefs,
     )
     private val voiceTransportPreference = voiceSettingsRepository.voiceTransportPreference.value
@@ -82,19 +111,10 @@ class AppContainer(context: Context) {
         roomTransport.stopAllEndpointsAndClearState(reason = "app_container_init")
     }
 
-    /**
-     * Репозиторий локального профиля пользователя.
-     */
-    val profileRepository = ProfileRepository(
-        prefs = prefs,
-    )
-    private val ignoredNearbyRepository = IgnoredNearbyRepository(
-        prefs = prefs,
-    )
-
     private val roomRuntime = RoomRuntime(
         profileRepository = profileRepository,
         roomTransport = roomTransport,
+        meshTransport = meshTransport,
         voiceTransport = voiceTransport,
         voiceRuntime = voiceRuntime,
         voiceSettingsRepository = voiceSettingsRepository,
@@ -128,6 +148,7 @@ class AppContainer(context: Context) {
                 roomRepository = roomRepository,
                 profileRepository = profileRepository,
                 ignoredNearbyRepository = ignoredNearbyRepository,
+                roomSettingsRepository = roomSettingsRepository,
                 voiceSettingsRepository = voiceSettingsRepository,
             )
         }
@@ -195,7 +216,30 @@ class AppContainer(context: Context) {
         )
     }
 
+    /**
+     * Отклоняет прямое connection request от gateway/host-а, который локально добавлен в ignore-list.
+     */
+    private fun shouldAcceptNeighborConnection(endpointName: String): Boolean {
+        val meshGatewayPeerId = MeshRoomAdvertisement.decode(endpointName)
+            ?.toAdvertisedGateway()
+            ?.peerId
+        if (meshGatewayPeerId != null && ignoredNearbyRepository.isPeerIgnored(meshGatewayPeerId)) {
+            Log.i(TAG, "[shouldAcceptNeighborConnection] Отклоняем ignored mesh gateway peerId=${meshGatewayPeerId.value}")
+            return false
+        }
+
+        val nearbyGatewayPeerId = NearbyRoomAdvertisement.decode(endpointName)
+            ?.toRoomInfo()
+            ?.let { roomInfo -> roomInfo.gateway?.peerId ?: roomInfo.host.peerId }
+        if (nearbyGatewayPeerId != null && ignoredNearbyRepository.isPeerIgnored(nearbyGatewayPeerId)) {
+            Log.i(TAG, "[shouldAcceptNeighborConnection] Отклоняем ignored Nearby gateway peerId=${nearbyGatewayPeerId.value}")
+            return false
+        }
+        return true
+    }
+
     private companion object {
+        private const val TAG = "AppContainer"
         private const val PREFS_NAME = "walkie_talkie_prefs"
         private const val WIFI_DIRECT_UNAVAILABLE_MESSAGE = "Wi-Fi Direct не поддерживается на этом устройстве"
     }

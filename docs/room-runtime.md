@@ -2,7 +2,7 @@
 
 ## Назначение
 
-`RoomRuntime` — обычный Kotlin-класс, который управляет текущей комнатой поверх `RoomTransport` и переключаемого голосового `VoiceTransport`.
+`RoomRuntime` — обычный Kotlin-класс, который управляет текущей комнатой поверх `RoomTransport` для Nearby Star, `MeshTransport` для MESHRA и переключаемого голосового `VoiceTransport`.
 
 Он не является Android Service, ViewModel или Repository. Его задача — слушать события транспорта, принимать protocol-решения и отдавать состояние выше через `StateFlow`.
 Статус голосового media-plane также идет через `RoomRuntimeState`, чтобы UI видел не только одноразовый snackbar, но и устойчивое состояние `Connecting` / `Ready` / `Unavailable`.
@@ -12,6 +12,7 @@
 
 - `app/src/main/java/com/yellastro/btration/domain/runtime/RoomRuntime.kt`
 - `app/src/main/java/com/yellastro/btration/domain/runtime/RoomTransport.kt`
+- `app/src/main/java/com/yellastro/btration/domain/mesh/MeshTransport.kt`
 - `app/src/main/java/com/yellastro/btration/domain/runtime/RoomRuntimeState.kt`
 - `app/src/main/java/com/yellastro/btration/domain/transport/NeighborTransport.kt`
 - `app/src/main/java/com/yellastro/btration/domain/transport/PeerLinkResolver.kt`
@@ -32,7 +33,9 @@ RoomTransport.events + VoiceTransport.events
 
 `RoomRuntime` получает `CoroutineScope` снаружи, например из application-level контейнера, и в `init` подписывается на события room signaling из `RoomTransport.events` и media-события `VoiceTransport.events`.
 
-`RoomTransport` держит room-level протокол поверх `NeighborTransport`: декодирует/кодирует `WirePacket`, разбирает короткую визитку комнаты, ведет связь `PeerId <-> linkId` и прячет детали конкретного нижнего транспорта от `RoomRuntime`.
+`RoomTransport` держит Nearby Star room-level протокол поверх `NeighborTransport`: декодирует/кодирует `WirePacket`, разбирает короткую визитку комнаты, ведет связь `PeerId <-> linkId` и прячет детали конкретного нижнего транспорта от `RoomRuntime`.
+
+`MeshTransport` держит MESHRA room-level протокол поверх того же `NeighborTransport`: принимает gateway-рекламу, snapshot-ы и durable room events, дедупит их по `eventId` и flood-ит соседям.
 
 ## StateFlow
 
@@ -46,7 +49,11 @@ RoomTransport.events + VoiceTransport.events
 Host:
 
 - создает `RoomInfo`;
+- перед созданием комнаты получает тип комнаты из диалога создания, сохраняет его в prefs и кладет `roomTransportMode` в `RoomInfo`;
 - перед созданием комнаты получает voice-настройку из диалога создания, сохраняет ее в prefs, выбирает `voiceTransportMode` и кладет его в `RoomInfo`;
+- фиксирует выбранный room transport через `activateRoomTransportMode(...)`;
+- для `Nearby Star` запускает обычный `RoomTransport.startAdvertising(room)`;
+- для `MESHRA` публикует локальный `MEMBER_JOINED`, применяет mesh snapshot и запускает `MeshTransport.startAdvertising(snapshot, self)` как gateway;
 - держит `RoomInfo.isDirectAudioReady=false`, пока первый peer не завершил UDP `HELLO/HELLO_ACK` handshake;
 - останавливает discovery;
 - запускает advertising;
@@ -73,7 +80,9 @@ Client:
 - хранит внутреннюю связь `RoomId -> endpointId`, где до входа `RoomId` может быть временным advertised-id;
 - по `joinRoom(roomId)` подключается к endpoint;
 - после успешного connection отправляет `JOIN_REQUEST` без реального `roomId`;
-- после `JOIN_ACCEPTED` получает настоящий `RoomInfo`, берет `RoomInfo.voiceTransportMode`, переключает локальный voice transport на режим host-а, берет `RoomInfo.host.peerId` для Wi-Fi Direct DNS-SD matching, заменяет временный `RoomId -> endpointId` на реальный `RoomId -> endpointId` и переходит в `Client`;
+- для `Nearby Star` после `JOIN_ACCEPTED` получает настоящий `RoomInfo`, берет `RoomInfo.roomTransportMode` как режим room transport комнаты, берет `RoomInfo.voiceTransportMode`, переключает локальный voice transport на режим host-а, берет `RoomInfo.host.peerId` для Wi-Fi Direct DNS-SD matching, заменяет временный `RoomId -> endpointId` на реальный `RoomId -> endpointId` и переходит в `Client`;
+- для `MESHRA` после подключения к gateway ждет `ROOM_SNAPSHOT`, заменяет временный `mesh_room_<token>` на настоящий `RoomInfo`, публикует свой `MEMBER_JOINED` и тоже начинает рекламировать комнату как gateway;
+- MESHRA gateway-кандидаты в discovery имеют разные временные `RoomId`, но общий `discoveryGroupId`, чтобы ignore одного gateway не скрывал ту же комнату через другой gateway;
 - на экране комнаты видит выбранный host-ом voice transport как read-only пункт меню настроек; host видит такой же read-only пункт, потому что активный transport комнаты после старта не переключается;
 - получает host `VOICE_TRANSPORT_INFO` сразу после входа и запускает direct-audio handshake;
 - по `MEMBER_LIST` обновляет участников;
@@ -87,6 +96,7 @@ Client:
 ## Reconnect
 
 - `STATUS_ENDPOINT_UNKNOWN` считается recoverable stale endpoint: runtime удаляет комнату из `availableRooms`, запускает clean discovery и при повторном `EndpointFound` автоматически повторяет connection.
+- Для MESHRA такой же recovery идет через `MeshTransport.GatewayFound`: runtime повторяет connection только к тому же временному `RoomId` выбранного gateway, чтобы ignore одного gateway/host-а не превратился в автоматическое подключение через него.
 - Если client внезапно теряет host-а не через `ROOM_CLOSED`, runtime не сбрасывает комнату в `Idle`, а переходит в `Joining` по сохраненной advertised-комнате и пробует переподключиться.
 - Если нижний Nearby API сразу после runtime-permission grant возвращает transient `MISSING_PERMISSION` при discovery/advertising, `NearbyTransport` тихо делает короткий retry и через `RoomTransport` отдает ошибку в `RoomRuntime` только после исчерпания попыток.
 
@@ -113,4 +123,5 @@ Client:
 ## Ограничения текущего слоя
 
 - Нет mesh relay, только задел через `packetId` и `ttl`.
+- MESHRA сейчас покрывает вступление, выход/разрыв и текстовый чат. Voice в MESHRA-комнатах намеренно помечается как недоступный до отдельной realtime-политики.
 - Voice MVP использует `VoiceTransport`; дефолтный режим в настройках — `WIFI_DIRECT_UDP`, при этом реальный delegate создается только после применения режима конкретной комнаты.

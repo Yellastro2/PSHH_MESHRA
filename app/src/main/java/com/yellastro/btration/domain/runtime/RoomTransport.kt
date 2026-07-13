@@ -29,6 +29,7 @@ class RoomTransport(
     private val wireCodec: WireCodec,
     private val externalScope: CoroutineScope,
     private val shouldIgnoreMessage: (ByteArray) -> Boolean = { false },
+    private val shouldAcceptConnection: (String) -> Boolean = { true },
 ) : PeerLinkResolver {
     private val endpointToPeer = mutableMapOf<String, PeerId>()
     private val peerToEndpoint = mutableMapOf<PeerId, String>()
@@ -169,8 +170,7 @@ class RoomTransport(
             is NeighborTransportEvent.CandidateFound -> handleCandidateFound(event)
             is NeighborTransportEvent.CandidateLost -> handleCandidateLost(event)
             is NeighborTransportEvent.ConnectionInitiated -> {
-                neighborTransport.acceptConnection(event.connectionId)
-                emitEvent(RoomTransportEvent.ConnectionInitiated(event.connectionId.value))
+                handleConnectionInitiated(event)
             }
             is NeighborTransportEvent.ConnectionAcceptFailed -> emitEvent(
                 RoomTransportEvent.ConnectionAcceptFailed(event.connectionId.value, event.cause),
@@ -213,18 +213,32 @@ class RoomTransport(
     }
 
     /**
+     * Принимает или отклоняет входящий connection request по endpointName до создания прямого link-а.
+     */
+    private fun handleConnectionInitiated(event: NeighborTransportEvent.ConnectionInitiated) {
+        if (!shouldAcceptConnection(event.endpointName)) {
+            Log.i(TAG, "[handleConnectionInitiated] Connection request отклонен политикой endpointName=${event.endpointName}")
+            neighborTransport.rejectConnection(event.connectionId)
+            return
+        }
+        neighborTransport.acceptConnection(event.connectionId)
+        emitEvent(RoomTransportEvent.ConnectionInitiated(event.connectionId.value))
+    }
+
+    /**
      * Обрабатывает найденный endpoint как возможную комнату.
      */
     private fun handleCandidateFound(event: NeighborTransportEvent.CandidateFound) {
         val endpointId = event.candidate.candidateId.value
         val roomInfo = decodeRoomInfo(event.candidate.endpointName)
         roomInfo?.let { decodedRoomInfo ->
+            val gatewayPeer = decodedRoomInfo.gateway ?: decodedRoomInfo.host
             Log.i(
                 TAG,
-                "[handleCandidateFound] Endpoint распознан как комната roomId=${decodedRoomInfo.roomId.value} roomName=${decodedRoomInfo.name} hostPeerId=${decodedRoomInfo.host.peerId.value}",
+                "[handleCandidateFound] Endpoint распознан как комната roomId=${decodedRoomInfo.roomId.value} roomName=${decodedRoomInfo.name} gatewayPeerId=${gatewayPeer.peerId.value}",
             )
             bindRoom(endpointId, decodedRoomInfo.roomId)
-            bindPeer(endpointId, decodedRoomInfo.host.peerId)
+            bindPeer(endpointId, gatewayPeer.peerId)
         } ?: run {
             Log.w(TAG, "[handleCandidateFound] Endpoint не содержит корректную визитку комнаты endpointId=$endpointId")
         }

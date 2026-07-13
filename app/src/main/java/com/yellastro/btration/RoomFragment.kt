@@ -406,7 +406,7 @@ class RoomFragment : Fragment() {
         tvChannelStatus.text = when {
             state.isConnecting -> "ПОДКЛЮЧЕНИЕ…"
             state.directAudioStatusText.isNotBlank() -> state.directAudioStatusText
-            else -> "В ЭФИРЕ • ШИФРОВАНИЕ"
+            else -> getString(R.string.subt_onair)
         }
         tvChannelStatus.setTextColor(channelStatusColor(state))
         etMessage.isEnabled = !state.isConnecting

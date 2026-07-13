@@ -46,7 +46,7 @@
                 android:id="@+id/tv_channel_status"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="В ЭФИРЕ • ШИФРОВАНИЕ"
+                android:text="@string/subt_onair"
                 android:textColor="@color/second_accent_green"
                 android:textSize="10sp"
                 android:textStyle="bold" />

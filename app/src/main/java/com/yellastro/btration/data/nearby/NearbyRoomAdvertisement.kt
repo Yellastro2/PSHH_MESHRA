@@ -4,10 +4,11 @@ import com.yellastro.btration.domain.model.Peer
 import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.RoomId
 import com.yellastro.btration.domain.model.RoomInfo
+import com.yellastro.btration.domain.model.RoomTransportMode
 import com.yellastro.btration.voice.VoiceTransportMode
 
 /**
- * Компактная визитка комнаты для Nearby endpointName: данные для лобби, подключения и выбора voice transport.
+ * Компактная визитка комнаты для Nearby endpointName: данные для лобби, подключения, room transport и voice transport.
  */
 data class NearbyRoomAdvertisement(
     val roomName: String,
@@ -15,6 +16,7 @@ data class NearbyRoomAdvertisement(
     val hostName: String,
     val sessionId: String,
     val createdAtMillis: Long,
+    val roomTransportMode: RoomTransportMode,
     val voiceTransportMode: VoiceTransportMode,
 ) {
     /**
@@ -28,6 +30,7 @@ data class NearbyRoomAdvertisement(
             utf8Size(sessionId) +
             utf8Size(createdAtToken) +
             utf8Size(hostShortId) +
+            utf8Size(roomTransportToken(roomTransportMode)) +
             utf8Size(voiceTransportToken(voiceTransportMode)) +
             SEPARATOR_BYTES * SEPARATOR_COUNT
         val availableNameBytes = (MAX_ENDPOINT_NAME_BYTES - fixedBytes).coerceAtLeast(0)
@@ -45,6 +48,7 @@ data class NearbyRoomAdvertisement(
             sessionId,
             createdAtToken,
             hostShortId,
+            roomTransportToken(roomTransportMode),
             voiceTransportToken(voiceTransportMode),
             encodedRoomName,
             encodedHostName,
@@ -63,15 +67,22 @@ data class NearbyRoomAdvertisement(
                 name = hostName.ifBlank { DEFAULT_HOST_NAME },
             ),
             createdAtMillis = createdAtMillis,
+            roomTransportMode = roomTransportMode,
             voiceTransportMode = voiceTransportMode,
+            gateway = Peer(
+                peerId = PeerId("$ADVERTISED_HOST_PEER_ID_PREFIX$hostShortId"),
+                name = hostName.ifBlank { DEFAULT_HOST_NAME },
+            ),
         )
     }
 
     companion object {
-        private const val FORMAT_PREFIX = "BTR4"
+        private const val FORMAT_PREFIX = "BTR5"
+        private const val PREVIOUS_FORMAT_PREFIX = "BTR4"
         private const val LEGACY_FORMAT_PREFIX = "BTR3"
         private const val SEPARATOR = "|"
-        private const val FIELD_COUNT = 7
+        private const val FIELD_COUNT = 8
+        private const val PREVIOUS_FIELD_COUNT = 7
         private const val LEGACY_FIELD_COUNT = 6
         private const val SEPARATOR_COUNT = FIELD_COUNT - 1
         private const val SEPARATOR_BYTES = 1
@@ -94,12 +105,13 @@ data class NearbyRoomAdvertisement(
                 hostName = room.host.name,
                 sessionId = sessionIdFor(room),
                 createdAtMillis = room.createdAtMillis,
+                roomTransportMode = room.roomTransportMode,
                 voiceTransportMode = room.voiceTransportMode,
             )
         }
 
         /**
-         * Декодирует endpointName, если это короткая визитка комнаты BtRation актуального поколения рекламы.
+         * Декодирует endpointName, если это короткая визитка комнаты BtRation актуального или legacy-поколения рекламы.
          */
         fun decode(endpointName: String): NearbyRoomAdvertisement? {
             val parts = endpointName.split(SEPARATOR, limit = FIELD_COUNT)
@@ -107,26 +119,41 @@ data class NearbyRoomAdvertisement(
                 return null
             }
             val isCurrentFormat = parts.size == FIELD_COUNT && parts[0] == FORMAT_PREFIX
+            val isPreviousFormat = parts.size == PREVIOUS_FIELD_COUNT && parts[0] == PREVIOUS_FORMAT_PREFIX
             val isLegacyFormat = parts.size == LEGACY_FIELD_COUNT && parts[0] == LEGACY_FORMAT_PREFIX
-            if (!isCurrentFormat && !isLegacyFormat) {
+            if (!isCurrentFormat && !isPreviousFormat && !isLegacyFormat) {
                 return null
             }
             val sessionId = parts[1].takeIf { value -> value.isNotBlank() } ?: return null
             val createdAtMillis = parts[2].toLongOrNull(CREATED_AT_RADIX) ?: return null
             val hostShortId = parts[3].takeIf { value -> value.isNotBlank() } ?: return null
-            val voiceTransportMode = if (isCurrentFormat) {
-                voiceTransportModeForToken(parts[4])
+            val roomTransportMode = if (isCurrentFormat) {
+                roomTransportModeForToken(parts[4])
             } else {
-                VoiceTransportMode.WIFI_DIRECT_UDP
+                RoomTransportMode.NEARBY_STAR
             }
-            val roomNameIndex = if (isCurrentFormat) 5 else 4
-            val hostNameIndex = if (isCurrentFormat) 6 else 5
+            val voiceTransportMode = when {
+                isCurrentFormat -> voiceTransportModeForToken(parts[5])
+                isPreviousFormat -> voiceTransportModeForToken(parts[4])
+                else -> VoiceTransportMode.WIFI_DIRECT_UDP
+            }
+            val roomNameIndex = when {
+                isCurrentFormat -> 6
+                isPreviousFormat -> 5
+                else -> 4
+            }
+            val hostNameIndex = when {
+                isCurrentFormat -> 7
+                isPreviousFormat -> 6
+                else -> 5
+            }
             return NearbyRoomAdvertisement(
                 hostShortId = hostShortId,
                 roomName = parts[roomNameIndex],
                 hostName = parts[hostNameIndex],
                 sessionId = sessionId,
                 createdAtMillis = createdAtMillis,
+                roomTransportMode = roomTransportMode,
                 voiceTransportMode = voiceTransportMode,
             )
         }
@@ -171,6 +198,26 @@ data class NearbyRoomAdvertisement(
                 .replace('\n', ' ')
                 .replace('\r', ' ')
                 .replace('\t', ' ')
+        }
+
+        /**
+         * Кодирует тип транспорта комнаты в компактный token для Nearby endpointName.
+         */
+        private fun roomTransportToken(mode: RoomTransportMode): String {
+            return when (mode) {
+                RoomTransportMode.NEARBY_STAR -> "s"
+                RoomTransportMode.MESHRA -> "m"
+            }
+        }
+
+        /**
+         * Декодирует компактный token room transport, оставляя MESHRA default для актуального формата.
+         */
+        private fun roomTransportModeForToken(token: String): RoomTransportMode {
+            return when (token) {
+                "s" -> RoomTransportMode.NEARBY_STAR
+                else -> RoomTransportMode.MESHRA
+            }
         }
 
         /**

@@ -8,6 +8,8 @@ Repository-слой — удобная дверь для будущих ViewMode
 
 - `app/src/main/java/com/yellastro/btration/repository/ProfileRepository.kt`
 - `app/src/main/java/com/yellastro/btration/repository/RoomRepository.kt`
+- `app/src/main/java/com/yellastro/btration/repository/RoomSettingsRepository.kt`
+- `app/src/main/java/com/yellastro/btration/repository/IgnoredNearbyRepository.kt`
 - `app/src/main/java/com/yellastro/btration/service/RoomServiceController.kt`
 
 ## ProfileRepository
@@ -33,6 +35,21 @@ Repository-слой — удобная дверь для будущих ViewMode
 - `messages`.
 
 Прокидывает команды в `RoomRuntime`, а перед активными сетевыми действиями запускает `RoomServiceController`.
+
+## RoomSettingsRepository
+
+Хранит выбор типа комнаты для следующих диалогов создания:
+
+- `NEARBY_STAR` — прямой star-режим поверх Nearby;
+- `MESHRA` — будущий mesh-режим, выбранный по умолчанию.
+
+Значение сохраняется в общих app prefs и попадает в `RoomInfo.roomTransportMode` при создании комнаты.
+
+## IgnoredNearbyRepository
+
+Хранит локальный ignore-list прямых Nearby peer-ов/gateway-ев.
+
+Для `Nearby Star` ignored peer совпадает с host-ом комнаты. Для `MESHRA` ignored peer — это конкретный gateway из рекламы, а не `knownHost` логической комнаты. Поэтому одна и та же mesh-комната может скрыть рекламу gateway A, но остаться доступной через gateway B.
 
 ## RoomServiceController
 

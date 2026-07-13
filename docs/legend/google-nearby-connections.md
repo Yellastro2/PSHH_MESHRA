@@ -4,20 +4,24 @@
 
 - Android API: Google Play services Nearby Connections.
 - Зависимость MVP: `com.google.android.gms:play-services-nearby:19.3.0`.
-- Текущая стратегия MVP: `Strategy.P2P_STAR`.
+- Текущая стратегия MVP: `Strategy.P2P_CLUSTER`.
 - `serviceId` должен быть стабильной строкой приложения. Сейчас публичный фасад `NearbyTransport` передаёт в `NearbyConnectionLayer`: `com.yellastro.btration.nearby.ROOM_V1`.
+- Для MESHRA нижняя Nearby-стратегия должна позволять устройству быть одновременно участником уже установленного link-а и gateway для нового peer-а. В тесте 2026-07-13 `P2P_STAR` давал `STATUS_ENDPOINT_IO_ERROR` при входе C через gateway B, когда B уже состоял в комнате A. Поэтому application-level `NearbyTransport` в `AppContainer` запускается с `Strategy.P2P_CLUSTER`; обычный Nearby Star при этом остается star на уровне `RoomRuntime`/`RoomTransport`, а не на уровне физической Nearby-топологии.
 
 ## Практический контракт проекта
 
 - Advertising публикует комнату через `endpointName`.
-- В `endpointName` кладётся компактная визитка `NearbyRoomAdvertisement` формата `BTR4`, чтобы discovery мог показать комнату без подключения.
-- Визитка `BTR4` содержит `sessionId`, `createdAtMillis`, короткий след host-а, token voice transport, `roomName` и `hostName`. Полные `roomId` и `hostPeerId` не кладутся в `endpointName`, потому что лимит Nearby маленький и название комнаты важнее.
+- В `endpointName` кладётся компактная визитка `NearbyRoomAdvertisement` формата `BTR5`, чтобы discovery мог показать комнату без подключения.
+- Визитка `BTR5` содержит `sessionId`, `createdAtMillis`, короткий след host-а, token room transport, token voice transport, `roomName` и `hostName`. Полные `roomId` и `hostPeerId` не кладутся в `endpointName`, потому что лимит Nearby маленький и название комнаты важнее.
+- Старый формат `BTR4` продолжает декодироваться как legacy-визитка без token room transport; для него используется default `NEARBY_STAR`, а token voice transport читается как раньше.
 - Старый формат `BTR3` продолжает декодироваться как legacy-визитка без token voice transport; для него используется default `WIFI_DIRECT_UDP`.
 - До `JOIN_ACCEPTED` listener использует временные `RoomId`/`PeerId` из визитки. После подключения host присылает настоящий `RoomInfo`, и runtime заменяет временные идентификаторы реальными.
 - Nearby endpointId не считается доменным идентификатором участника. Связь `endpointId/linkId -> PeerId/RoomId` ведет `RoomTransport`, потому что это уже room-level знание, а не обязанность нижнего Nearby wrapper-а.
 - Для физических nearby-линков введён общий интерфейс `NeighborTransport`: discovery, advertising, connect/accept/reject/disconnect, BYTES-сообщения и STREAM-потоки описаны без привязки к Nearby SDK и без знания формата контента.
 - Код Nearby разделён на фасад `NearbyTransport`, lifecycle-слой `NearbyConnectionLayer` и payload-слой `NearbyPayloadTransport`. `NearbyConnectionLayer` отвечает за discovery, advertising, request/accept/reject/disconnect callbacks и transient permission retry. `NearbyPayloadTransport` отвечает только за отправку и прием непрозрачных BYTES/STREAM по endpointId. `NearbyTransport` реализует `NeighborTransport` и не знает о `WirePacket`, `RoomInfo`, `PeerId` или voice frame.
 - `RoomTransport` сидит поверх `NeighborTransport`: кодирует/декодирует `WirePacket`, готовит/читает `NearbyRoomAdvertisement`, автоматически принимает нижнее connection request и публикует `RoomTransportEvent` для `RoomRuntime`.
+- `MeshTransport` тоже сидит поверх того же `NeighborTransport`, но читает только payload-ы с сигнатурой `BTME1\n` и рекламу `BTM4`. В `AppContainer` прямой accept у `MeshTransport` выключен, чтобы не принимать один Nearby request двумя слоями; общий accept выполняет `RoomTransport`.
+- Ignore-list для MESHRA применяется к gateway из `BTM4`, а не к known host комнаты. `RoomTransport` получает predicate `shouldAcceptConnection(...)` и отклоняет входящий request, если endpointName распознается как реклама ignored gateway.
 - `NearbyVoiceTransport` сидит рядом с `RoomTransport` поверх того же `NeighborTransport`: он читает только BYTES с сигнатурой `BTVO`, а все room/control сообщения игнорирует.
 - Ошибка отправки BYTES/STREAM возвращается callback-ом конкретному вызывающему слою, а не широковещательным event-ом: иначе voice send failure мог бы случайно превратиться в room packet failure.
 - `endpointId -> PeerId` описывает только прямого физического Nearby-соседа. Автор `CHAT_MESSAGE` или другого relayed-пакета не должен перезаписывать эту связь.

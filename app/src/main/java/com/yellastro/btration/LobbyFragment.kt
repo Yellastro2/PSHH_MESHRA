@@ -25,6 +25,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.snackbar.Snackbar
+import com.yellastro.btration.domain.model.RoomTransportMode
 import com.yellastro.btration.domain.runtime.RoomRuntimeNotice
 import com.yellastro.btration.domain.runtime.RoomRuntimeErrorAction
 import com.yellastro.btration.ui.lobby.LobbyUiState
@@ -44,7 +45,7 @@ class LobbyFragment : Fragment() {
     private lateinit var tvWelcome: TextView
     private lateinit var etPeerName: EditText
     private lateinit var btnEditName: ImageButton
-    private lateinit var btnClearIgnoredHosts: ImageView
+    private lateinit var btnClearIgnoredPeers: ImageView
     private lateinit var tvLobbyError: TextView
     private lateinit var btnCreateRoom: Button
     private lateinit var viewScanProgress: View
@@ -78,7 +79,7 @@ class LobbyFragment : Fragment() {
         tvWelcome = view.findViewById(R.id.tv_welcome)
         etPeerName = view.findViewById(R.id.et_peer_name)
         btnEditName = view.findViewById(R.id.btn_edit_name)
-        btnClearIgnoredHosts = view.findViewById(R.id.fr_lobby_users)
+        btnClearIgnoredPeers = view.findViewById(R.id.fr_lobby_users)
         tvLobbyError = view.findViewById(R.id.tv_lobby_error)
         btnCreateRoom = view.findViewById(R.id.btn_create_room)
         viewScanProgress = view.findViewById(R.id.view_scan_progress)
@@ -86,7 +87,7 @@ class LobbyFragment : Fragment() {
 
         roomsAdapter = RoomsAdapter(
             onJoinClick = viewModel::onJoinRoomClicked,
-            onIgnoreClick = ::showIgnoreHostDialog,
+            onIgnoreClick = ::showIgnoreGatewayDialog,
         )
         rvRooms.layoutManager = LinearLayoutManager(requireContext())
         rvRooms.adapter = roomsAdapter
@@ -109,8 +110,8 @@ class LobbyFragment : Fragment() {
                 viewModel.onEditNameClicked()
             }
         }
-        btnClearIgnoredHosts.setOnClickListener {
-            showClearIgnoredHostsDialog()
+        btnClearIgnoredPeers.setOnClickListener {
+            showClearIgnoredPeersDialog()
         }
 
         childFragmentManager.setFragmentResultListener(
@@ -118,18 +119,22 @@ class LobbyFragment : Fragment() {
             viewLifecycleOwner,
         ) { _, bundle ->
             val newRoomName = bundle.getString(CreateRoomDialogFragment.RESULT_ROOM_NAME).orEmpty()
+            val roomTransportMode = RoomTransportMode.fromPrefValue(
+                bundle.getString(CreateRoomDialogFragment.RESULT_ROOM_TRANSPORT_MODE),
+            )
             val voiceTransportPreference = VoiceTransportPreference.fromPrefValue(
                 bundle.getString(CreateRoomDialogFragment.RESULT_VOICE_TRANSPORT_PREF),
             )
             if (newRoomName.isBlank()) {
                 return@setFragmentResultListener
             }
-            viewModel.onCreateRoomClicked(newRoomName, voiceTransportPreference)
+            viewModel.onCreateRoomClicked(newRoomName, roomTransportMode, voiceTransportPreference)
         }
 
         btnCreateRoom.setOnClickListener {
             val dialog = CreateRoomDialogFragment.newInstance(
                 initialRoomName = viewModel.lastRoomNameForDialog(),
+                initialRoomTransportMode = viewModel.roomTransportModeForDialog(),
                 initialVoiceTransportPreference = viewModel.voiceTransportPreferenceForDialog(),
             )
             dialog.show(childFragmentManager, "CreateRoomDialog")
@@ -330,29 +335,29 @@ class LobbyFragment : Fragment() {
     }
 
     /**
-     * Показывает подтверждение игнора host-а найденной комнаты.
+     * Показывает подтверждение игнора прямого gateway найденной комнаты.
      */
-    private fun showIgnoreHostDialog(room: RoomItemUi) {
+    private fun showIgnoreGatewayDialog(room: RoomItemUi) {
         AlertDialog.Builder(requireContext())
-            .setTitle("Игнорить host-а?")
-            .setMessage("Комнаты от ${room.hostName} больше не будут показываться в Nearby-лобби на этом устройстве.")
+            .setTitle("Игнорить gateway?")
+            .setMessage("Реклама от ${room.gatewayName} больше не будет использоваться напрямую. Эта же mesh-комната может остаться видимой через другие узлы.")
             .setPositiveButton("Игнорить") { _, _ ->
                 viewModel.onIgnoreRoomClicked(room)
-                showSnackbarIfNeeded("Host ${room.hostName} добавлен в ignore-list")
+                showSnackbarIfNeeded("Gateway ${room.gatewayName} добавлен в ignore-list")
             }
             .setNegativeButton("Отмена", null)
             .show()
     }
 
     /**
-     * Показывает подтверждение очистки локального ignore-list Nearby host-ов.
+     * Показывает подтверждение очистки локального ignore-list Nearby peer-ов/gateway-ев.
      */
-    private fun showClearIgnoredHostsDialog() {
+    private fun showClearIgnoredPeersDialog() {
         AlertDialog.Builder(requireContext())
             .setTitle("Очистить игнор лист?")
-            .setMessage("После очистки скрытые Nearby-host-ы снова появятся в лобби при следующем discovery.")
+            .setMessage("После очистки скрытые Nearby gateway-и снова появятся в лобби при следующем discovery.")
             .setPositiveButton("Да") { _, _ ->
-                viewModel.onClearIgnoredHostsConfirmed()
+                viewModel.onClearIgnoredPeersConfirmed()
                 showSnackbarIfNeeded("Ignore-list очищен")
             }
             .setNegativeButton("Нет", null)

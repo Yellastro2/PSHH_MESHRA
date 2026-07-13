@@ -16,7 +16,7 @@ data class LobbyUiState(
     val scanCycleDurationMillis: Long = 10_000L,
     val isSearching: Boolean = false,
     val availableRooms: List<RoomItemUi> = emptyList(),
-    val ignoredHostCount: Int = 0,
+    val ignoredPeerCount: Int = 0,
     val isInRoom: Boolean = false,
     val errorMessage: String? = null,
     val errorAction: RoomRuntimeErrorAction? = null,
@@ -28,7 +28,9 @@ data class LobbyUiState(
 data class RoomItemUi(
     val roomId: RoomId,
     val hostPeerId: PeerId,
+    val gatewayPeerId: PeerId,
     val roomName: String,
     val hostName: String,
+    val gatewayName: String,
     val memberCountText: String?,
 )

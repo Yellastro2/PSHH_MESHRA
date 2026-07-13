@@ -19,11 +19,13 @@ import kotlinx.coroutines.flow.asSharedFlow
 
 /**
  * Реализация NeighborTransport поверх Google Nearby Connections без знания форматов room/voice payload-ов.
+ *
+ * По умолчанию использует P2P_CLUSTER, потому что MESHRA gateway должен уметь держать несколько соседских link-ов.
  */
 class NearbyTransport(
     context: Context,
     connectionsClient: ConnectionsClient,
-    strategy: Strategy = Strategy.P2P_STAR,
+    strategy: Strategy = Strategy.P2P_CLUSTER,
     serviceId: String = DEFAULT_SERVICE_ID,
 ) : NeighborTransport {
     private val _neighborEvents = MutableSharedFlow<NeighborTransportEvent>(extraBufferCapacity = EVENT_BUFFER_CAPACITY)
