@@ -1,0 +1,577 @@
+package com.yellastro.btration.data.nearby
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.location.LocationManager
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import androidx.core.content.ContextCompat
+import androidx.core.location.LocationManagerCompat
+import com.google.android.gms.common.api.ApiException
+import com.google.android.gms.nearby.connection.AdvertisingOptions
+import com.google.android.gms.nearby.connection.ConnectionInfo
+import com.google.android.gms.nearby.connection.ConnectionLifecycleCallback
+import com.google.android.gms.nearby.connection.ConnectionResolution
+import com.google.android.gms.nearby.connection.ConnectionsClient
+import com.google.android.gms.nearby.connection.ConnectionsStatusCodes
+import com.google.android.gms.nearby.connection.DiscoveredEndpointInfo
+import com.google.android.gms.nearby.connection.DiscoveryOptions
+import com.google.android.gms.nearby.connection.EndpointDiscoveryCallback
+import com.google.android.gms.nearby.connection.PayloadCallback
+import com.google.android.gms.nearby.connection.Strategy
+import com.yellastro.btration.domain.model.RoomInfo
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Управляет Nearby discovery, advertising и lifecycle соединений без декодирования payload-ов приложения.
+ */
+internal class NearbyConnectionLayer(
+    private val context: Context,
+    private val connectionsClient: ConnectionsClient,
+    private val strategy: Strategy,
+    private val serviceId: String,
+    private val payloadCallback: PayloadCallback,
+    private val emitEvent: (NearbyConnectionLayerEvent) -> Unit,
+) {
+    private val connectedEndpointIds = ConcurrentHashMap.newKeySet<String>()
+    private val retryHandler = Handler(Looper.getMainLooper())
+    private var discoveryRetryRunnable: Runnable? = null
+    private var advertisingRetryRunnable: Runnable? = null
+
+    private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
+        /**
+         * Автоматически принимает Nearby-соединение и сообщает фасаду о начале handshake.
+         */
+        override fun onConnectionInitiated(endpointId: String, connectionInfo: ConnectionInfo) {
+            Log.i(TAG, "[onConnectionInitiated] Получен запрос соединения endpointId=$endpointId endpointName=${connectionInfo.endpointName}")
+            emitEvent(NearbyConnectionLayerEvent.ConnectionInitiated(endpointId, connectionInfo))
+            connectionsClient.acceptConnection(endpointId, payloadCallback)
+                .addOnFailureListener { cause ->
+                    Log.w(TAG, "[onConnectionInitiated] Не удалось принять соединение endpointId=$endpointId: ${cause.message}", cause)
+                    emitEvent(NearbyConnectionLayerEvent.ConnectionAcceptFailed(endpointId, cause))
+                }
+        }
+
+        /**
+         * Запоминает успешный handshake либо запускает recovery для полуподключенного endpoint.
+         */
+        override fun onConnectionResult(endpointId: String, resolution: ConnectionResolution) {
+            Log.i(
+                TAG,
+                "[onConnectionResult] Результат соединения endpointId=$endpointId statusCode=${resolution.status.statusCode} success=${resolution.status.isSuccess}",
+            )
+            if (!resolution.status.isSuccess && resolution.status.statusCode in RECOVERABLE_CONNECTION_STATUS_CODES) {
+                val cause = ApiException(resolution.status)
+                Log.w(TAG, "[onConnectionResult] Сбрасываем полуподключенный endpoint после statusCode=${resolution.status.statusCode} endpointId=$endpointId", cause)
+                disconnectEndpoint(endpointId)
+                emitEvent(NearbyConnectionLayerEvent.ConnectionRecoveryRequired(endpointId, cause))
+                return
+            }
+            if (resolution.status.isSuccess) {
+                connectedEndpointIds.add(endpointId)
+            }
+            emitEvent(NearbyConnectionLayerEvent.ConnectionResult(endpointId, resolution))
+        }
+
+        /**
+         * Снимает только состояние active connection, сохраняя discovery-связки на уровне фасада.
+         */
+        override fun onDisconnected(endpointId: String) {
+            Log.i(TAG, "[onDisconnected] Nearby endpoint отключился endpointId=$endpointId")
+            connectedEndpointIds.remove(endpointId)
+            emitEvent(NearbyConnectionLayerEvent.Disconnected(endpointId))
+        }
+    }
+
+    private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
+        /**
+         * Декодирует короткую визитку endpoint-а и сообщает фасаду найденную комнату.
+         */
+        override fun onEndpointFound(endpointId: String, endpointInfo: DiscoveredEndpointInfo) {
+            Log.i(
+                TAG,
+                "[onEndpointFound] Найден endpoint endpointId=$endpointId serviceId=${endpointInfo.serviceId} endpointNameLength=${endpointInfo.endpointName.length}",
+            )
+            val roomInfo = decodeRoomInfo(endpointInfo)
+            if (roomInfo != null) {
+                Log.i(
+                    TAG,
+                    "[onEndpointFound] Endpoint распознан как комната roomId=${roomInfo.roomId.value} roomName=${roomInfo.name} hostPeerId=${roomInfo.host.peerId.value}",
+                )
+            } else {
+                Log.w(TAG, "[onEndpointFound] Endpoint не содержит корректную визитку комнаты endpointId=$endpointId")
+            }
+            emitEvent(NearbyConnectionLayerEvent.EndpointFound(endpointId, endpointInfo, roomInfo))
+        }
+
+        /**
+         * Сообщает фасаду, что Nearby больше не видит найденный endpoint.
+         */
+        override fun onEndpointLost(endpointId: String) {
+            Log.i(TAG, "[onEndpointLost] Потерян endpoint endpointId=$endpointId")
+            emitEvent(NearbyConnectionLayerEvent.EndpointLost(endpointId))
+        }
+    }
+
+    /**
+     * Запускает поиск Nearby endpoint-ов с текущим serviceId.
+     */
+    fun startDiscovery() {
+        cancelDiscoveryPermissionRetry()
+        startDiscoveryInternal(permissionRetryAttempt = 0)
+    }
+
+    /**
+     * Запускает discovery и тихо ретраит краткий permission-race внутри Nearby API.
+     */
+    private fun startDiscoveryInternal(permissionRetryAttempt: Int) {
+        Log.i(TAG, "[startDiscovery] Запускаем discovery serviceId=$serviceId strategy=$strategy")
+        val missingPermissions = missingPermissionsForDiscovery()
+        if (missingPermissions.isNotEmpty()) {
+            Log.w(TAG, "[startDiscovery] Discovery не стартует, нет permissions: ${missingPermissions.joinToString()}")
+            emitEvent(
+                NearbyConnectionLayerEvent.DiscoveryFailed(
+                    SecurityException("Нет Nearby permissions для discovery: ${missingPermissions.joinToString()}"),
+                ),
+            )
+            return
+        }
+
+        val locationRequirementError = locationRequirementErrorOrNull()
+        if (locationRequirementError != null) {
+            Log.w(TAG, "[startDiscovery] Discovery не стартует, не выполнено системное требование: ${locationRequirementError.message}")
+            emitEvent(NearbyConnectionLayerEvent.DiscoveryFailed(locationRequirementError))
+            return
+        }
+
+        val options = DiscoveryOptions.Builder()
+            .setStrategy(strategy)
+            .build()
+        connectionsClient.startDiscovery(serviceId, endpointDiscoveryCallback, options)
+            .addOnSuccessListener {
+                cancelDiscoveryPermissionRetry()
+                Log.i(TAG, "[startDiscovery] Nearby discovery запущен")
+            }
+            .addOnFailureListener { cause ->
+                if (shouldRetryTransientPermissionFailure(
+                        cause = cause,
+                        permissionRetryAttempt = permissionRetryAttempt,
+                        missingPermissionsProvider = ::missingPermissionsForDiscovery,
+                    )
+                ) {
+                    scheduleDiscoveryPermissionRetry(permissionRetryAttempt + 1, cause)
+                    return@addOnFailureListener
+                }
+                Log.w(TAG, "[startDiscovery] Nearby не запустил discovery: ${cause.message}", cause)
+                emitEvent(NearbyConnectionLayerEvent.DiscoveryFailed(cause))
+            }
+    }
+
+    /**
+     * Останавливает поиск Nearby endpoint-ов.
+     */
+    fun stopDiscovery() {
+        Log.i(TAG, "[stopDiscovery] Останавливаем discovery")
+        cancelDiscoveryPermissionRetry()
+        connectionsClient.stopDiscovery()
+    }
+
+    /**
+     * Запускает advertising комнаты через короткую endpointName-визитку.
+     */
+    fun startAdvertising(room: RoomInfo) {
+        cancelAdvertisingPermissionRetry()
+        startAdvertisingInternal(room, permissionRetryAttempt = 0)
+    }
+
+    /**
+     * Запускает advertising и тихо ретраит краткий permission-race внутри Nearby API.
+     */
+    private fun startAdvertisingInternal(room: RoomInfo, permissionRetryAttempt: Int) {
+        Log.i(
+            TAG,
+            "[startAdvertising] Запускаем advertising roomId=${room.roomId.value} roomName=${room.name} hostPeerId=${room.host.peerId.value} serviceId=$serviceId strategy=$strategy",
+        )
+        val missingPermissions = missingPermissionsForAdvertising()
+        if (missingPermissions.isNotEmpty()) {
+            Log.w(TAG, "[startAdvertising] Advertising не стартует, нет permissions: ${missingPermissions.joinToString()}")
+            emitEvent(
+                NearbyConnectionLayerEvent.AdvertisingFailed(
+                    SecurityException("Нет Nearby permissions для advertising: ${missingPermissions.joinToString()}"),
+                ),
+            )
+            return
+        }
+
+        val locationRequirementError = locationRequirementErrorOrNull()
+        if (locationRequirementError != null) {
+            Log.w(TAG, "[startAdvertising] Advertising не стартует, не выполнено системное требование: ${locationRequirementError.message}")
+            emitEvent(NearbyConnectionLayerEvent.AdvertisingFailed(locationRequirementError))
+            return
+        }
+
+        val endpointName = NearbyRoomAdvertisement.fromRoom(room).encode()
+        Log.i(
+            TAG,
+            "[startAdvertising] Визитка комнаты закодирована в endpointName chars=${endpointName.length} bytes=${endpointName.encodeToByteArray().size}",
+        )
+        val options = AdvertisingOptions.Builder()
+            .setStrategy(strategy)
+            .build()
+        connectionsClient.startAdvertising(endpointName, serviceId, connectionLifecycleCallback, options)
+            .addOnSuccessListener {
+                cancelAdvertisingPermissionRetry()
+                Log.i(TAG, "[startAdvertising] Nearby advertising запущен roomId=${room.roomId.value}")
+            }
+            .addOnFailureListener { cause ->
+                if (shouldRetryTransientPermissionFailure(
+                        cause = cause,
+                        permissionRetryAttempt = permissionRetryAttempt,
+                        missingPermissionsProvider = ::missingPermissionsForAdvertising,
+                    )
+                ) {
+                    scheduleAdvertisingPermissionRetry(room, permissionRetryAttempt + 1, cause)
+                    return@addOnFailureListener
+                }
+                Log.w(TAG, "[startAdvertising] Nearby не запустил advertising roomId=${room.roomId.value}: ${cause.message}", cause)
+                emitEvent(NearbyConnectionLayerEvent.AdvertisingFailed(cause))
+            }
+    }
+
+    /**
+     * Останавливает advertising текущего устройства.
+     */
+    fun stopAdvertising() {
+        Log.i(TAG, "[stopAdvertising] Останавливаем advertising")
+        cancelAdvertisingPermissionRetry()
+        connectionsClient.stopAdvertising()
+    }
+
+    /**
+     * Полностью останавливает локальное Nearby-состояние discovery, advertising и активные endpoint-ы.
+     */
+    fun stopAllEndpoints(reason: String) {
+        Log.i(TAG, "[stopAllEndpoints] Полностью сбрасываем Nearby reason=$reason")
+        cancelDiscoveryPermissionRetry()
+        cancelAdvertisingPermissionRetry()
+        connectionsClient.stopDiscovery()
+        connectionsClient.stopAdvertising()
+        connectionsClient.stopAllEndpoints()
+        connectedEndpointIds.clear()
+    }
+
+    /**
+     * Запрашивает Nearby-соединение либо сообщает о пригодном для повторного использования активном endpoint.
+     */
+    fun connectToEndpoint(endpointId: String) {
+        if (endpointId in connectedEndpointIds) {
+            Log.i(TAG, "[connectToEndpoint] Endpoint уже подключен, переиспользуем endpointId=$endpointId")
+            emitEvent(NearbyConnectionLayerEvent.ConnectionReused(endpointId))
+            return
+        }
+        Log.i(TAG, "[connectToEndpoint] Запрашиваем соединение endpointId=$endpointId")
+        connectionsClient.requestConnection(context.packageName, endpointId, connectionLifecycleCallback)
+            .addOnSuccessListener {
+                Log.i(TAG, "[connectToEndpoint] Запрос соединения отправлен endpointId=$endpointId")
+            }
+            .addOnFailureListener { cause ->
+                if (cause is ApiException && cause.statusCode == ConnectionsStatusCodes.STATUS_ALREADY_CONNECTED_TO_ENDPOINT) {
+                    connectedEndpointIds.add(endpointId)
+                    Log.i(TAG, "[connectToEndpoint] Nearby подтвердил существующее соединение endpointId=$endpointId")
+                    emitEvent(NearbyConnectionLayerEvent.ConnectionReused(endpointId))
+                    return@addOnFailureListener
+                }
+                if (cause is ApiException && cause.statusCode in RECOVERABLE_CONNECTION_STATUS_CODES) {
+                    Log.w(TAG, "[connectToEndpoint] Сбрасываем полуподключенный endpoint после statusCode=${cause.statusCode} endpointId=$endpointId", cause)
+                    disconnectEndpoint(endpointId)
+                    emitEvent(NearbyConnectionLayerEvent.ConnectionRecoveryRequired(endpointId, cause))
+                    return@addOnFailureListener
+                }
+                Log.w(TAG, "[connectToEndpoint] Не удалось запросить соединение endpointId=$endpointId: ${cause.message}", cause)
+                emitEvent(NearbyConnectionLayerEvent.ConnectionRequestFailed(endpointId, cause))
+            }
+    }
+
+    /**
+     * Явно разрывает все активные Nearby-соединения без сброса discovery-связок на уровне фасада.
+     */
+    fun disconnectAllPeers() {
+        val endpointIds = connectedEndpointIds.toList()
+        if (endpointIds.isEmpty()) {
+            Log.i(TAG, "[disconnectAllPeers] Активных Nearby-соединений нет")
+            return
+        }
+        endpointIds.forEach(::disconnectEndpoint)
+    }
+
+    /**
+     * Безусловно отключает endpoint и очищает только локальный признак active connection.
+     */
+    private fun disconnectEndpoint(endpointId: String) {
+        connectedEndpointIds.remove(endpointId)
+        connectionsClient.disconnectFromEndpoint(endpointId)
+        Log.i(TAG, "[disconnectEndpoint] Endpoint отключен endpointId=$endpointId")
+    }
+
+    /**
+     * Проверяет transient permission-race: app уже видит permissions, а Nearby API еще отвечает MISSING_PERMISSION.
+     */
+    private fun shouldRetryTransientPermissionFailure(
+        cause: Throwable,
+        permissionRetryAttempt: Int,
+        missingPermissionsProvider: () -> List<String>,
+    ): Boolean {
+        if (!isNearbyMissingPermissionFailure(cause)) {
+            return false
+        }
+        if (permissionRetryAttempt >= TRANSIENT_PERMISSION_RETRY_DELAYS_MILLIS.size) {
+            return false
+        }
+        val missingPermissions = missingPermissionsProvider()
+        if (missingPermissions.isNotEmpty()) {
+            Log.w(TAG, "[shouldRetryTransientPermissionFailure] Nearby permission ошибка не transient: реально нет permissions ${missingPermissions.joinToString()}")
+            return false
+        }
+        return true
+    }
+
+    /**
+     * Распознает permission-ошибку Google Nearby, которая иногда приходит сразу после выдачи runtime permissions.
+     */
+    private fun isNearbyMissingPermissionFailure(cause: Throwable): Boolean {
+        val apiException = cause as? ApiException ?: return false
+        return apiException.statusCode == TRANSIENT_MISSING_PERMISSION_STATUS_CODE ||
+            apiException.message?.contains(TRANSIENT_MISSING_PERMISSION_MARKER, ignoreCase = true) == true
+    }
+
+    /**
+     * Планирует повторный discovery после краткой задержки, не отправляя ошибку в UI до исчерпания попыток.
+     */
+    private fun scheduleDiscoveryPermissionRetry(nextAttempt: Int, cause: Throwable) {
+        cancelDiscoveryPermissionRetry()
+        val delayMillis = TRANSIENT_PERMISSION_RETRY_DELAYS_MILLIS[nextAttempt - 1]
+        Log.w(
+            TAG,
+            "[scheduleDiscoveryPermissionRetry] Nearby discovery вернул transient permission race, повторяем attempt=$nextAttempt delayMs=$delayMillis message=${cause.message}",
+        )
+        val retryRunnable = Runnable {
+            discoveryRetryRunnable = null
+            startDiscoveryInternal(permissionRetryAttempt = nextAttempt)
+        }
+        discoveryRetryRunnable = retryRunnable
+        retryHandler.postDelayed(retryRunnable, delayMillis)
+    }
+
+    /**
+     * Планирует повторный advertising после краткой задержки, не отправляя ошибку в UI до исчерпания попыток.
+     */
+    private fun scheduleAdvertisingPermissionRetry(room: RoomInfo, nextAttempt: Int, cause: Throwable) {
+        cancelAdvertisingPermissionRetry()
+        val delayMillis = TRANSIENT_PERMISSION_RETRY_DELAYS_MILLIS[nextAttempt - 1]
+        Log.w(
+            TAG,
+            "[scheduleAdvertisingPermissionRetry] Nearby advertising вернул transient permission race, повторяем roomId=${room.roomId.value} attempt=$nextAttempt delayMs=$delayMillis message=${cause.message}",
+        )
+        val retryRunnable = Runnable {
+            advertisingRetryRunnable = null
+            startAdvertisingInternal(room, permissionRetryAttempt = nextAttempt)
+        }
+        advertisingRetryRunnable = retryRunnable
+        retryHandler.postDelayed(retryRunnable, delayMillis)
+    }
+
+    /**
+     * Отменяет отложенный retry discovery, если пользователь остановил поиск или transport сбрасывается.
+     */
+    private fun cancelDiscoveryPermissionRetry() {
+        discoveryRetryRunnable?.let { retryHandler.removeCallbacks(it) }
+        discoveryRetryRunnable = null
+    }
+
+    /**
+     * Отменяет отложенный retry advertising, если пользователь остановил комнату или transport сбрасывается.
+     */
+    private fun cancelAdvertisingPermissionRetry() {
+        advertisingRetryRunnable?.let { retryHandler.removeCallbacks(it) }
+        advertisingRetryRunnable = null
+    }
+
+    /**
+     * Возвращает permissions, без которых discovery заведомо упадет в Nearby API.
+     */
+    private fun missingPermissionsForDiscovery(): List<String> {
+        return requiredBaseNearbyPermissions()
+            .plus(requiredDiscoveryPermissions())
+            .filterNot(::isPermissionGranted)
+            .distinct()
+    }
+
+    /**
+     * Возвращает permissions, без которых advertising заведомо упадет в Nearby API.
+     */
+    private fun missingPermissionsForAdvertising(): List<String> {
+        return requiredBaseNearbyPermissions()
+            .plus(requiredAdvertisingPermissions())
+            .filterNot(::isPermissionGranted)
+            .distinct()
+    }
+
+    /**
+     * Возвращает общие permissions Nearby Connections для текущего Android.
+     */
+    private fun requiredBaseNearbyPermissions(): List<String> {
+        return buildList {
+            add(Manifest.permission.ACCESS_WIFI_STATE)
+            add(Manifest.permission.CHANGE_WIFI_STATE)
+            add(Manifest.permission.ACCESS_COARSE_LOCATION)
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            }
+        }
+    }
+
+    /**
+     * Возвращает permissions, специфичные для discovery.
+     */
+    private fun requiredDiscoveryPermissions(): List<String> {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            listOf(Manifest.permission.BLUETOOTH_SCAN)
+        } else {
+            emptyList()
+        }
+    }
+
+    /**
+     * Возвращает permissions, специфичные для advertising.
+     */
+    private fun requiredAdvertisingPermissions(): List<String> {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            listOf(Manifest.permission.BLUETOOTH_ADVERTISE)
+        } else {
+            emptyList()
+        }
+    }
+
+    /**
+     * Проверяет, считает ли Android permission выданным этому приложению.
+     */
+    private fun isPermissionGranted(permission: String): Boolean {
+        return ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+    }
+
+    /**
+     * Возвращает ошибку системной геолокации, если permissions есть, но Location toggle выключен.
+     */
+    private fun locationRequirementErrorOrNull(): NearbyRequirementException? {
+        val locationPermissionsGranted = listOf(
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+        ).all(::isPermissionGranted)
+        if (!locationPermissionsGranted) {
+            return null
+        }
+
+        val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        return if (LocationManagerCompat.isLocationEnabled(locationManager)) {
+            null
+        } else {
+            NearbyRequirementException.LocationDisabled
+        }
+    }
+
+    /**
+     * Декодирует публичное описание комнаты из короткой Nearby endpointName-визитки актуального поколения.
+     */
+    private fun decodeRoomInfo(endpointInfo: DiscoveredEndpointInfo): RoomInfo? {
+        return runCatching {
+            NearbyRoomAdvertisement.decode(endpointInfo.endpointName)
+                ?.toRoomInfo()
+        }.onFailure { cause ->
+            Log.w(TAG, "[decodeRoomInfo] Не удалось декодировать endpointName как визитку комнаты: ${cause.message}", cause)
+        }.getOrNull()
+    }
+
+    private companion object {
+        private const val TAG = "NearbyConnectionLayer"
+        private const val TRANSIENT_MISSING_PERMISSION_STATUS_CODE = 8034
+        private const val TRANSIENT_MISSING_PERMISSION_MARKER = "MISSING_PERMISSION"
+        private val TRANSIENT_PERMISSION_RETRY_DELAYS_MILLIS = longArrayOf(400L, 900L, 1_600L)
+        private val RECOVERABLE_CONNECTION_STATUS_CODES = setOf(
+            ConnectionsStatusCodes.STATUS_RADIO_ERROR,
+            ConnectionsStatusCodes.STATUS_ENDPOINT_UNKNOWN,
+            ConnectionsStatusCodes.STATUS_OUT_OF_ORDER_API_CALL,
+            ConnectionsStatusCodes.STATUS_ENDPOINT_IO_ERROR,
+        )
+    }
+}
+
+/**
+ * Низкоуровневое событие Nearby lifecycle, которое фасад переводит в публичный NearbyEvent.
+ */
+internal sealed class NearbyConnectionLayerEvent {
+    /**
+     * Nearby начал входящий handshake от endpoint-а.
+     */
+    data class ConnectionInitiated(val endpointId: String, val connectionInfo: ConnectionInfo) : NearbyConnectionLayerEvent()
+
+    /**
+     * Автоматическое принятие Nearby-соединения завершилось ошибкой.
+     */
+    data class ConnectionAcceptFailed(val endpointId: String, val cause: Throwable) : NearbyConnectionLayerEvent()
+
+    /**
+     * Nearby вернул итог handshake для endpoint-а.
+     */
+    data class ConnectionResult(val endpointId: String, val resolution: ConnectionResolution) : NearbyConnectionLayerEvent()
+
+    /**
+     * Nearby endpoint требует recovery после recoverable ошибки handshake или requestConnection.
+     */
+    data class ConnectionRecoveryRequired(val endpointId: String, val cause: ApiException) : NearbyConnectionLayerEvent()
+
+    /**
+     * Nearby сообщил о разрыве активного endpoint-а.
+     */
+    data class Disconnected(val endpointId: String) : NearbyConnectionLayerEvent()
+
+    /**
+     * Discovery нашел endpoint и, возможно, декодированную визитку комнаты.
+     */
+    data class EndpointFound(
+        val endpointId: String,
+        val endpointInfo: DiscoveredEndpointInfo,
+        val roomInfo: RoomInfo?,
+    ) : NearbyConnectionLayerEvent()
+
+    /**
+     * Discovery потерял ранее найденный endpoint.
+     */
+    data class EndpointLost(val endpointId: String) : NearbyConnectionLayerEvent()
+
+    /**
+     * Nearby не смог запустить discovery.
+     */
+    data class DiscoveryFailed(val cause: Throwable) : NearbyConnectionLayerEvent()
+
+    /**
+     * Nearby не смог запустить advertising.
+     */
+    data class AdvertisingFailed(val cause: Throwable) : NearbyConnectionLayerEvent()
+
+    /**
+     * Endpoint уже имеет активное соединение и может быть переиспользован.
+     */
+    data class ConnectionReused(val endpointId: String) : NearbyConnectionLayerEvent()
+
+    /**
+     * Nearby не смог отправить requestConnection к endpoint-у.
+     */
+    data class ConnectionRequestFailed(val endpointId: String, val cause: Throwable) : NearbyConnectionLayerEvent()
+}

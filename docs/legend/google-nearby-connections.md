@@ -5,7 +5,7 @@
 - Android API: Google Play services Nearby Connections.
 - Зависимость MVP: `com.google.android.gms:play-services-nearby:19.3.0`.
 - Текущая стратегия MVP: `Strategy.P2P_STAR`.
-- `serviceId` должен быть стабильной строкой приложения. Сейчас в `NearbyTransport`: `com.yellastro.btration.nearby.ROOM_V1`.
+- `serviceId` должен быть стабильной строкой приложения. Сейчас публичный фасад `NearbyTransport` передаёт в `NearbyConnectionLayer`: `com.yellastro.btration.nearby.ROOM_V1`.
 
 ## Практический контракт проекта
 
@@ -15,6 +15,7 @@
 - Старый формат `BTR3` продолжает декодироваться как legacy-визитка без token voice transport; для него используется default `WIFI_DIRECT_UDP`.
 - До `JOIN_ACCEPTED` listener использует временные `RoomId`/`PeerId` из визитки. После подключения host присылает настоящий `RoomInfo`, и runtime заменяет временные идентификаторы реальными.
 - Nearby endpointId не считается доменным идентификатором участника. Для этого есть `NearbyEndpointRegistry`, который связывает `endpointId` с `PeerId` и `RoomId`.
+- Код Nearby разделён на фасад `NearbyTransport`, lifecycle-слой `NearbyConnectionLayer` и payload-слой `NearbyPayloadTransport`. `NearbyConnectionLayer` отвечает за discovery, advertising, request/accept/disconnect callbacks и transient permission retry. `NearbyPayloadTransport` отвечает за отправку BYTES/STREAM по endpointId и декодирование входящих payload-ов в wire/voice события. `NearbyTransport` сохраняет старый API для `RoomRuntime` и дополняет низкоуровневые события данными из `NearbyEndpointRegistry`.
 - `endpointId -> PeerId` описывает только прямого физического Nearby-соседа. Автор `CHAT_MESSAGE` или другого relayed-пакета не должен перезаписывать эту связь.
 - Транспорт автоматически принимает Nearby connection, а бизнес-решение входа в комнату остаётся выше, в `RoomRuntime`, через `JOIN_ACCEPTED` / `JOIN_REJECTED`.
 - Для будущего mesh/relay в `WirePacket` уже есть поля `packetId` и `ttl`, но Nearby-слой пока не делает dedup и relay.
