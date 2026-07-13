@@ -29,6 +29,7 @@ import com.yellastro.btration.domain.runtime.RoomRuntimeErrorAction
 import com.yellastro.btration.ui.lobby.LobbyUiState
 import com.yellastro.btration.ui.lobby.LobbyViewModel
 import com.yellastro.btration.ui.lobby.RoomItemUi
+import com.yellastro.btration.voice.VoiceTransportPreference
 import kotlinx.coroutines.launch
 
 /**
@@ -110,14 +111,20 @@ class LobbyFragment : Fragment() {
             viewLifecycleOwner,
         ) { _, bundle ->
             val newRoomName = bundle.getString(CreateRoomDialogFragment.RESULT_ROOM_NAME).orEmpty()
+            val voiceTransportPreference = VoiceTransportPreference.fromPrefValue(
+                bundle.getString(CreateRoomDialogFragment.RESULT_VOICE_TRANSPORT_PREF),
+            )
             if (newRoomName.isBlank()) {
                 return@setFragmentResultListener
             }
-            viewModel.onCreateRoomClicked(newRoomName)
+            viewModel.onCreateRoomClicked(newRoomName, voiceTransportPreference)
         }
 
         btnCreateRoom.setOnClickListener {
-            val dialog = CreateRoomDialogFragment()
+            val dialog = CreateRoomDialogFragment.newInstance(
+                initialRoomName = viewModel.lastRoomNameForDialog(),
+                initialVoiceTransportPreference = viewModel.voiceTransportPreferenceForDialog(),
+            )
             dialog.show(childFragmentManager, "CreateRoomDialog")
         }
 

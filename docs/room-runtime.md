@@ -2,9 +2,11 @@
 
 ## Назначение
 
-`RoomRuntime` — обычный Kotlin-класс, который управляет текущей комнатой поверх signaling-транспорта `NearbyTransport` и голосового `VoiceTransport`.
+`RoomRuntime` — обычный Kotlin-класс, который управляет текущей комнатой поверх signaling-транспорта `NearbyTransport` и переключаемого голосового `VoiceTransport`.
 
 Он не является Android Service, ViewModel или Repository. Его задача — слушать события транспорта, принимать protocol-решения и отдавать состояние выше через `StateFlow`.
+Статус прямого аудиоканала также идет через `RoomRuntimeState`, чтобы UI видел не только одноразовый snackbar, но и устойчивое состояние `Connecting` / `Ready` / `Unavailable`.
+Переключаемый voice transport создает конкретный media-plane delegate лениво, только после выбора режима комнаты. Это важно для Nearby-комнат: Wi-Fi Direct не должен регистрировать callbacks, чистить группы или трогать системный P2P-слой, если host выбрал `NEARBY_BYTES`.
 
 ## Файлы
 
@@ -29,7 +31,7 @@ NearbyTransport.events + VoiceTransport.events
 
 ## StateFlow
 
-- `state: StateFlow<RoomRuntimeState>` — текущая роль и сессия.
+- `state: StateFlow<RoomRuntimeState>` — текущая роль, сессия и `DirectAudioStatus` для активной комнаты.
 - `availableRooms: StateFlow<List<RoomInfo>>` — комнаты из discovery.
 - `messages: StateFlow<List<ChatMessage>>` — чат текущей комнаты.
 - `talkingPeerIds: StateFlow<Set<PeerId>>` — участники, чьи voice frames сейчас передаются или локально доигрываются.
@@ -39,11 +41,13 @@ NearbyTransport.events + VoiceTransport.events
 Host:
 
 - создает `RoomInfo`;
+- перед созданием комнаты получает voice-настройку из диалога создания, сохраняет ее в prefs, выбирает `voiceTransportMode` и кладет его в `RoomInfo`;
 - держит `RoomInfo.isDirectAudioReady=false`, пока первый peer не завершил UDP `HELLO/HELLO_ACK` handshake;
 - останавливает discovery;
 - запускает advertising;
 - рассылает host `VOICE_TRANSPORT_INFO` для запуска handshake независимо от флага готовности;
 - по `VoiceTransportEvent.DirectAudioReady` после handshake помечает комнату готовой к direct-аудио и рассылает обновленный `RoomInfo`;
+- по `VoiceTransportEvent.TransportUnavailable` сохраняет `DirectAudioStatus.Unavailable`, но не закрывает комнату и не затирает уже готовый direct-аудиоканал;
 - принимает `JOIN_REQUEST`;
 - добавляет участника в `members`;
 - отправляет `JOIN_ACCEPTED`;
@@ -64,9 +68,11 @@ Client:
 - хранит внутреннюю связь `RoomId -> endpointId`, где до входа `RoomId` может быть временным advertised-id;
 - по `joinRoom(roomId)` подключается к endpoint;
 - после успешного connection отправляет `JOIN_REQUEST` без реального `roomId`;
-- после `JOIN_ACCEPTED` получает настоящий `RoomInfo`, берет `RoomInfo.host.peerId` для Wi-Fi Direct DNS-SD matching, заменяет временный `RoomId -> endpointId` на реальный `RoomId -> endpointId` и переходит в `Client`;
+- после `JOIN_ACCEPTED` получает настоящий `RoomInfo`, берет `RoomInfo.voiceTransportMode`, переключает локальный voice transport на режим host-а, берет `RoomInfo.host.peerId` для Wi-Fi Direct DNS-SD matching, заменяет временный `RoomId -> endpointId` на реальный `RoomId -> endpointId` и переходит в `Client`;
+- на экране комнаты видит выбранный host-ом voice transport как read-only пункт меню настроек; host видит такой же read-only пункт, потому что активный transport комнаты после старта не переключается;
 - получает host `VOICE_TRANSPORT_INFO` сразу после входа и запускает direct-audio handshake;
 - по `MEMBER_LIST` обновляет участников;
+- по `VoiceTransportEvent.TransportUnavailable` получает `DirectAudioStatus.Unavailable`, который ViewModel показывает как состояние прямого канала;
 - свои сообщения добавляет локально и отправляет host-у;
 - сообщения от host-а добавляет в чат;
 - по `ROOM_CLOSED` сбрасывает сессию в `Idle`.
@@ -82,6 +88,7 @@ Client:
 
 - `RoomRuntime.startTalking()` добавляет локальный `PeerId` в `talkingPeerIds`, только если `VoiceRuntime` реально начал передачу.
 - Перед стартом записи `RoomRuntime.startTalking()` выбирает адресатов с готовым handshake. Запись блокируется только когда нет ни одного готового адресата; неготовые участники пропускают текущую передачу.
+- Если готовых адресатов нет, `RoomRuntime.startTalking()` сохраняет `DirectAudioStatus.Unavailable("Прямой аудиоканал не установлен")`, и UI отключает повторный PTT до переподключения.
 - `RoomRuntime.stopTalking()` убирает локальный `PeerId` из `talkingPeerIds`.
 - При `VoiceTransportEvent.FrameReceived` runtime добавляет `originPeerId` отправителя в `talkingPeerIds`, передает Opus frame в `VoiceRuntime.playIncomingFrame(...)` и снимает индикатор через callback после final-frame/EOF.
 - Для UDP media-plane есть fallback: каждый non-final voice frame продлевает таймер говорящего, а если final-frame потерялся, runtime гасит индикатор и закрывает входящую frame-сессию по таймауту тишины.
@@ -100,4 +107,4 @@ Client:
 ## Ограничения текущего слоя
 
 - Нет mesh relay, только задел через `packetId` и `ttl`.
-- Voice MVP использует `VoiceTransport`; текущий выбранный режим в `AppContainer` — `WIFI_DIRECT_UDP`, при этом `NEARBY_BYTES` оставлен как альтернативная реализация.
+- Voice MVP использует `VoiceTransport`; дефолтный режим в настройках — `WIFI_DIRECT_UDP`, при этом реальный delegate создается только после применения режима конкретной комнаты.

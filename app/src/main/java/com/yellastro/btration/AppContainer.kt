@@ -12,6 +12,7 @@ import com.yellastro.btration.domain.runtime.RoomRuntime
 import com.yellastro.btration.domain.util.IdGenerator
 import com.yellastro.btration.repository.ProfileRepository
 import com.yellastro.btration.repository.RoomRepository
+import com.yellastro.btration.repository.VoiceSettingsRepository
 import com.yellastro.btration.service.RoomServiceController
 import com.yellastro.btration.ui.lobby.LobbyViewModel
 import com.yellastro.btration.ui.profile.ProfileViewModel
@@ -19,6 +20,7 @@ import com.yellastro.btration.ui.room.RoomViewModel
 import com.yellastro.btration.voice.NearbyVoiceTransport
 import com.yellastro.btration.voice.PcmVoiceCapture
 import com.yellastro.btration.voice.PcmVoicePlayer
+import com.yellastro.btration.voice.SwitchableVoiceTransport
 import com.yellastro.btration.voice.UnavailableVoiceTransport
 import com.yellastro.btration.voice.VoiceRuntime
 import com.yellastro.btration.voice.VoiceTransport
@@ -30,7 +32,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.serialization.json.Json
 
 /**
- * Ручной composition root приложения: собирает signaling-транспорт, voice-транспорт, runtime, repository и ViewModel factories.
+ * Ручной composition root приложения: собирает prefs, signaling/voice transport, runtime, repository и ViewModel factories.
  */
 class AppContainer(context: Context) {
     private val applicationContext = context.applicationContext
@@ -41,13 +43,25 @@ class AppContainer(context: Context) {
     }
     private val wireCodec = WireCodec(json)
     private val idGenerator = IdGenerator()
+    private val prefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val nearbyTransport = NearbyTransport(
         context = applicationContext,
         connectionsClient = Nearby.getConnectionsClient(applicationContext),
         wireCodec = wireCodec,
     )
-    private val voiceTransportMode = VoiceTransportMode.WIFI_DIRECT_UDP
-    private val voiceTransport = createVoiceTransport(voiceTransportMode)
+    /**
+     * Репозиторий пользовательских voice-настроек, сохраненных в SharedPreferences.
+     */
+    val voiceSettingsRepository = VoiceSettingsRepository(
+        prefs = prefs,
+    )
+    private val voiceTransportPreference = voiceSettingsRepository.voiceTransportPreference.value
+    private val voiceTransportMode = voiceTransportPreference.transportMode ?: VoiceTransportMode.WIFI_DIRECT_UDP
+    private val voiceTransport = SwitchableVoiceTransport(
+        initialMode = voiceTransportMode,
+        externalScope = applicationScope,
+        createDelegate = ::createVoiceTransport,
+    )
     private val roomServiceController = RoomServiceController(applicationContext)
     private val voiceRuntime = VoiceRuntime(
         voiceTransport = voiceTransport,
@@ -64,7 +78,7 @@ class AppContainer(context: Context) {
      * Репозиторий локального профиля пользователя.
      */
     val profileRepository = ProfileRepository(
-        prefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE),
+        prefs = prefs,
     )
 
     private val roomRuntime = RoomRuntime(
@@ -72,6 +86,7 @@ class AppContainer(context: Context) {
         nearbyTransport = nearbyTransport,
         voiceTransport = voiceTransport,
         voiceRuntime = voiceRuntime,
+        voiceSettingsRepository = voiceSettingsRepository,
         idGenerator = idGenerator,
         externalScope = applicationScope,
     )
@@ -98,16 +113,23 @@ class AppContainer(context: Context) {
      */
     fun lobbyViewModelFactory(): ViewModelProvider.Factory {
         return viewModelFactory(LobbyViewModel::class.java) {
-            LobbyViewModel(roomRepository, profileRepository)
+            LobbyViewModel(
+                roomRepository = roomRepository,
+                profileRepository = profileRepository,
+                voiceSettingsRepository = voiceSettingsRepository,
+            )
         }
     }
 
     /**
-     * Создает factory для RoomViewModel.
+     * Создает factory для RoomViewModel с состоянием комнаты и сохраненными voice-настройками.
      */
     fun roomViewModelFactory(): ViewModelProvider.Factory {
         return viewModelFactory(RoomViewModel::class.java) {
-            RoomViewModel(roomRepository)
+            RoomViewModel(
+                roomRepository = roomRepository,
+                voiceSettingsRepository = voiceSettingsRepository,
+            )
         }
     }
 
@@ -133,7 +155,7 @@ class AppContainer(context: Context) {
     }
 
     /**
-     * Создает текущую реализацию media-plane для голоса; позже сюда придет выбор из настроек.
+     * Создает текущую реализацию media-plane для голоса по режиму, прочитанному из пользовательских настроек.
      */
     private fun createVoiceTransport(mode: VoiceTransportMode): VoiceTransport {
         return when (mode) {

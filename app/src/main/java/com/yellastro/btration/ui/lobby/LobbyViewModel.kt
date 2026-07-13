@@ -7,6 +7,8 @@ import com.yellastro.btration.domain.model.RoomInfo
 import com.yellastro.btration.domain.runtime.RoomRuntimeState
 import com.yellastro.btration.repository.ProfileRepository
 import com.yellastro.btration.repository.RoomRepository
+import com.yellastro.btration.repository.VoiceSettingsRepository
+import com.yellastro.btration.voice.VoiceTransportPreference
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -23,6 +25,7 @@ import kotlinx.coroutines.launch
 class LobbyViewModel(
     private val roomRepository: RoomRepository,
     private val profileRepository: ProfileRepository,
+    private val voiceSettingsRepository: VoiceSettingsRepository,
 ) : ViewModel() {
     private var searchRefreshJob: Job? = null
     private val nameEditorState = MutableStateFlow(initialNameEditorState())
@@ -136,12 +139,31 @@ class LobbyViewModel(
     }
 
     /**
-     * Создает комнату с заданным именем.
+     * Сохраняет выбранный voice transport и создает комнату с заданным именем.
      */
-    fun onCreateRoomClicked(name: String) {
+    fun onCreateRoomClicked(name: String, voiceTransportPreference: VoiceTransportPreference) {
         viewModelScope.launch {
-            roomRepository.createRoom(name)
+            val cleanName = name.trim()
+            if (!voiceSettingsRepository.setVoiceTransportPreference(voiceTransportPreference)) {
+                return@launch
+            }
+            roomRepository.createRoom(cleanName)
+            profileRepository.setLastRoomName(cleanName)
         }
+    }
+
+    /**
+     * Возвращает последнее использованное название комнаты для предзаполнения диалога создания.
+     */
+    fun lastRoomNameForDialog(): String {
+        return profileRepository.getLastRoomName()
+    }
+
+    /**
+     * Возвращает сохраненный voice transport для предзаполнения диалога создания комнаты.
+     */
+    fun voiceTransportPreferenceForDialog(): VoiceTransportPreference {
+        return voiceSettingsRepository.voiceTransportPreference.value
     }
 
     /**

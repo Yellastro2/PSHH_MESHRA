@@ -5,6 +5,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
@@ -16,6 +17,8 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.ImageButton
+import android.widget.ImageView
+import android.widget.PopupMenu
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
@@ -43,7 +46,7 @@ import com.yellastro.btration.ui.room.RoomViewModel
 import kotlinx.coroutines.launch
 
 /**
- * Экран комнаты с connecting-overlay, списком участников, текстовым чатом, PTT-кнопкой и очисткой клавиатуры при уходе.
+ * Экран комнаты с настройками транспорта, direct-аудио статусом, connecting-overlay, чатом, PTT и очисткой клавиатуры.
  */
 class RoomFragment : Fragment() {
     private val viewModel: RoomViewModel by viewModels {
@@ -53,6 +56,7 @@ class RoomFragment : Fragment() {
     private lateinit var tvChannelTitle: TextView
     private lateinit var tvChannelStatus: TextView
     private lateinit var btnBack: ImageButton
+    private lateinit var ivRoomSettings: ImageView
     private lateinit var rvMessages: RecyclerView
     private lateinit var rvMembers: RecyclerView
     private lateinit var tvRoomError: TextView
@@ -84,6 +88,10 @@ class RoomFragment : Fragment() {
      * Фабрика RoomFragment без аргументов: состояние комнаты берется из RoomViewModel.
      */
     companion object {
+        private const val MENU_GROUP_ROOM_SETTINGS = 0
+        private const val MENU_ITEM_VOICE_TRANSPORT = 1
+        private const val MENU_ORDER_VOICE_TRANSPORT = 0
+
         /**
          * Создает экран текущей активной комнаты.
          */
@@ -118,7 +126,7 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Настраивает списки участников, чат, кнопки, PTT-визуализацию и размер кнопки микрофона при IME.
+     * Настраивает списки участников, чат, меню комнаты, PTT-визуализацию и размер кнопки микрофона при IME.
      */
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
@@ -126,6 +134,7 @@ class RoomFragment : Fragment() {
         tvChannelTitle = view.findViewById(R.id.tv_channel_title)
         tvChannelStatus = view.findViewById(R.id.tv_channel_status)
         btnBack = view.findViewById(R.id.btn_back)
+        ivRoomSettings = view.findViewById(R.id.iv_room_settings)
         rvMessages = view.findViewById(R.id.rv_messages)
         rvMembers = view.findViewById(R.id.rv_members)
         tvRoomError = view.findViewById(R.id.tv_room_error)
@@ -160,6 +169,10 @@ class RoomFragment : Fragment() {
 
         btnSend.setOnClickListener {
             viewModel.onSendClicked()
+        }
+
+        ivRoomSettings.setOnClickListener {
+            showRoomSettingsMenu()
         }
 
         etMessage.setOnEditorActionListener { _, actionId, _ ->
@@ -271,6 +284,28 @@ class RoomFragment : Fragment() {
     }
 
     /**
+     * Показывает выпадающее меню настроек комнаты с read-only текущим voice transport.
+     */
+    private fun showRoomSettingsMenu() {
+        val popupMenu = PopupMenu(requireContext(), ivRoomSettings)
+        val voiceTransportItem = popupMenu.menu.add(
+            MENU_GROUP_ROOM_SETTINGS,
+            MENU_ITEM_VOICE_TRANSPORT,
+            MENU_ORDER_VOICE_TRANSPORT,
+            "транспорт голоса: ${latestState.roomVoiceTransportPreference.shortName}",
+        )
+        voiceTransportItem.isEnabled = false
+        popupMenu.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                MENU_ITEM_VOICE_TRANSPORT -> true
+
+                else -> false
+            }
+        }
+        popupMenu.show()
+    }
+
+    /**
      * Скрывает клавиатуру при уходе с экрана комнаты, чтобы IME не оставалась поверх следующего экрана.
      */
     override fun onPause() {
@@ -313,7 +348,7 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Отрисовывает connecting-overlay, участников, чат, ошибку, PTT-состояние и закрытие комнаты.
+     * Отрисовывает connecting-overlay, direct-аудио предупреждение, участников, чат, PTT-состояние и закрытие комнаты.
      */
     private fun renderState(state: RoomUiState) {
         latestState = state
@@ -321,9 +356,10 @@ class RoomFragment : Fragment() {
         renderConnectingState(state)
         btnSend.isEnabled = state.canSend && !state.isConnecting
         btnSend.alpha = if (btnSend.isEnabled) 1.0f else 0.45f
-        tvRoomError.text = state.errorMessage.orEmpty()
-        tvRoomError.visibility = if (state.errorMessage.isNullOrBlank()) View.GONE else View.VISIBLE
-        showSnackbarIfNeeded(state.errorMessage)
+        val visibleProblem = state.errorMessage ?: state.directAudioIssueMessage
+        tvRoomError.text = visibleProblem.orEmpty()
+        tvRoomError.visibility = if (visibleProblem.isNullOrBlank()) View.GONE else View.VISIBLE
+        showSnackbarIfNeeded(visibleProblem)
         showErrorActionIfNeeded(state.errorAction)
         if (etMessage.text.toString() != state.inputText) {
             etMessage.setText(state.inputText)
@@ -368,16 +404,33 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Показывает ожидание Nearby join и блокирует интерактивное содержимое комнаты, сохраняя кнопку назад доступной.
+     * Показывает ожидание Nearby join, direct-аудио статус и блокирует интерактивное содержимое при подключении.
      */
     private fun renderConnectingState(state: RoomUiState) {
         layoutConnectingOverlay.visibility = if (state.isConnecting) View.VISIBLE else View.GONE
-        tvChannelStatus.text = if (state.isConnecting) "ПОДКЛЮЧЕНИЕ…" else "В ЭФИРЕ • ШИФРОВАНИЕ"
+        tvChannelStatus.text = when {
+            state.isConnecting -> "ПОДКЛЮЧЕНИЕ…"
+            state.directAudioStatusText.isNotBlank() -> state.directAudioStatusText
+            else -> "В ЭФИРЕ • ШИФРОВАНИЕ"
+        }
+        tvChannelStatus.setTextColor(channelStatusColor(state))
         etMessage.isEnabled = !state.isConnecting
         btnPushToTalk.isEnabled = !state.isConnecting && state.canTalk
         layoutChatInput.alpha = if (state.isConnecting) 0.45f else 1f
         rvMembers.isEnabled = !state.isConnecting
         rvMessages.isEnabled = !state.isConnecting
+    }
+
+    /**
+     * Подбирает цвет статуса комнаты так, чтобы ошибка direct-аудио была видна прямо в шапке.
+     */
+    private fun channelStatusColor(state: RoomUiState): Int {
+        return when {
+            state.isConnecting -> Color.parseColor("#94A3B8")
+            state.directAudioIssueMessage != null -> ContextCompat.getColor(requireContext(), android.R.color.holo_red_light)
+            state.directAudioStatusText.isNotBlank() -> ContextCompat.getColor(requireContext(), R.color.second_accent_green)
+            else -> ContextCompat.getColor(requireContext(), R.color.second_accent_green)
+        }
     }
 
     /**

@@ -34,8 +34,10 @@ ViewModel-слой готовит состояние для XML-фрагмент
 
 - `onStartSearchClicked()`;
 - `onStopSearchClicked()`;
-- `onCreateRoomClicked(name)`;
+- `onCreateRoomClicked(name, voiceTransportPreference)`;
 - `onJoinRoomClicked(roomId)`.
+
+Диалог создания комнаты передает в `LobbyViewModel` имя комнаты и выбранный voice transport; ViewModel сохраняет transport в prefs до вызова `RoomRepository.createRoom(...)`, чтобы host runtime положил этот режим в meta комнаты.
 
 ## RoomViewModel
 
@@ -55,3 +57,4 @@ ViewModel-слой готовит состояние для XML-фрагмент
 - `onCloseRoomClicked()`.
 
 `RoomViewModel` получает локальный `PeerId` через `RoomRepository.getSelfPeerId()`, чтобы вычислять `MemberUi.isSelf` и `ChatMessageUi.isOwn`.
+Выбранный transport активной комнаты отображается на экране комнаты как read-only пункт меню; после старта комнаты он не меняется из этого меню.

@@ -2,4 +2,7 @@
 <resources>
     <dimen name="micro_size_big">125dp</dimen>
     <dimen name="micro_size_small">64dp</dimen>
+    <dimen name="dialog_content_padding_horizontal">24dp</dimen>
+    <dimen name="dialog_content_padding_top">12dp</dimen>
+    <dimen name="dialog_field_top_margin">8dp</dimen>
 </resources>

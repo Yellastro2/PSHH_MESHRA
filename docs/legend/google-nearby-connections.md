@@ -10,8 +10,9 @@
 ## Практический контракт проекта
 
 - Advertising публикует комнату через `endpointName`.
-- В `endpointName` кладётся компактная визитка `NearbyRoomAdvertisement` формата `BTR3`, чтобы discovery мог показать комнату без подключения.
-- Визитка `BTR3` содержит только `sessionId`, `createdAtMillis`, короткий след host-а, `roomName` и `hostName`. Полные `roomId` и `hostPeerId` не кладутся в `endpointName`, потому что лимит Nearby маленький и название комнаты важнее.
+- В `endpointName` кладётся компактная визитка `NearbyRoomAdvertisement` формата `BTR4`, чтобы discovery мог показать комнату без подключения.
+- Визитка `BTR4` содержит `sessionId`, `createdAtMillis`, короткий след host-а, token voice transport, `roomName` и `hostName`. Полные `roomId` и `hostPeerId` не кладутся в `endpointName`, потому что лимит Nearby маленький и название комнаты важнее.
+- Старый формат `BTR3` продолжает декодироваться как legacy-визитка без token voice transport; для него используется default `WIFI_DIRECT_UDP`.
 - До `JOIN_ACCEPTED` listener использует временные `RoomId`/`PeerId` из визитки. После подключения host присылает настоящий `RoomInfo`, и runtime заменяет временные идентификаторы реальными.
 - Nearby endpointId не считается доменным идентификатором участника. Для этого есть `NearbyEndpointRegistry`, который связывает `endpointId` с `PeerId` и `RoomId`.
 - `endpointId -> PeerId` описывает только прямого физического Nearby-соседа. Автор `CHAT_MESSAGE` или другого relayed-пакета не должен перезаписывать эту связь.

@@ -45,10 +45,11 @@ class NearbyVoiceTransport(
     }
 
     /**
-     * Отмечает старт Nearby voice-сессии; реальная Nearby-сессия уже управляется комнатой.
+     * Отмечает старт Nearby voice-сессии и сразу сообщает готовность, потому что signaling endpoint уже установлен.
      */
     override fun startSession(selfPeerId: PeerId, role: VoiceTransportSessionRole) {
         Log.i(TAG, "[startSession] Nearby voice transport готов role=$role selfPeerId=${selfPeerId.value}")
+        emitEvent(VoiceTransportEvent.DirectAudioReady)
     }
 
     /**

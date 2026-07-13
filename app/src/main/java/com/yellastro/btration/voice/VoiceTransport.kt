@@ -3,10 +3,12 @@ package com.yellastro.btration.voice
 import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.VoiceTransportControlInfo
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.serialization.Serializable
 
 /**
  * Режим media-plane для голоса, который позже можно привязать к пользовательской настройке.
  */
+@Serializable
 enum class VoiceTransportMode {
     NEARBY_BYTES,
     WIFI_DIRECT_UDP,

@@ -6,7 +6,7 @@ import com.yellastro.btration.domain.model.PeerId
 import java.util.UUID
 
 /**
- * Хранит локальный профиль участника: стабильный peerId и отображаемое имя.
+ * Хранит локальный профиль участника, последнее имя комнаты, стабильный peerId и отображаемое имя.
  */
 class ProfileRepository(
     private val prefs: SharedPreferences,
@@ -40,6 +40,20 @@ class ProfileRepository(
     }
 
     /**
+     * Возвращает последнее использованное название комнаты для предзаполнения диалога создания.
+     */
+    fun getLastRoomName(): String {
+        return prefs.getString(KEY_LAST_ROOM_NAME, null)?.takeIf { it.isNotBlank() }.orEmpty()
+    }
+
+    /**
+     * Сохраняет последнее использованное название комнаты.
+     */
+    fun setLastRoomName(name: String) {
+        prefs.edit().putString(KEY_LAST_ROOM_NAME, name.trim()).apply()
+    }
+
+    /**
      * Возвращает полное описание локального участника для runtime и wire-пакетов.
      */
     fun getSelfPeer(): Peer {
@@ -52,6 +66,7 @@ class ProfileRepository(
     private companion object {
         private const val KEY_PEER_ID = "peer_id"
         private const val KEY_PEER_NAME = "self_name"
+        private const val KEY_LAST_ROOM_NAME = "last_room_name"
         private const val DEFAULT_PEER_NAME = "Гость"
     }
 }
