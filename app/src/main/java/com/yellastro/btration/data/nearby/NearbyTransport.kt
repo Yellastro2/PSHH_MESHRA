@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.core.location.LocationManagerCompat
@@ -38,7 +40,8 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 
 /**
- * Тонкая обертка над Nearby Connections с короткой рекламой комнат, прямыми endpoint-ами, cleanup, payload, Opus voice frames и legacy voice stream.
+ * Тонкая обертка над Nearby Connections с короткой рекламой комнат, прямыми endpoint-ами, cleanup, payload,
+ * Opus voice frames, legacy voice stream и тихим retry transient permission-race после runtime permissions.
  */
 class NearbyTransport(
     private val context: Context,
@@ -50,6 +53,9 @@ class NearbyTransport(
     private val endpointRegistry = NearbyEndpointRegistry()
     private val connectedEndpointIds = ConcurrentHashMap.newKeySet<String>()
     private val _events = MutableSharedFlow<NearbyEvent>(extraBufferCapacity = EVENT_BUFFER_CAPACITY)
+    private val retryHandler = Handler(Looper.getMainLooper())
+    private var discoveryRetryRunnable: Runnable? = null
+    private var advertisingRetryRunnable: Runnable? = null
 
     /**
      * Поток событий Nearby-слоя для RoomRuntime.
@@ -227,6 +233,14 @@ class NearbyTransport(
      * Запускает поиск Nearby endpoint-ов с текущим serviceId.
      */
     fun startDiscovery() {
+        cancelDiscoveryPermissionRetry()
+        startDiscoveryInternal(permissionRetryAttempt = 0)
+    }
+
+    /**
+     * Запускает discovery и тихо ретраит краткий permission-race внутри Nearby API.
+     */
+    private fun startDiscoveryInternal(permissionRetryAttempt: Int) {
         Log.i(TAG, "[startDiscovery] Запускаем discovery serviceId=$serviceId strategy=$strategy")
         val missingPermissions = missingPermissionsForDiscovery()
         if (missingPermissions.isNotEmpty()) {
@@ -251,9 +265,19 @@ class NearbyTransport(
             .build()
         connectionsClient.startDiscovery(serviceId, endpointDiscoveryCallback, options)
             .addOnSuccessListener {
+                cancelDiscoveryPermissionRetry()
                 Log.i(TAG, "[startDiscovery] Nearby discovery запущен")
             }
             .addOnFailureListener { cause ->
+                if (shouldRetryTransientPermissionFailure(
+                        cause = cause,
+                        permissionRetryAttempt = permissionRetryAttempt,
+                        missingPermissionsProvider = ::missingPermissionsForDiscovery,
+                    )
+                ) {
+                    scheduleDiscoveryPermissionRetry(permissionRetryAttempt + 1, cause)
+                    return@addOnFailureListener
+                }
                 Log.w(TAG, "[startDiscovery] Nearby не запустил discovery: ${cause.message}", cause)
                 emitEvent(NearbyEvent.DiscoveryFailed(cause))
             }
@@ -264,6 +288,7 @@ class NearbyTransport(
      */
     fun stopDiscovery() {
         Log.i(TAG, "[stopDiscovery] Останавливаем discovery")
+        cancelDiscoveryPermissionRetry()
         connectionsClient.stopDiscovery()
     }
 
@@ -271,11 +296,21 @@ class NearbyTransport(
      * Запускает advertising комнаты через короткую endpointName-визитку после сброса старой рекламы и endpoint-ов.
      */
     fun startAdvertising(room: RoomInfo) {
+        cancelAdvertisingPermissionRetry()
+        startAdvertisingInternal(room, permissionRetryAttempt = 0, resetEndpoints = true)
+    }
+
+    /**
+     * Запускает advertising и тихо ретраит краткий permission-race внутри Nearby API.
+     */
+    private fun startAdvertisingInternal(room: RoomInfo, permissionRetryAttempt: Int, resetEndpoints: Boolean) {
         Log.i(
             TAG,
             "[startAdvertising] Запускаем advertising roomId=${room.roomId.value} roomName=${room.name} hostPeerId=${room.host.peerId.value} serviceId=$serviceId strategy=$strategy",
         )
-        stopAllEndpointsAndClearState(reason = "prepare_start_advertising")
+        if (resetEndpoints) {
+            stopAllEndpointsAndClearState(reason = "prepare_start_advertising")
+        }
         val missingPermissions = missingPermissionsForAdvertising()
         if (missingPermissions.isNotEmpty()) {
             Log.w(TAG, "[startAdvertising] Advertising не стартует, нет permissions: ${missingPermissions.joinToString()}")
@@ -304,9 +339,19 @@ class NearbyTransport(
             .build()
         connectionsClient.startAdvertising(endpointName, serviceId, connectionLifecycleCallback, options)
             .addOnSuccessListener {
+                cancelAdvertisingPermissionRetry()
                 Log.i(TAG, "[startAdvertising] Nearby advertising запущен roomId=${room.roomId.value}")
             }
             .addOnFailureListener { cause ->
+                if (shouldRetryTransientPermissionFailure(
+                        cause = cause,
+                        permissionRetryAttempt = permissionRetryAttempt,
+                        missingPermissionsProvider = ::missingPermissionsForAdvertising,
+                    )
+                ) {
+                    scheduleAdvertisingPermissionRetry(room, permissionRetryAttempt + 1, cause)
+                    return@addOnFailureListener
+                }
                 Log.w(TAG, "[startAdvertising] Nearby не запустил advertising roomId=${room.roomId.value}: ${cause.message}", cause)
                 emitEvent(NearbyEvent.AdvertisingFailed(cause))
             }
@@ -317,6 +362,7 @@ class NearbyTransport(
      */
     fun stopAdvertising() {
         Log.i(TAG, "[stopAdvertising] Останавливаем advertising")
+        cancelAdvertisingPermissionRetry()
         connectionsClient.stopAdvertising()
     }
 
@@ -325,6 +371,8 @@ class NearbyTransport(
      */
     fun stopAllEndpointsAndClearState(reason: String) {
         Log.i(TAG, "[stopAllEndpointsAndClearState] Полностью сбрасываем Nearby reason=$reason")
+        cancelDiscoveryPermissionRetry()
+        cancelAdvertisingPermissionRetry()
         connectionsClient.stopDiscovery()
         connectionsClient.stopAdvertising()
         connectionsClient.stopAllEndpoints()
@@ -515,6 +563,89 @@ class NearbyTransport(
                 )
                 emitEvent(NearbyEvent.VoiceFrameSendFailed(peerIds, cause))
             }
+    }
+
+    /**
+     * Проверяет transient permission-race: app уже видит permissions, а Nearby API еще отвечает MISSING_PERMISSION.
+     */
+    private fun shouldRetryTransientPermissionFailure(
+        cause: Throwable,
+        permissionRetryAttempt: Int,
+        missingPermissionsProvider: () -> List<String>,
+    ): Boolean {
+        if (!isNearbyMissingPermissionFailure(cause)) {
+            return false
+        }
+        if (permissionRetryAttempt >= TRANSIENT_PERMISSION_RETRY_DELAYS_MILLIS.size) {
+            return false
+        }
+        val missingPermissions = missingPermissionsProvider()
+        if (missingPermissions.isNotEmpty()) {
+            Log.w(TAG, "[shouldRetryTransientPermissionFailure] Nearby permission ошибка не transient: реально нет permissions ${missingPermissions.joinToString()}")
+            return false
+        }
+        return true
+    }
+
+    /**
+     * Распознает permission-ошибку Google Nearby, которая иногда приходит сразу после выдачи runtime permissions.
+     */
+    private fun isNearbyMissingPermissionFailure(cause: Throwable): Boolean {
+        val apiException = cause as? ApiException ?: return false
+        return apiException.statusCode == TRANSIENT_MISSING_PERMISSION_STATUS_CODE ||
+            apiException.message?.contains(TRANSIENT_MISSING_PERMISSION_MARKER, ignoreCase = true) == true
+    }
+
+    /**
+     * Планирует повторный discovery после краткой задержки, не отправляя ошибку в UI до исчерпания попыток.
+     */
+    private fun scheduleDiscoveryPermissionRetry(nextAttempt: Int, cause: Throwable) {
+        cancelDiscoveryPermissionRetry()
+        val delayMillis = TRANSIENT_PERMISSION_RETRY_DELAYS_MILLIS[nextAttempt - 1]
+        Log.w(
+            TAG,
+            "[scheduleDiscoveryPermissionRetry] Nearby discovery вернул transient permission race, повторяем attempt=$nextAttempt delayMs=$delayMillis message=${cause.message}",
+        )
+        val retryRunnable = Runnable {
+            discoveryRetryRunnable = null
+            startDiscoveryInternal(permissionRetryAttempt = nextAttempt)
+        }
+        discoveryRetryRunnable = retryRunnable
+        retryHandler.postDelayed(retryRunnable, delayMillis)
+    }
+
+    /**
+     * Планирует повторный advertising после краткой задержки, не отправляя ошибку в UI до исчерпания попыток.
+     */
+    private fun scheduleAdvertisingPermissionRetry(room: RoomInfo, nextAttempt: Int, cause: Throwable) {
+        cancelAdvertisingPermissionRetry()
+        val delayMillis = TRANSIENT_PERMISSION_RETRY_DELAYS_MILLIS[nextAttempt - 1]
+        Log.w(
+            TAG,
+            "[scheduleAdvertisingPermissionRetry] Nearby advertising вернул transient permission race, повторяем roomId=${room.roomId.value} attempt=$nextAttempt delayMs=$delayMillis message=${cause.message}",
+        )
+        val retryRunnable = Runnable {
+            advertisingRetryRunnable = null
+            startAdvertisingInternal(room, permissionRetryAttempt = nextAttempt, resetEndpoints = false)
+        }
+        advertisingRetryRunnable = retryRunnable
+        retryHandler.postDelayed(retryRunnable, delayMillis)
+    }
+
+    /**
+     * Отменяет отложенный retry discovery, если пользователь остановил поиск или transport сбрасывается.
+     */
+    private fun cancelDiscoveryPermissionRetry() {
+        discoveryRetryRunnable?.let { retryHandler.removeCallbacks(it) }
+        discoveryRetryRunnable = null
+    }
+
+    /**
+     * Отменяет отложенный retry advertising, если пользователь остановил комнату или transport сбрасывается.
+     */
+    private fun cancelAdvertisingPermissionRetry() {
+        advertisingRetryRunnable?.let { retryHandler.removeCallbacks(it) }
+        advertisingRetryRunnable = null
     }
 
     /**
@@ -788,6 +919,9 @@ class NearbyTransport(
         private const val EVENT_BUFFER_CAPACITY = 64
         private const val STREAM_READ_LIMIT_BYTES = 320
         private const val FIRST_VOICE_FRAME_SEQUENCE = 0L
+        private const val TRANSIENT_MISSING_PERMISSION_STATUS_CODE = 8034
+        private const val TRANSIENT_MISSING_PERMISSION_MARKER = "MISSING_PERMISSION"
+        private val TRANSIENT_PERMISSION_RETRY_DELAYS_MILLIS = longArrayOf(400L, 900L, 1_600L)
         private val REAL_HOST_ID_PACKET_TYPES = setOf(
             WirePacketType.JOIN_ACCEPTED,
             WirePacketType.JOIN_REJECTED,

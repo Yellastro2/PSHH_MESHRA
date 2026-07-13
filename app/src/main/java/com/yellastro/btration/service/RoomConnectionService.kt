@@ -277,13 +277,13 @@ class RoomConnectionService : Service() {
      */
     private fun buildForegroundNotification(state: RoomRuntimeState): Notification {
         val title = when (state) {
-            is RoomRuntimeState.Hosting -> "BtRation: комната запущена"
-            is RoomRuntimeState.Client -> "BtRation: вы в комнате"
-            is RoomRuntimeState.Joining -> "BtRation: подключение к комнате"
-            RoomRuntimeState.Searching -> "BtRation: поиск комнат"
+            is RoomRuntimeState.Hosting -> "$APP_DISPLAY_NAME: комната запущена"
+            is RoomRuntimeState.Client -> "$APP_DISPLAY_NAME: вы в комнате"
+            is RoomRuntimeState.Joining -> "$APP_DISPLAY_NAME: подключение к комнате"
+            RoomRuntimeState.Searching -> "$APP_DISPLAY_NAME: поиск комнат"
             RoomRuntimeState.Idle,
             is RoomRuntimeState.Error,
-            -> "BtRation"
+            -> APP_DISPLAY_NAME
         }
         val text = when (state) {
             is RoomRuntimeState.Hosting -> "Хостим ${state.room.name}"
@@ -321,14 +321,14 @@ class RoomConnectionService : Service() {
             "Активная комната",
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = "Постоянное уведомление о поиске или активной комнате BtRation"
+            description = "Постоянное уведомление о поиске или активной комнате PSHH MESHRA"
         }
         val messageChannel = NotificationChannel(
             MESSAGE_CHANNEL_ID,
             "Сообщения комнаты",
             NotificationManager.IMPORTANCE_DEFAULT,
         ).apply {
-            description = "Уведомления о новых сообщениях, когда BtRation не на экране"
+            description = "Уведомления о новых сообщениях, когда PSHH MESHRA не на экране"
         }
         getSystemService(NotificationManager::class.java).createNotificationChannels(
             listOf(foregroundChannel, messageChannel),
@@ -375,6 +375,7 @@ class RoomConnectionService : Service() {
      */
     companion object {
         private const val TAG = "RoomConnectionService"
+        private const val APP_DISPLAY_NAME = "PSHH MESHRA"
         private const val ACTION_START = "com.yellastro.btration.service.START_ROOM_CONNECTION"
         private const val ACTION_STOP = "com.yellastro.btration.service.STOP_ROOM_CONNECTION"
         private const val ACTION_DISCONNECT = "com.yellastro.btration.service.DISCONNECT_ROOM_CONNECTION"

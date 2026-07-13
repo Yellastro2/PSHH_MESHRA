@@ -33,6 +33,7 @@
 - Client принимает voice frame только от host endpoint-а и только если `originPeerId` есть в списке участников.
 - Ошибка отправки отдельного voice frame логируется, но не переводит комнату в Error: голос может потерять фрейм, а чат и сессия должны жить дальше.
 - Если Nearby API возвращает `ApiException` при discovery/advertising/connect/accept, `RoomRuntime` переводит состояние в Error и отправляет snackbar `Nearby Connections не поддерживается или недоступен на этом устройстве`.
+- Исключение: transient `8034: MISSING_PERMISSION...` сразу после выдачи runtime permissions. Если локальный precheck уже видит нужные permissions, `NearbyTransport` делает несколько тихих retry discovery/advertising и не отправляет ошибку в UI до исчерпания попыток.
 
 ## STREAM payload для старого MVP-голоса
 

@@ -314,7 +314,7 @@ class LobbyFragment : Fragment() {
     private fun showLocationSettingsDialog() {
         AlertDialog.Builder(requireContext())
             .setTitle("Геолокация выключена")
-            .setMessage("Для поиска Nearby-комнат нужно включить геолокацию устройства. BtRation не читает GPS-координаты.")
+            .setMessage("Для поиска Nearby-комнат нужно включить геолокацию устройства. PSHH MESHRA не читает GPS-координаты.")
             .setPositiveButton("Включить") { _, _ ->
                 startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
             }

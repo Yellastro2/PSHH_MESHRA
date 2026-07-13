@@ -39,7 +39,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
- * Рабочая машина комнаты: ведет discovery, Nearby-сессии, выбор voice transport, чат, PTT, relay и статус direct-аудио.
+ * Рабочая машина комнаты: ведет discovery, Nearby-сессии, выбор voice transport, чат, PTT, relay и статус голосового media-plane.
  */
 class RoomRuntime(
     private val profileRepository: ProfileRepository,
@@ -361,7 +361,7 @@ class RoomRuntime(
     }
 
     /**
-     * Начинает передачу готовым адресатам и фиксирует UI-статус, если прямой аудиоканал не установлен.
+     * Начинает передачу готовым адресатам и фиксирует UI-статус, если выбранный voice transport не установлен.
      */
     suspend fun startTalking(): Boolean {
         Log.i(TAG, "[startTalking] Команда начать передачу голоса currentState=${_state.value.javaClass.simpleName}")
@@ -376,9 +376,10 @@ class RoomRuntime(
                     voiceTransport.isReadyForPeers(setOf(peerId))
                 }
                 if (readyPeerIds.isEmpty()) {
-                    Log.w(TAG, "[startTalking] Нет участников с готовым прямым аудиоканалом targetCount=${targetPeerIds.size}")
-                    markDirectAudioUnavailable(DIRECT_AUDIO_UNAVAILABLE_MESSAGE)
-                    emitNotice(DIRECT_AUDIO_UNAVAILABLE_MESSAGE)
+                    val message = voiceTransportUnavailableMessage(currentState.room)
+                    Log.w(TAG, "[startTalking] Нет участников с готовым voice transport targetCount=${targetPeerIds.size} mode=${currentState.room.voiceTransportMode}")
+                    markDirectAudioUnavailable(message)
+                    emitNotice(message)
                     return false
                 }
                 val skippedPeerCount = targetPeerIds.size - readyPeerIds.size
@@ -395,9 +396,10 @@ class RoomRuntime(
             is RoomRuntimeState.Client -> {
                 val targetPeerIds = setOf(currentState.room.host.peerId)
                 if (!voiceTransport.isReadyForPeers(targetPeerIds)) {
-                    Log.w(TAG, "[startTalking] Прямой аудиоканал с хостом еще не установлен")
-                    markDirectAudioUnavailable(DIRECT_AUDIO_UNAVAILABLE_MESSAGE)
-                    emitNotice(DIRECT_AUDIO_UNAVAILABLE_MESSAGE)
+                    val message = voiceTransportUnavailableMessage(currentState.room)
+                    Log.w(TAG, "[startTalking] Voice transport с хостом еще не установлен mode=${currentState.room.voiceTransportMode}")
+                    markDirectAudioUnavailable(message)
+                    emitNotice(message)
                     return false
                 }
                 if (voiceRuntime.startTalking(selfPeerId, targetPeerIds)) {
@@ -506,13 +508,13 @@ class RoomRuntime(
     }
 
     /**
-     * Помечает активную комнату готовой к Wi-Fi Direct аудио и рассылает обновленный RoomInfo с host-а.
+     * Помечает активную комнату готовой к выбранному voice transport и рассылает обновленный RoomInfo с host-а.
      */
     private fun handleDirectAudioReady() {
         when (val currentState = _state.value) {
             is RoomRuntimeState.Hosting -> {
                 if (currentState.room.isDirectAudioReady && currentState.directAudioStatus == DirectAudioStatus.Ready) {
-                    Log.i(TAG, "[handleDirectAudioReady] Direct-аудио уже помечено готовым roomId=${currentState.room.roomId.value}")
+                    Log.i(TAG, "[handleDirectAudioReady] Voice transport уже помечен готовым roomId=${currentState.room.roomId.value} mode=${currentState.room.voiceTransportMode}")
                     return
                 }
                 val updatedRoom = currentState.room.copy(isDirectAudioReady = true)
@@ -520,8 +522,8 @@ class RoomRuntime(
                     room = updatedRoom,
                     directAudioStatus = DirectAudioStatus.Ready,
                 )
-                emitNotice("Wi-Fi Direct аудио готово")
-                Log.i(TAG, "[handleDirectAudioReady] Host-комната готова к direct-аудио roomId=${updatedRoom.roomId.value} memberCount=${currentState.members.size}")
+                emitNotice(voiceTransportReadyMessage(updatedRoom))
+                Log.i(TAG, "[handleDirectAudioReady] Host-комната готова к voice transport roomId=${updatedRoom.roomId.value} mode=${updatedRoom.voiceTransportMode} memberCount=${currentState.members.size}")
                 broadcastMemberList(updatedRoom, currentState.members)
                 voiceTransport.localControlInfo?.let { info ->
                     sendVoiceTransportInfoToMembers(updatedRoom, currentState.members, info)
@@ -530,15 +532,39 @@ class RoomRuntime(
 
             is RoomRuntimeState.Client -> {
                 _state.value = currentState.copy(directAudioStatus = DirectAudioStatus.Ready)
-                emitNotice("Wi-Fi Direct аудио готово")
-                Log.i(TAG, "[handleDirectAudioReady] Client media-plane сообщил готовность roomId=${currentState.room.roomId.value}")
+                emitNotice(voiceTransportReadyMessage(currentState.room))
+                Log.i(TAG, "[handleDirectAudioReady] Client media-plane сообщил готовность roomId=${currentState.room.roomId.value} mode=${currentState.room.voiceTransportMode}")
             }
 
             RoomRuntimeState.Idle,
             RoomRuntimeState.Searching,
             is RoomRuntimeState.Joining,
             is RoomRuntimeState.Error,
-            -> Log.i(TAG, "[handleDirectAudioReady] Direct-аудио готово вне активной host-комнаты currentState=${currentState.javaClass.simpleName}")
+            -> Log.i(TAG, "[handleDirectAudioReady] Voice transport готов вне активной комнаты currentState=${currentState.javaClass.simpleName}")
+        }
+    }
+
+    /**
+     * Формирует snackbar о готовности выбранного транспорта комнаты.
+     */
+    private fun voiceTransportReadyMessage(room: RoomInfo): String {
+        return "${voiceTransportDisplayName(room.voiceTransportMode)} аудио готово"
+    }
+
+    /**
+     * Формирует snackbar о недоступности выбранного транспорта комнаты.
+     */
+    private fun voiceTransportUnavailableMessage(room: RoomInfo): String {
+        return "${voiceTransportDisplayName(room.voiceTransportMode)} аудиоканал не установлен"
+    }
+
+    /**
+     * Возвращает короткое пользовательское имя media-plane режима комнаты.
+     */
+    private fun voiceTransportDisplayName(mode: VoiceTransportMode): String {
+        return when (mode) {
+            VoiceTransportMode.NEARBY_BYTES -> "Nearby"
+            VoiceTransportMode.WIFI_DIRECT_UDP -> "Direct"
         }
     }
 

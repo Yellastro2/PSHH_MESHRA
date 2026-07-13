@@ -5,7 +5,7 @@
 `RoomRuntime` — обычный Kotlin-класс, который управляет текущей комнатой поверх signaling-транспорта `NearbyTransport` и переключаемого голосового `VoiceTransport`.
 
 Он не является Android Service, ViewModel или Repository. Его задача — слушать события транспорта, принимать protocol-решения и отдавать состояние выше через `StateFlow`.
-Статус прямого аудиоканала также идет через `RoomRuntimeState`, чтобы UI видел не только одноразовый snackbar, но и устойчивое состояние `Connecting` / `Ready` / `Unavailable`.
+Статус голосового media-plane также идет через `RoomRuntimeState`, чтобы UI видел не только одноразовый snackbar, но и устойчивое состояние `Connecting` / `Ready` / `Unavailable`.
 Переключаемый voice transport создает конкретный media-plane delegate лениво, только после выбора режима комнаты. Это важно для Nearby-комнат: Wi-Fi Direct не должен регистрировать callbacks, чистить группы или трогать системный P2P-слой, если host выбрал `NEARBY_BYTES`.
 
 ## Файлы
@@ -46,7 +46,7 @@ Host:
 - останавливает discovery;
 - запускает advertising;
 - рассылает host `VOICE_TRANSPORT_INFO` для запуска handshake независимо от флага готовности;
-- по `VoiceTransportEvent.DirectAudioReady` после handshake помечает комнату готовой к direct-аудио и рассылает обновленный `RoomInfo`;
+- по `VoiceTransportEvent.DirectAudioReady` после handshake помечает комнату готовой к выбранному voice transport, показывает snackbar с актуальным режимом (`Direct`/`Nearby`) и рассылает обновленный `RoomInfo`;
 - по `VoiceTransportEvent.TransportUnavailable` сохраняет `DirectAudioStatus.Unavailable`, но не закрывает комнату и не затирает уже готовый direct-аудиоканал;
 - принимает `JOIN_REQUEST`;
 - добавляет участника в `members`;
@@ -72,7 +72,7 @@ Client:
 - на экране комнаты видит выбранный host-ом voice transport как read-only пункт меню настроек; host видит такой же read-only пункт, потому что активный transport комнаты после старта не переключается;
 - получает host `VOICE_TRANSPORT_INFO` сразу после входа и запускает direct-audio handshake;
 - по `MEMBER_LIST` обновляет участников;
-- по `VoiceTransportEvent.TransportUnavailable` получает `DirectAudioStatus.Unavailable`, который ViewModel показывает как состояние прямого канала;
+- по `VoiceTransportEvent.TransportUnavailable` получает `DirectAudioStatus.Unavailable`, который ViewModel показывает как состояние выбранного голосового транспорта;
 - свои сообщения добавляет локально и отправляет host-у;
 - сообщения от host-а добавляет в чат;
 - по `ROOM_CLOSED` сбрасывает сессию в `Idle`.
@@ -83,6 +83,7 @@ Client:
 
 - `STATUS_ENDPOINT_UNKNOWN` считается recoverable stale endpoint: runtime удаляет комнату из `availableRooms`, запускает clean discovery и при повторном `EndpointFound` автоматически повторяет connection.
 - Если client внезапно теряет host-а не через `ROOM_CLOSED`, runtime не сбрасывает комнату в `Idle`, а переходит в `Joining` по сохраненной advertised-комнате и пробует переподключиться.
+- Если Nearby API сразу после runtime-permission grant возвращает transient `MISSING_PERMISSION` при discovery/advertising, `NearbyTransport` тихо делает короткий retry и отдает ошибку в `RoomRuntime` только после исчерпания попыток.
 
 ## PTT-индикация
 

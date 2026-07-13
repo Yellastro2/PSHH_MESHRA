@@ -16,7 +16,7 @@
 
 `BtRationApplication.onCreate()` создает `AppContainer`.
 
-Перед контейнером приложение регистрирует `AppVisibilityTracker`, чтобы сервис мог понять, находится ли BtRation сейчас на экране пользователя.
+Перед контейнером приложение регистрирует `AppVisibilityTracker`, чтобы сервис мог понять, находится ли PSHH MESHRA сейчас на экране пользователя.
 
 `AppContainer` собирает:
 

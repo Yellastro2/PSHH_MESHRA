@@ -19,6 +19,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "BtRation"
+rootProject.name = "MESHRA"
 include(":app")
  

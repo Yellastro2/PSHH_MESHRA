@@ -470,7 +470,7 @@ class RoomFragment : Fragment() {
     private fun showLocationSettingsDialog() {
         AlertDialog.Builder(requireContext())
             .setTitle("Геолокация выключена")
-            .setMessage("Для работы Nearby-комнаты нужно включить геолокацию устройства. BtRation не читает GPS-координаты.")
+            .setMessage("Для работы Nearby-комнаты нужно включить геолокацию устройства. PSHH MESHRA не читает GPS-координаты.")
             .setPositiveButton("Включить") { _, _ ->
                 startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
             }

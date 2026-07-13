@@ -21,7 +21,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /**
- * ViewModel комнаты: собирает runtime, voice-настройки, direct-аудио статус, участников, чат и команды UI.
+ * ViewModel комнаты: собирает runtime, voice-настройки, статус выбранного media-plane, участников, чат и команды UI.
  */
 class RoomViewModel(
     private val roomRepository: RoomRepository,
@@ -167,53 +167,62 @@ class RoomViewModel(
             directAudioStatus !is DirectAudioStatus.Unavailable
 
         return when (runtimeState) {
-            is RoomRuntimeState.Hosting -> RoomUiState(
-                roomName = runtimeState.room.name,
-                isHost = true,
-                members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, talking) },
-                messages = messages.map { mapMessage(it, selfPeerId) },
-                inputText = input,
-                canSend = canSend,
-                canTalk = canTalk,
-                isTalking = talking,
-                isClosed = false,
-                voiceTransportPreference = voiceTransportPreference,
-                roomVoiceTransportPreference = VoiceTransportPreference.fromTransportMode(runtimeState.room.voiceTransportMode),
-                directAudioStatusText = directAudioStatusText(runtimeState.directAudioStatus),
-                directAudioIssueMessage = directAudioIssueMessage(runtimeState.directAudioStatus),
-                errorMessage = null,
-            )
+            is RoomRuntimeState.Hosting -> {
+                val roomVoiceTransportPreference = VoiceTransportPreference.fromTransportMode(runtimeState.room.voiceTransportMode)
+                RoomUiState(
+                    roomName = runtimeState.room.name,
+                    isHost = true,
+                    members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, talking) },
+                    messages = messages.map { mapMessage(it, selfPeerId) },
+                    inputText = input,
+                    canSend = canSend,
+                    canTalk = canTalk,
+                    isTalking = talking,
+                    isClosed = false,
+                    voiceTransportPreference = voiceTransportPreference,
+                    roomVoiceTransportPreference = roomVoiceTransportPreference,
+                    directAudioStatusText = directAudioStatusText(runtimeState.directAudioStatus, roomVoiceTransportPreference),
+                    directAudioIssueMessage = directAudioIssueMessage(runtimeState.directAudioStatus),
+                    errorMessage = null,
+                )
+            }
 
-            is RoomRuntimeState.Client -> RoomUiState(
-                roomName = runtimeState.room.name,
-                isHost = false,
-                members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, talking) },
-                messages = messages.map { mapMessage(it, selfPeerId) },
-                inputText = input,
-                canSend = canSend,
-                canTalk = canTalk,
-                isTalking = talking,
-                isClosed = false,
-                voiceTransportPreference = voiceTransportPreference,
-                roomVoiceTransportPreference = VoiceTransportPreference.fromTransportMode(runtimeState.room.voiceTransportMode),
-                directAudioStatusText = directAudioStatusText(runtimeState.directAudioStatus),
-                directAudioIssueMessage = directAudioIssueMessage(runtimeState.directAudioStatus),
-                errorMessage = null,
-            )
+            is RoomRuntimeState.Client -> {
+                val roomVoiceTransportPreference = VoiceTransportPreference.fromTransportMode(runtimeState.room.voiceTransportMode)
+                RoomUiState(
+                    roomName = runtimeState.room.name,
+                    isHost = false,
+                    members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, talking) },
+                    messages = messages.map { mapMessage(it, selfPeerId) },
+                    inputText = input,
+                    canSend = canSend,
+                    canTalk = canTalk,
+                    isTalking = talking,
+                    isClosed = false,
+                    voiceTransportPreference = voiceTransportPreference,
+                    roomVoiceTransportPreference = roomVoiceTransportPreference,
+                    directAudioStatusText = directAudioStatusText(runtimeState.directAudioStatus, roomVoiceTransportPreference),
+                    directAudioIssueMessage = directAudioIssueMessage(runtimeState.directAudioStatus),
+                    errorMessage = null,
+                )
+            }
 
-            is RoomRuntimeState.Joining -> RoomUiState(
-                roomName = runtimeState.room.name,
-                inputText = input,
-                canSend = false,
-                canTalk = false,
-                isConnecting = true,
-                isTalking = false,
-                isClosed = false,
-                voiceTransportPreference = voiceTransportPreference,
-                roomVoiceTransportPreference = VoiceTransportPreference.fromTransportMode(runtimeState.room.voiceTransportMode),
-                directAudioStatusText = directAudioStatusText(runtimeState.directAudioStatus),
-                directAudioIssueMessage = directAudioIssueMessage(runtimeState.directAudioStatus),
-            )
+            is RoomRuntimeState.Joining -> {
+                val roomVoiceTransportPreference = VoiceTransportPreference.fromTransportMode(runtimeState.room.voiceTransportMode)
+                RoomUiState(
+                    roomName = runtimeState.room.name,
+                    inputText = input,
+                    canSend = false,
+                    canTalk = false,
+                    isConnecting = true,
+                    isTalking = false,
+                    isClosed = false,
+                    voiceTransportPreference = voiceTransportPreference,
+                    roomVoiceTransportPreference = roomVoiceTransportPreference,
+                    directAudioStatusText = directAudioStatusText(runtimeState.directAudioStatus, roomVoiceTransportPreference),
+                    directAudioIssueMessage = directAudioIssueMessage(runtimeState.directAudioStatus),
+                )
+            }
 
             RoomRuntimeState.Idle,
             RoomRuntimeState.Searching,
@@ -258,13 +267,17 @@ class RoomViewModel(
     }
 
     /**
-     * Формирует короткий текст для шапки комнаты из статуса прямого аудиоканала.
+     * Формирует короткий текст для шапки комнаты из статуса выбранного voice transport.
      */
-    private fun directAudioStatusText(status: DirectAudioStatus?): String {
+    private fun directAudioStatusText(
+        status: DirectAudioStatus?,
+        roomVoiceTransportPreference: VoiceTransportPreference,
+    ): String {
+        val transportName = roomVoiceTransportPreference.shortName.uppercase(Locale.ROOT)
         return when (status) {
-            DirectAudioStatus.Connecting -> "ПРЯМОЙ КАНАЛ • ПОДКЛЮЧЕНИЕ"
-            DirectAudioStatus.Ready -> "ПРЯМОЙ КАНАЛ • ГОТОВ"
-            is DirectAudioStatus.Unavailable -> "ПРЯМОЙ КАНАЛ • НЕ УСТАНОВЛЕН"
+            DirectAudioStatus.Connecting -> "$transportName • ПОДКЛЮЧЕНИЕ"
+            DirectAudioStatus.Ready -> "$transportName • ГОТОВ"
+            is DirectAudioStatus.Unavailable -> "$transportName • НЕ УСТАНОВЛЕН"
             null -> ""
         }
     }
