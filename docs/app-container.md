@@ -24,8 +24,11 @@
 - `Json`;
 - `WireCodec`;
 - `IdGenerator`;
-- `NearbyTransport`;
+- `NearbyTransport` как реализацию `NeighborTransport`;
+- `RoomTransport` как room-level signaling поверх `NeighborTransport`;
+- `SwitchableVoiceTransport`, который лениво создает нужный media-plane (`NearbyVoiceTransport` или `WifiDirectVoiceTransport`);
 - `ProfileRepository`;
+- `IgnoredNearbyRepository` для локального списка ignored host `PeerId` в Nearby-лобби;
 - `RoomRuntime`;
 - `RoomServiceController`;
 - `RoomRepository`;
@@ -37,7 +40,7 @@
 
 `(requireActivity().application as BtRationApplication).appContainer.*ViewModelFactory()`
 
-Фрагменты не создают `RoomRuntime`, `NearbyTransport` и repository напрямую.
+Фрагменты не создают `RoomRuntime`, `RoomTransport`, `NearbyTransport` и repository напрямую.
 
 ## Permissions
 
@@ -52,9 +55,9 @@
 
 `BLUETOOTH_ADVERTISE`, `BLUETOOTH_CONNECT`, `BLUETOOTH_SCAN` и `NEARBY_WIFI_DEVICES` объявлены в manifest без `minSdkVersion`, чтобы Nearby/Google Play Services точно видели permissions в установленном APK. На старых Android неизвестные permissions просто игнорируются системой. Для `NEARBY_WIFI_DEVICES` стоит `usesPermissionFlags="neverForLocation"`, потому что Nearby нужен для локальной связи, а не для вывода геолокации пользователя.
 
-Если обязательные Nearby permissions не выданы, `MainActivity` показывает список недостающих permissions тостом, но все равно открывает UI. `NearbyTransport` перед вызовом Google Nearby дополнительно проверяет discovery/advertising permissions и отдает понятную ошибку в `RoomRuntimeState.Error`, чтобы лобби или комната показали причину на экране.
+Если обязательные Nearby permissions не выданы, `MainActivity` показывает список недостающих permissions тостом, но все равно открывает UI. `NearbyTransport` перед вызовом Google Nearby дополнительно проверяет discovery/advertising permissions и через `RoomTransport` отдает понятную ошибку в `RoomRuntimeState.Error`, чтобы лобби или комната показали причину на экране.
 
-Если permissions выданы, но системная геолокация устройства выключена, `NearbyTransport` не вызывает Google Nearby API, а отдает ошибку с действием `OPEN_LOCATION_SETTINGS`. Лобби и комната показывают диалог с кнопкой перехода в системные настройки геолокации.
+Если permissions выданы, но системная геолокация устройства выключена, `NearbyTransport` не вызывает Google Nearby API, а через `RoomTransport` отдает ошибку с действием `OPEN_LOCATION_SETTINGS`. Лобби и комната показывают диалог с кнопкой перехода в системные настройки геолокации.
 
 ## Service
 

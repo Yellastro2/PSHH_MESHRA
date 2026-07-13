@@ -13,6 +13,7 @@ import android.view.animation.LinearInterpolator
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.fragment.app.Fragment
@@ -43,6 +44,7 @@ class LobbyFragment : Fragment() {
     private lateinit var tvWelcome: TextView
     private lateinit var etPeerName: EditText
     private lateinit var btnEditName: ImageButton
+    private lateinit var btnClearIgnoredHosts: ImageView
     private lateinit var tvLobbyError: TextView
     private lateinit var btnCreateRoom: Button
     private lateinit var viewScanProgress: View
@@ -76,14 +78,16 @@ class LobbyFragment : Fragment() {
         tvWelcome = view.findViewById(R.id.tv_welcome)
         etPeerName = view.findViewById(R.id.et_peer_name)
         btnEditName = view.findViewById(R.id.btn_edit_name)
+        btnClearIgnoredHosts = view.findViewById(R.id.fr_lobby_users)
         tvLobbyError = view.findViewById(R.id.tv_lobby_error)
         btnCreateRoom = view.findViewById(R.id.btn_create_room)
         viewScanProgress = view.findViewById(R.id.view_scan_progress)
         rvRooms = view.findViewById(R.id.rv_rooms)
 
-        roomsAdapter = RoomsAdapter { room ->
-            viewModel.onJoinRoomClicked(room.roomId)
-        }
+        roomsAdapter = RoomsAdapter(
+            onJoinClick = viewModel::onJoinRoomClicked,
+            onIgnoreClick = ::showIgnoreHostDialog,
+        )
         rvRooms.layoutManager = LinearLayoutManager(requireContext())
         rvRooms.adapter = roomsAdapter
 
@@ -104,6 +108,9 @@ class LobbyFragment : Fragment() {
             } else {
                 viewModel.onEditNameClicked()
             }
+        }
+        btnClearIgnoredHosts.setOnClickListener {
+            showClearIgnoredHostsDialog()
         }
 
         childFragmentManager.setFragmentResultListener(
@@ -323,10 +330,41 @@ class LobbyFragment : Fragment() {
     }
 
     /**
+     * Показывает подтверждение игнора host-а найденной комнаты.
+     */
+    private fun showIgnoreHostDialog(room: RoomItemUi) {
+        AlertDialog.Builder(requireContext())
+            .setTitle("Игнорить host-а?")
+            .setMessage("Комнаты от ${room.hostName} больше не будут показываться в Nearby-лобби на этом устройстве.")
+            .setPositiveButton("Игнорить") { _, _ ->
+                viewModel.onIgnoreRoomClicked(room)
+                showSnackbarIfNeeded("Host ${room.hostName} добавлен в ignore-list")
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    /**
+     * Показывает подтверждение очистки локального ignore-list Nearby host-ов.
+     */
+    private fun showClearIgnoredHostsDialog() {
+        AlertDialog.Builder(requireContext())
+            .setTitle("Очистить игнор лист?")
+            .setMessage("После очистки скрытые Nearby-host-ы снова появятся в лобби при следующем discovery.")
+            .setPositiveButton("Да") { _, _ ->
+                viewModel.onClearIgnoredHostsConfirmed()
+                showSnackbarIfNeeded("Ignore-list очищен")
+            }
+            .setNegativeButton("Нет", null)
+            .show()
+    }
+
+    /**
      * Адаптер списка комнат в лобби.
      */
     private class RoomsAdapter(
-        private val onJoinClick: (RoomItemUi) -> Unit
+        private val onJoinClick: (RoomItemUi) -> Unit,
+        private val onIgnoreClick: (RoomItemUi) -> Unit,
     ) : RecyclerView.Adapter<RoomsAdapter.ViewHolder>() {
         private val items = mutableListOf<RoomItemUi>()
 
@@ -373,6 +411,10 @@ class LobbyFragment : Fragment() {
 
             holder.btnJoin.setOnClickListener {
                 onJoinClick(room)
+            }
+            holder.itemView.setOnLongClickListener {
+                onIgnoreClick(room)
+                true
             }
         }
 

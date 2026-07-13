@@ -22,7 +22,7 @@ import com.google.android.gms.nearby.connection.DiscoveryOptions
 import com.google.android.gms.nearby.connection.EndpointDiscoveryCallback
 import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.Strategy
-import com.yellastro.btration.domain.model.RoomInfo
+import com.yellastro.btration.domain.transport.NeighborAdvertisement
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -43,16 +43,11 @@ internal class NearbyConnectionLayer(
 
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
         /**
-         * Автоматически принимает Nearby-соединение и сообщает фасаду о начале handshake.
+         * Сообщает фасаду о входящем handshake, оставляя accept/reject верхнему слою.
          */
         override fun onConnectionInitiated(endpointId: String, connectionInfo: ConnectionInfo) {
             Log.i(TAG, "[onConnectionInitiated] Получен запрос соединения endpointId=$endpointId endpointName=${connectionInfo.endpointName}")
             emitEvent(NearbyConnectionLayerEvent.ConnectionInitiated(endpointId, connectionInfo))
-            connectionsClient.acceptConnection(endpointId, payloadCallback)
-                .addOnFailureListener { cause ->
-                    Log.w(TAG, "[onConnectionInitiated] Не удалось принять соединение endpointId=$endpointId: ${cause.message}", cause)
-                    emitEvent(NearbyConnectionLayerEvent.ConnectionAcceptFailed(endpointId, cause))
-                }
         }
 
         /**
@@ -88,23 +83,14 @@ internal class NearbyConnectionLayer(
 
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
         /**
-         * Декодирует короткую визитку endpoint-а и сообщает фасаду найденную комнату.
+         * Сообщает фасаду о найденном endpoint-е без разбора endpointName.
          */
         override fun onEndpointFound(endpointId: String, endpointInfo: DiscoveredEndpointInfo) {
             Log.i(
                 TAG,
                 "[onEndpointFound] Найден endpoint endpointId=$endpointId serviceId=${endpointInfo.serviceId} endpointNameLength=${endpointInfo.endpointName.length}",
             )
-            val roomInfo = decodeRoomInfo(endpointInfo)
-            if (roomInfo != null) {
-                Log.i(
-                    TAG,
-                    "[onEndpointFound] Endpoint распознан как комната roomId=${roomInfo.roomId.value} roomName=${roomInfo.name} hostPeerId=${roomInfo.host.peerId.value}",
-                )
-            } else {
-                Log.w(TAG, "[onEndpointFound] Endpoint не содержит корректную визитку комнаты endpointId=$endpointId")
-            }
-            emitEvent(NearbyConnectionLayerEvent.EndpointFound(endpointId, endpointInfo, roomInfo))
+            emitEvent(NearbyConnectionLayerEvent.EndpointFound(endpointId, endpointInfo))
         }
 
         /**
@@ -180,20 +166,20 @@ internal class NearbyConnectionLayer(
     }
 
     /**
-     * Запускает advertising комнаты через короткую endpointName-визитку.
+     * Запускает advertising с уже подготовленной endpointName-визиткой.
      */
-    fun startAdvertising(room: RoomInfo) {
+    fun startAdvertising(advertisement: NeighborAdvertisement) {
         cancelAdvertisingPermissionRetry()
-        startAdvertisingInternal(room, permissionRetryAttempt = 0)
+        startAdvertisingInternal(advertisement, permissionRetryAttempt = 0)
     }
 
     /**
      * Запускает advertising и тихо ретраит краткий permission-race внутри Nearby API.
      */
-    private fun startAdvertisingInternal(room: RoomInfo, permissionRetryAttempt: Int) {
+    private fun startAdvertisingInternal(advertisement: NeighborAdvertisement, permissionRetryAttempt: Int) {
         Log.i(
             TAG,
-            "[startAdvertising] Запускаем advertising roomId=${room.roomId.value} roomName=${room.name} hostPeerId=${room.host.peerId.value} serviceId=$serviceId strategy=$strategy",
+            "[startAdvertising] Запускаем advertising endpointNameChars=${advertisement.endpointName.length} serviceId=$serviceId strategy=$strategy",
         )
         val missingPermissions = missingPermissionsForAdvertising()
         if (missingPermissions.isNotEmpty()) {
@@ -213,7 +199,7 @@ internal class NearbyConnectionLayer(
             return
         }
 
-        val endpointName = NearbyRoomAdvertisement.fromRoom(room).encode()
+        val endpointName = advertisement.endpointName
         Log.i(
             TAG,
             "[startAdvertising] Визитка комнаты закодирована в endpointName chars=${endpointName.length} bytes=${endpointName.encodeToByteArray().size}",
@@ -224,7 +210,7 @@ internal class NearbyConnectionLayer(
         connectionsClient.startAdvertising(endpointName, serviceId, connectionLifecycleCallback, options)
             .addOnSuccessListener {
                 cancelAdvertisingPermissionRetry()
-                Log.i(TAG, "[startAdvertising] Nearby advertising запущен roomId=${room.roomId.value}")
+                Log.i(TAG, "[startAdvertising] Nearby advertising запущен endpointNameChars=${endpointName.length}")
             }
             .addOnFailureListener { cause ->
                 if (shouldRetryTransientPermissionFailure(
@@ -233,10 +219,10 @@ internal class NearbyConnectionLayer(
                         missingPermissionsProvider = ::missingPermissionsForAdvertising,
                     )
                 ) {
-                    scheduleAdvertisingPermissionRetry(room, permissionRetryAttempt + 1, cause)
+                    scheduleAdvertisingPermissionRetry(advertisement, permissionRetryAttempt + 1, cause)
                     return@addOnFailureListener
                 }
-                Log.w(TAG, "[startAdvertising] Nearby не запустил advertising roomId=${room.roomId.value}: ${cause.message}", cause)
+                Log.w(TAG, "[startAdvertising] Nearby не запустил advertising: ${cause.message}", cause)
                 emitEvent(NearbyConnectionLayerEvent.AdvertisingFailed(cause))
             }
     }
@@ -296,6 +282,30 @@ internal class NearbyConnectionLayer(
     }
 
     /**
+     * Принимает входящее Nearby-соединение и привязывает к нему payload callback.
+     */
+    fun acceptConnection(endpointId: String) {
+        Log.i(TAG, "[acceptConnection] Принимаем входящее соединение endpointId=$endpointId")
+        connectionsClient.acceptConnection(endpointId, payloadCallback)
+            .addOnFailureListener { cause ->
+                Log.w(TAG, "[acceptConnection] Не удалось принять соединение endpointId=$endpointId: ${cause.message}", cause)
+                emitEvent(NearbyConnectionLayerEvent.ConnectionAcceptFailed(endpointId, cause))
+            }
+    }
+
+    /**
+     * Отклоняет входящее Nearby-соединение.
+     */
+    fun rejectConnection(endpointId: String) {
+        Log.i(TAG, "[rejectConnection] Отклоняем входящее соединение endpointId=$endpointId")
+        connectionsClient.rejectConnection(endpointId)
+            .addOnFailureListener { cause ->
+                Log.w(TAG, "[rejectConnection] Не удалось отклонить соединение endpointId=$endpointId: ${cause.message}", cause)
+                emitEvent(NearbyConnectionLayerEvent.ConnectionRejectFailed(endpointId, cause))
+            }
+    }
+
+    /**
      * Явно разрывает все активные Nearby-соединения без сброса discovery-связок на уровне фасада.
      */
     fun disconnectAllPeers() {
@@ -310,7 +320,7 @@ internal class NearbyConnectionLayer(
     /**
      * Безусловно отключает endpoint и очищает только локальный признак active connection.
      */
-    private fun disconnectEndpoint(endpointId: String) {
+    fun disconnectEndpoint(endpointId: String) {
         connectedEndpointIds.remove(endpointId)
         connectionsClient.disconnectFromEndpoint(endpointId)
         Log.i(TAG, "[disconnectEndpoint] Endpoint отключен endpointId=$endpointId")
@@ -368,16 +378,16 @@ internal class NearbyConnectionLayer(
     /**
      * Планирует повторный advertising после краткой задержки, не отправляя ошибку в UI до исчерпания попыток.
      */
-    private fun scheduleAdvertisingPermissionRetry(room: RoomInfo, nextAttempt: Int, cause: Throwable) {
+    private fun scheduleAdvertisingPermissionRetry(advertisement: NeighborAdvertisement, nextAttempt: Int, cause: Throwable) {
         cancelAdvertisingPermissionRetry()
         val delayMillis = TRANSIENT_PERMISSION_RETRY_DELAYS_MILLIS[nextAttempt - 1]
         Log.w(
             TAG,
-            "[scheduleAdvertisingPermissionRetry] Nearby advertising вернул transient permission race, повторяем roomId=${room.roomId.value} attempt=$nextAttempt delayMs=$delayMillis message=${cause.message}",
+            "[scheduleAdvertisingPermissionRetry] Nearby advertising вернул transient permission race, повторяем attempt=$nextAttempt delayMs=$delayMillis message=${cause.message}",
         )
         val retryRunnable = Runnable {
             advertisingRetryRunnable = null
-            startAdvertisingInternal(room, permissionRetryAttempt = nextAttempt)
+            startAdvertisingInternal(advertisement, permissionRetryAttempt = nextAttempt)
         }
         advertisingRetryRunnable = retryRunnable
         retryHandler.postDelayed(retryRunnable, delayMillis)
@@ -486,18 +496,6 @@ internal class NearbyConnectionLayer(
         }
     }
 
-    /**
-     * Декодирует публичное описание комнаты из короткой Nearby endpointName-визитки актуального поколения.
-     */
-    private fun decodeRoomInfo(endpointInfo: DiscoveredEndpointInfo): RoomInfo? {
-        return runCatching {
-            NearbyRoomAdvertisement.decode(endpointInfo.endpointName)
-                ?.toRoomInfo()
-        }.onFailure { cause ->
-            Log.w(TAG, "[decodeRoomInfo] Не удалось декодировать endpointName как визитку комнаты: ${cause.message}", cause)
-        }.getOrNull()
-    }
-
     private companion object {
         private const val TAG = "NearbyConnectionLayer"
         private const val TRANSIENT_MISSING_PERMISSION_STATUS_CODE = 8034
@@ -513,7 +511,7 @@ internal class NearbyConnectionLayer(
 }
 
 /**
- * Низкоуровневое событие Nearby lifecycle, которое фасад переводит в публичный NearbyEvent.
+ * Низкоуровневое событие Nearby lifecycle, которое фасад переводит в публичный NeighborTransportEvent.
  */
 internal sealed class NearbyConnectionLayerEvent {
     /**
@@ -525,6 +523,11 @@ internal sealed class NearbyConnectionLayerEvent {
      * Автоматическое принятие Nearby-соединения завершилось ошибкой.
      */
     data class ConnectionAcceptFailed(val endpointId: String, val cause: Throwable) : NearbyConnectionLayerEvent()
+
+    /**
+     * Отклонение входящего Nearby-соединения завершилось ошибкой.
+     */
+    data class ConnectionRejectFailed(val endpointId: String, val cause: Throwable) : NearbyConnectionLayerEvent()
 
     /**
      * Nearby вернул итог handshake для endpoint-а.
@@ -547,7 +550,6 @@ internal sealed class NearbyConnectionLayerEvent {
     data class EndpointFound(
         val endpointId: String,
         val endpointInfo: DiscoveredEndpointInfo,
-        val roomInfo: RoomInfo?,
     ) : NearbyConnectionLayerEvent()
 
     /**

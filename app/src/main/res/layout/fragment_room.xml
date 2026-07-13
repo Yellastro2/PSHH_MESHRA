@@ -142,8 +142,18 @@
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent" />
 
-    <LinearLayout
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
 
+
+
+    </androidx.constraintlayout.widget.ConstraintLayout>
+
+
+
+
+    <LinearLayout
         android:id="@+id/btn_push_to_talk"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
@@ -151,7 +161,9 @@
         android:layout_width="@dimen/micro_size_big"
         android:layout_height="@dimen/micro_size_big">
 
+
     <androidx.constraintlayout.widget.ConstraintLayout
+        android:id="@+id/fr_room_micro_layout"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:layout_margin="8dp"
@@ -160,38 +172,7 @@
 
         app:layout_constraintVertical_bias="0.4">
 
-        <View
-            android:id="@+id/view_wave_3"
-            android:layout_width="180dp"
-            android:layout_height="180dp"
-            android:background="@drawable/bg_wave_ring"
-            android:visibility="gone"
-            app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toTopOf="parent" />
 
-        <View
-            android:id="@+id/view_wave_2"
-            android:layout_width="150dp"
-            android:layout_height="150dp"
-            android:background="@drawable/bg_wave_ring"
-            android:visibility="gone"
-            app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toTopOf="parent" />
-
-        <View
-            android:id="@+id/view_wave_1"
-            android:layout_width="120dp"
-            android:layout_height="120dp"
-            android:background="@drawable/bg_wave_ring"
-            android:visibility="gone"
-            app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toTopOf="parent" />
 
         <ImageView
             android:layout_width="25dp"
@@ -205,6 +186,7 @@
 
     </androidx.constraintlayout.widget.ConstraintLayout>
 </LinearLayout>
+
     <!-- Bottom Chat message typing bar -->
     <LinearLayout
         android:id="@+id/layout_chat_input"
@@ -245,7 +227,43 @@
             android:contentDescription="Send Message Button" />
 
 
+
     </LinearLayout>
+
+    <View
+        android:id="@+id/view_wave_3"
+        android:layout_width="180dp"
+        android:layout_height="180dp"
+        android:background="@drawable/bg_wave_ring"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="@id/btn_push_to_talk"
+        app:layout_constraintEnd_toEndOf="@id/btn_push_to_talk"
+        app:layout_constraintStart_toStartOf="@id/btn_push_to_talk"
+        app:layout_constraintTop_toTopOf="@id/btn_push_to_talk" />
+
+    <View
+        android:id="@+id/view_wave_2"
+        android:layout_width="150dp"
+        android:layout_height="150dp"
+        android:background="@drawable/bg_wave_ring"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="@id/btn_push_to_talk"
+        app:layout_constraintEnd_toEndOf="@id/btn_push_to_talk"
+        app:layout_constraintStart_toStartOf="@id/btn_push_to_talk"
+        app:layout_constraintTop_toTopOf="@id/btn_push_to_talk" />
+
+    <View
+        android:id="@+id/view_wave_1"
+        android:layout_width="120dp"
+        android:layout_height="120dp"
+        android:background="@drawable/bg_wave_ring"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="@id/btn_push_to_talk"
+        app:layout_constraintEnd_toEndOf="@id/btn_push_to_talk"
+        app:layout_constraintStart_toStartOf="@id/btn_push_to_talk"
+        app:layout_constraintTop_toTopOf="@id/btn_push_to_talk" />
+
+
 
     <FrameLayout
         android:id="@+id/layout_connecting_overlay"

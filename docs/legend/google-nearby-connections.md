@@ -14,10 +14,14 @@
 - Визитка `BTR4` содержит `sessionId`, `createdAtMillis`, короткий след host-а, token voice transport, `roomName` и `hostName`. Полные `roomId` и `hostPeerId` не кладутся в `endpointName`, потому что лимит Nearby маленький и название комнаты важнее.
 - Старый формат `BTR3` продолжает декодироваться как legacy-визитка без token voice transport; для него используется default `WIFI_DIRECT_UDP`.
 - До `JOIN_ACCEPTED` listener использует временные `RoomId`/`PeerId` из визитки. После подключения host присылает настоящий `RoomInfo`, и runtime заменяет временные идентификаторы реальными.
-- Nearby endpointId не считается доменным идентификатором участника. Для этого есть `NearbyEndpointRegistry`, который связывает `endpointId` с `PeerId` и `RoomId`.
-- Код Nearby разделён на фасад `NearbyTransport`, lifecycle-слой `NearbyConnectionLayer` и payload-слой `NearbyPayloadTransport`. `NearbyConnectionLayer` отвечает за discovery, advertising, request/accept/disconnect callbacks и transient permission retry. `NearbyPayloadTransport` отвечает за отправку BYTES/STREAM по endpointId и декодирование входящих payload-ов в wire/voice события. `NearbyTransport` сохраняет старый API для `RoomRuntime` и дополняет низкоуровневые события данными из `NearbyEndpointRegistry`.
+- Nearby endpointId не считается доменным идентификатором участника. Связь `endpointId/linkId -> PeerId/RoomId` ведет `RoomTransport`, потому что это уже room-level знание, а не обязанность нижнего Nearby wrapper-а.
+- Для физических nearby-линков введён общий интерфейс `NeighborTransport`: discovery, advertising, connect/accept/reject/disconnect, BYTES-сообщения и STREAM-потоки описаны без привязки к Nearby SDK и без знания формата контента.
+- Код Nearby разделён на фасад `NearbyTransport`, lifecycle-слой `NearbyConnectionLayer` и payload-слой `NearbyPayloadTransport`. `NearbyConnectionLayer` отвечает за discovery, advertising, request/accept/reject/disconnect callbacks и transient permission retry. `NearbyPayloadTransport` отвечает только за отправку и прием непрозрачных BYTES/STREAM по endpointId. `NearbyTransport` реализует `NeighborTransport` и не знает о `WirePacket`, `RoomInfo`, `PeerId` или voice frame.
+- `RoomTransport` сидит поверх `NeighborTransport`: кодирует/декодирует `WirePacket`, готовит/читает `NearbyRoomAdvertisement`, автоматически принимает нижнее connection request и публикует `RoomTransportEvent` для `RoomRuntime`.
+- `NearbyVoiceTransport` сидит рядом с `RoomTransport` поверх того же `NeighborTransport`: он читает только BYTES с сигнатурой `BTVO`, а все room/control сообщения игнорирует.
+- Ошибка отправки BYTES/STREAM возвращается callback-ом конкретному вызывающему слою, а не широковещательным event-ом: иначе voice send failure мог бы случайно превратиться в room packet failure.
 - `endpointId -> PeerId` описывает только прямого физического Nearby-соседа. Автор `CHAT_MESSAGE` или другого relayed-пакета не должен перезаписывать эту связь.
-- Транспорт автоматически принимает Nearby connection, а бизнес-решение входа в комнату остаётся выше, в `RoomRuntime`, через `JOIN_ACCEPTED` / `JOIN_REJECTED`.
+- `RoomTransport` автоматически принимает Nearby connection, а бизнес-решение входа в комнату остаётся выше, в `RoomRuntime`, через `JOIN_ACCEPTED` / `JOIN_REJECTED`.
 - Для будущего mesh/relay в `WirePacket` уже есть поля `packetId` и `ttl`, но Nearby-слой пока не делает dedup и relay.
 - При старте приложения, перед новой рекламой и при сбросе runtime вызывается полный cleanup Nearby: `stopDiscovery()`, `stopAdvertising()`, `stopAllEndpoints()` и очистка локального registry.
 
@@ -33,8 +37,8 @@
 - Host при получении frame проверяет, что `originPeerId == directPeerId`, ретранслирует сжатый Opus-frame остальным участникам без decode/re-encode, а для собственного динамика декодирует отдельной локальной веткой.
 - Client принимает voice frame только от host endpoint-а и только если `originPeerId` есть в списке участников.
 - Ошибка отправки отдельного voice frame логируется, но не переводит комнату в Error: голос может потерять фрейм, а чат и сессия должны жить дальше.
-- Если Nearby API возвращает `ApiException` при discovery/advertising/connect/accept, `RoomRuntime` переводит состояние в Error и отправляет snackbar `Nearby Connections не поддерживается или недоступен на этом устройстве`.
-- Исключение: transient `8034: MISSING_PERMISSION...` сразу после выдачи runtime permissions. Если локальный precheck уже видит нужные permissions, `NearbyTransport` делает несколько тихих retry discovery/advertising и не отправляет ошибку в UI до исчерпания попыток.
+- Если Nearby API возвращает `ApiException` при discovery/advertising/connect/accept, ошибка проходит через `NearbyTransport -> RoomTransport`, а `RoomRuntime` переводит состояние в Error и отправляет snackbar `Nearby Connections не поддерживается или недоступен на этом устройстве`.
+- Исключение: transient `8034: MISSING_PERMISSION...` сразу после выдачи runtime permissions. Если локальный precheck уже видит нужные permissions, `NearbyConnectionLayer` делает несколько тихих retry discovery/advertising и не отправляет ошибку в UI до исчерпания попыток.
 
 ## STREAM payload для старого MVP-голоса
 
@@ -53,7 +57,7 @@
 - `BLUETOOTH_ADVERTISE`, `BLUETOOTH_CONNECT`, `BLUETOOTH_SCAN` для Android 12+.
 - `NEARBY_WIFI_DEVICES` для новых Android.
 
-Runtime-запрос permissions ещё не реализован: это задача UI/ViewModel слоя.
+Runtime-запрос permissions реализован в `MainActivity`; транспортный слой дополнительно делает precheck перед Nearby discovery/advertising.
 
 ## Источники
 

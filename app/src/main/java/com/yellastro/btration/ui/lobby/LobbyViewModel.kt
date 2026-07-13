@@ -1,10 +1,12 @@
 package com.yellastro.btration.ui.lobby
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.yellastro.btration.domain.model.RoomId
+import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.RoomInfo
 import com.yellastro.btration.domain.runtime.RoomRuntimeState
+import com.yellastro.btration.repository.IgnoredNearbyRepository
 import com.yellastro.btration.repository.ProfileRepository
 import com.yellastro.btration.repository.RoomRepository
 import com.yellastro.btration.repository.VoiceSettingsRepository
@@ -25,6 +27,7 @@ import kotlinx.coroutines.launch
 class LobbyViewModel(
     private val roomRepository: RoomRepository,
     private val profileRepository: ProfileRepository,
+    private val ignoredNearbyRepository: IgnoredNearbyRepository,
     private val voiceSettingsRepository: VoiceSettingsRepository,
 ) : ViewModel() {
     private var searchRefreshJob: Job? = null
@@ -39,8 +42,9 @@ class LobbyViewModel(
         roomRepository.availableRooms,
         nameEditorState,
         scanCycleId,
-    ) { runtimeState, rooms, nameEditor, cycleId ->
-        mapUiState(runtimeState, rooms, nameEditor, cycleId)
+        ignoredNearbyRepository.ignoredHostPeerIds,
+    ) { runtimeState, rooms, nameEditor, cycleId, ignoredHostPeerIds ->
+        mapUiState(runtimeState, rooms, nameEditor, cycleId, ignoredHostPeerIds)
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
@@ -49,6 +53,7 @@ class LobbyViewModel(
             roomRepository.availableRooms.value,
             nameEditorState.value,
             scanCycleId.value,
+            ignoredNearbyRepository.ignoredHostPeerIds.value,
         ),
     )
 
@@ -169,10 +174,28 @@ class LobbyViewModel(
     /**
      * Подключается к найденной комнате.
      */
-    fun onJoinRoomClicked(roomId: RoomId) {
+    fun onJoinRoomClicked(room: RoomItemUi) {
         viewModelScope.launch {
-            roomRepository.joinRoom(roomId)
+            if (ignoredNearbyRepository.isHostIgnored(room.hostPeerId)) {
+                Log.i(TAG, "[onJoinRoomClicked] Вход пропущен, host в ignore-list roomId=${room.roomId.value} hostPeerId=${room.hostPeerId.value}")
+                return@launch
+            }
+            roomRepository.joinRoom(room.roomId)
         }
+    }
+
+    /**
+     * Добавляет host-а выбранной комнаты в ignore-list Nearby и скрывает его комнаты из лобби.
+     */
+    fun onIgnoreRoomClicked(room: RoomItemUi) {
+        ignoredNearbyRepository.ignoreHost(room.hostPeerId)
+    }
+
+    /**
+     * Очищает локальный ignore-list Nearby host-ов после подтверждения пользователя.
+     */
+    fun onClearIgnoredHostsConfirmed() {
+        ignoredNearbyRepository.clearIgnoredHosts()
     }
 
     /**
@@ -183,7 +206,9 @@ class LobbyViewModel(
         rooms: List<RoomInfo>,
         nameEditor: NameEditorState,
         cycleId: Long,
+        ignoredHostPeerIds: Set<PeerId>,
     ): LobbyUiState {
+        val visibleRooms = rooms.filterNot { roomInfo -> roomInfo.host.peerId in ignoredHostPeerIds }
         return LobbyUiState(
             selfName = nameEditor.savedName,
             nameInput = nameEditor.inputName,
@@ -192,7 +217,8 @@ class LobbyViewModel(
             scanCycleId = cycleId,
             scanCycleDurationMillis = SEARCH_REFRESH_INTERVAL_MILLIS,
             isSearching = runtimeState is RoomRuntimeState.Searching,
-            availableRooms = rooms.map(::mapRoomItem),
+            availableRooms = visibleRooms.map(::mapRoomItem),
+            ignoredHostCount = ignoredHostPeerIds.size,
             isInRoom = runtimeState is RoomRuntimeState.Hosting ||
                 runtimeState is RoomRuntimeState.Joining ||
                 runtimeState is RoomRuntimeState.Client,
@@ -207,6 +233,7 @@ class LobbyViewModel(
     private fun mapRoomItem(roomInfo: RoomInfo): RoomItemUi {
         return RoomItemUi(
             roomId = roomInfo.roomId,
+            hostPeerId = roomInfo.host.peerId,
             roomName = roomInfo.name,
             hostName = roomInfo.host.name,
             memberCountText = null,
@@ -243,6 +270,7 @@ class LobbyViewModel(
     )
 
     private companion object {
+        private const val TAG = "LobbyViewModel"
         private const val STOP_TIMEOUT_MILLIS = 5_000L
         private const val SEARCH_REFRESH_INTERVAL_MILLIS = 10_000L
         private const val MAX_NAME_LENGTH = 18

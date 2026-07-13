@@ -2,7 +2,7 @@
 
 ## Назначение
 
-`RoomRuntime` — обычный Kotlin-класс, который управляет текущей комнатой поверх signaling-транспорта `NearbyTransport` и переключаемого голосового `VoiceTransport`.
+`RoomRuntime` — обычный Kotlin-класс, который управляет текущей комнатой поверх `RoomTransport` и переключаемого голосового `VoiceTransport`.
 
 Он не является Android Service, ViewModel или Repository. Его задача — слушать события транспорта, принимать protocol-решения и отдавать состояние выше через `StateFlow`.
 Статус голосового media-plane также идет через `RoomRuntimeState`, чтобы UI видел не только одноразовый snackbar, но и устойчивое состояние `Connecting` / `Ready` / `Unavailable`.
@@ -11,7 +11,10 @@
 ## Файлы
 
 - `app/src/main/java/com/yellastro/btration/domain/runtime/RoomRuntime.kt`
+- `app/src/main/java/com/yellastro/btration/domain/runtime/RoomTransport.kt`
 - `app/src/main/java/com/yellastro/btration/domain/runtime/RoomRuntimeState.kt`
+- `app/src/main/java/com/yellastro/btration/domain/transport/NeighborTransport.kt`
+- `app/src/main/java/com/yellastro/btration/domain/transport/PeerLinkResolver.kt`
 - `app/src/main/java/com/yellastro/btration/repository/ProfileRepository.kt`
 - `app/src/main/java/com/yellastro/btration/domain/util/IdGenerator.kt`
 - `app/src/main/java/com/yellastro/btration/voice/VoiceRuntime.kt`
@@ -22,12 +25,14 @@
 ## Потоки данных
 
 ```text
-NearbyTransport.events + VoiceTransport.events
+RoomTransport.events + VoiceTransport.events
   -> RoomRuntime
   -> state / availableRooms / messages / talkingPeerIds
 ```
 
-`RoomRuntime` получает `CoroutineScope` снаружи, например из application-level контейнера, и в `init` подписывается на signaling-события `NearbyTransport.events` и media-события `VoiceTransport.events`.
+`RoomRuntime` получает `CoroutineScope` снаружи, например из application-level контейнера, и в `init` подписывается на события room signaling из `RoomTransport.events` и media-события `VoiceTransport.events`.
+
+`RoomTransport` держит room-level протокол поверх `NeighborTransport`: декодирует/кодирует `WirePacket`, разбирает короткую визитку комнаты, ведет связь `PeerId <-> linkId` и прячет детали конкретного нижнего транспорта от `RoomRuntime`.
 
 ## StateFlow
 
@@ -64,7 +69,7 @@ Host:
 Client:
 
 - запускает discovery;
-- получает из `NearbyRoomAdvertisement` временный advertised `RoomId`, потому что `endpointName` не несет полный `roomId`;
+- получает из `RoomTransport` временный advertised `RoomId`, потому что короткая транспортная визитка не несет полный `roomId`;
 - хранит внутреннюю связь `RoomId -> endpointId`, где до входа `RoomId` может быть временным advertised-id;
 - по `joinRoom(roomId)` подключается к endpoint;
 - после успешного connection отправляет `JOIN_REQUEST` без реального `roomId`;
@@ -83,7 +88,7 @@ Client:
 
 - `STATUS_ENDPOINT_UNKNOWN` считается recoverable stale endpoint: runtime удаляет комнату из `availableRooms`, запускает clean discovery и при повторном `EndpointFound` автоматически повторяет connection.
 - Если client внезапно теряет host-а не через `ROOM_CLOSED`, runtime не сбрасывает комнату в `Idle`, а переходит в `Joining` по сохраненной advertised-комнате и пробует переподключиться.
-- Если Nearby API сразу после runtime-permission grant возвращает transient `MISSING_PERMISSION` при discovery/advertising, `NearbyTransport` тихо делает короткий retry и отдает ошибку в `RoomRuntime` только после исчерпания попыток.
+- Если нижний Nearby API сразу после runtime-permission grant возвращает transient `MISSING_PERMISSION` при discovery/advertising, `NearbyTransport` тихо делает короткий retry и через `RoomTransport` отдает ошибку в `RoomRuntime` только после исчерпания попыток.
 
 ## PTT-индикация
 

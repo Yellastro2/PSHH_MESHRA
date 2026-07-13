@@ -35,9 +35,13 @@ ViewModel-слой готовит состояние для XML-фрагмент
 - `onStartSearchClicked()`;
 - `onStopSearchClicked()`;
 - `onCreateRoomClicked(name, voiceTransportPreference)`;
-- `onJoinRoomClicked(roomId)`.
+- `onJoinRoomClicked(room)`;
+- `onIgnoreRoomClicked(room)`;
+- `onClearIgnoredHostsConfirmed()`.
 
 Диалог создания комнаты передает в `LobbyViewModel` имя комнаты и выбранный voice transport; ViewModel сохраняет transport в prefs до вызова `RoomRepository.createRoom(...)`, чтобы host runtime положил этот режим в meta комнаты.
+
+Для тестирования nearby/mesh-сценариев лобби умеет локально игнорировать host-а найденной комнаты. `LobbyViewModel` берет `RoomInfo.host.peerId`, сохраняет его через `IgnoredNearbyRepository` и фильтрует найденные комнаты до маппинга в `RoomItemUi`. `endpointId` не сохраняется, потому что это временный идентификатор нижнего транспорта.
 
 ## RoomViewModel
 

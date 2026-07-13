@@ -131,6 +131,14 @@ class RoomFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                (requireActivity() as MainActivity)
+                    .keyboardVisible
+                    .collect(::resizePushToTalkForKeyboard)
+            }
+        }
+
         tvChannelTitle = view.findViewById(R.id.tv_channel_title)
         tvChannelStatus = view.findViewById(R.id.tv_channel_status)
         btnBack = view.findViewById(R.id.btn_back)
@@ -222,19 +230,6 @@ class RoomFragment : Fragment() {
         collectUiState()
         collectNotices()
 
-        val rootView = requireActivity().findViewById<View>(android.R.id.content)
-
-        ViewCompat.setOnApplyWindowInsetsListener(rootView) { _, insets ->
-            val keyboardVisible =
-                insets.isVisible(WindowInsetsCompat.Type.ime())
-
-            Log.d("Keyboard", "IME callback: $keyboardVisible")
-
-            resizePushToTalkForKeyboard(keyboardVisible)
-            insets
-        }
-
-        ViewCompat.requestApplyInsets(rootView)
     }
 
     /**
@@ -354,7 +349,7 @@ class RoomFragment : Fragment() {
         latestState = state
         tvChannelTitle.text = state.roomName.ifBlank { "ROOM" }
         renderConnectingState(state)
-        btnSend.isEnabled = state.canSend && !state.isConnecting
+        btnSend.visibility = if (state.canSend && !state.isConnecting) View.VISIBLE else View.GONE
         btnSend.alpha = if (btnSend.isEnabled) 1.0f else 0.45f
         val visibleProblem = state.errorMessage ?: state.directAudioIssueMessage
         tvRoomError.text = visibleProblem.orEmpty()

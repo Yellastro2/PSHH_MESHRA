@@ -8,8 +8,10 @@ import androidx.lifecycle.ViewModelProvider
 import com.google.android.gms.nearby.Nearby
 import com.yellastro.btration.data.nearby.NearbyTransport
 import com.yellastro.btration.data.wire.WireCodec
+import com.yellastro.btration.domain.runtime.RoomTransport
 import com.yellastro.btration.domain.runtime.RoomRuntime
 import com.yellastro.btration.domain.util.IdGenerator
+import com.yellastro.btration.repository.IgnoredNearbyRepository
 import com.yellastro.btration.repository.ProfileRepository
 import com.yellastro.btration.repository.RoomRepository
 import com.yellastro.btration.repository.VoiceSettingsRepository
@@ -22,6 +24,7 @@ import com.yellastro.btration.voice.PcmVoiceCapture
 import com.yellastro.btration.voice.PcmVoicePlayer
 import com.yellastro.btration.voice.SwitchableVoiceTransport
 import com.yellastro.btration.voice.UnavailableVoiceTransport
+import com.yellastro.btration.voice.VoiceFrameCodec
 import com.yellastro.btration.voice.VoiceRuntime
 import com.yellastro.btration.voice.VoiceTransport
 import com.yellastro.btration.voice.VoiceTransportMode
@@ -47,7 +50,12 @@ class AppContainer(context: Context) {
     private val nearbyTransport = NearbyTransport(
         context = applicationContext,
         connectionsClient = Nearby.getConnectionsClient(applicationContext),
+    )
+    private val roomTransport = RoomTransport(
+        neighborTransport = nearbyTransport,
         wireCodec = wireCodec,
+        externalScope = applicationScope,
+        shouldIgnoreMessage = VoiceFrameCodec::isVoiceFrame,
     )
     /**
      * Репозиторий пользовательских voice-настроек, сохраненных в SharedPreferences.
@@ -71,7 +79,7 @@ class AppContainer(context: Context) {
     )
 
     init {
-        nearbyTransport.stopAllEndpointsAndClearState(reason = "app_container_init")
+        roomTransport.stopAllEndpointsAndClearState(reason = "app_container_init")
     }
 
     /**
@@ -80,10 +88,13 @@ class AppContainer(context: Context) {
     val profileRepository = ProfileRepository(
         prefs = prefs,
     )
+    private val ignoredNearbyRepository = IgnoredNearbyRepository(
+        prefs = prefs,
+    )
 
     private val roomRuntime = RoomRuntime(
         profileRepository = profileRepository,
-        nearbyTransport = nearbyTransport,
+        roomTransport = roomTransport,
         voiceTransport = voiceTransport,
         voiceRuntime = voiceRuntime,
         voiceSettingsRepository = voiceSettingsRepository,
@@ -116,6 +127,7 @@ class AppContainer(context: Context) {
             LobbyViewModel(
                 roomRepository = roomRepository,
                 profileRepository = profileRepository,
+                ignoredNearbyRepository = ignoredNearbyRepository,
                 voiceSettingsRepository = voiceSettingsRepository,
             )
         }
@@ -160,7 +172,8 @@ class AppContainer(context: Context) {
     private fun createVoiceTransport(mode: VoiceTransportMode): VoiceTransport {
         return when (mode) {
             VoiceTransportMode.NEARBY_BYTES -> NearbyVoiceTransport(
-                nearbyTransport = nearbyTransport,
+                neighborTransport = nearbyTransport,
+                peerLinkResolver = roomTransport,
                 externalScope = applicationScope,
             )
             VoiceTransportMode.WIFI_DIRECT_UDP -> createWifiDirectVoiceTransport()

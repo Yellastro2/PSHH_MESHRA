@@ -4,12 +4,20 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.view.View
 import android.widget.Toast
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.updatePadding
 import androidx.fragment.app.Fragment
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * Главный контейнер UI-слоя: запрашивает permissions, выбирает стартовый экран и управляет ручной fragment-навигацией.
@@ -18,6 +26,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var nearbyPermissionLauncher: ActivityResultLauncher<Array<String>>
     private val appContainer: AppContainer
         get() = (application as BtRationApplication).appContainer
+
+    private val _keyboardVisible = MutableStateFlow(false)
+    val keyboardVisible: StateFlow<Boolean> = _keyboardVisible.asStateFlow()
 
     /**
      * Загружает контейнер, запрашивает permissions и показывает лобби или экран профиля.
@@ -29,10 +40,40 @@ class MainActivity : AppCompatActivity() {
         ) {
             handleStartupPermissionResult()
         }
+
+        enableEdgeToEdge()
         setContentView(R.layout.activity_main)
         if (savedInstanceState == null) {
             requestStartupPermissionsIfNeeded()
         }
+
+        val root = findViewById<View>(R.id.fragment_container)
+
+        ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
+            val systemBars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or
+                        WindowInsetsCompat.Type.displayCutout()
+            )
+
+            val imeVisible =
+                insets.isVisible(WindowInsetsCompat.Type.ime())
+
+            val imeBottom =
+                insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+
+            view.updatePadding(
+                left = systemBars.left,
+                top = systemBars.top,
+                right = systemBars.right,
+                bottom = maxOf(systemBars.bottom, imeBottom),
+            )
+
+            _keyboardVisible.value = imeVisible
+
+            insets
+        }
+
+        ViewCompat.requestApplyInsets(root)
     }
 
     /**
