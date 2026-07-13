@@ -20,9 +20,17 @@ class VoiceRuntime(
     private val voicePlayer: PcmVoicePlayer,
     private val externalScope: CoroutineScope,
 ) {
+    private fun interface VoiceFrameSender {
+        /**
+         * Отправляет уже закодированный voice frame выбранным адресатам.
+         */
+        fun send(targetPeerIds: Set<PeerId>, frame: VoiceFrame)
+    }
+
     private var isTalking = false
     private var activeTalkingOriginPeerId: PeerId? = null
     private var activeTalkingTargetPeerIds: Set<PeerId> = emptySet()
+    private var activeFrameSender: VoiceFrameSender? = null
     private var activeOutgoingEncoder: OpusVoiceEncoder? = null
     private var outgoingVoiceSequence = 0L
     private val activeFrameSessions = ConcurrentHashMap<PeerId, ActiveFrameSession>()
@@ -33,6 +41,21 @@ class VoiceRuntime(
      * Начинает передачу микрофона от исходного участника выбранным адресатам через текущий VoiceTransport.
      */
     fun startTalking(originPeerId: PeerId, targetPeerIds: Set<PeerId>): Boolean {
+        return startTalking(
+            originPeerId = originPeerId,
+            targetPeerIds = targetPeerIds,
+            sendFrame = { peerIds, frame -> voiceTransport.sendFrameToPeers(peerIds, frame) },
+        )
+    }
+
+    /**
+     * Начинает передачу микрофона и отдает закодированные Opus frames наружу через переданный sender.
+     */
+    fun startTalking(
+        originPeerId: PeerId,
+        targetPeerIds: Set<PeerId>,
+        sendFrame: (targetPeerIds: Set<PeerId>, frame: VoiceFrame) -> Unit,
+    ): Boolean {
         if (isTalking) {
             Log.i(TAG, "[startTalking] Передача голоса уже активна")
             return true
@@ -53,6 +76,14 @@ class VoiceRuntime(
         outgoingVoiceSequence = 0L
         activeTalkingOriginPeerId = originPeerId
         activeTalkingTargetPeerIds = targetPeerIds
+        activeFrameSender = object : VoiceFrameSender {
+            /**
+             * Передает frame в callback, выбранный RoomRuntime для текущего transport режима.
+             */
+            override fun send(targetPeerIds: Set<PeerId>, frame: VoiceFrame) {
+                sendFrame(targetPeerIds, frame)
+            }
+        }
         synchronized(outgoingEncoderLock) {
             activeOutgoingEncoder?.close()
             activeOutgoingEncoder = encoder
@@ -71,6 +102,7 @@ class VoiceRuntime(
             isTalking = false
             activeTalkingOriginPeerId = null
             activeTalkingTargetPeerIds = emptySet()
+            activeFrameSender = null
             synchronized(outgoingEncoderLock) {
                 if (activeOutgoingEncoder === encoder) {
                     activeOutgoingEncoder = null
@@ -92,10 +124,11 @@ class VoiceRuntime(
         }
         val originPeerId = activeTalkingOriginPeerId
         val targetPeerIds = activeTalkingTargetPeerIds
+        val frameSender = activeFrameSender
         voiceCapture.stop()
         isTalking = false
-        if (originPeerId != null && targetPeerIds.isNotEmpty()) {
-            sendLocalVoiceFrame(originPeerId, targetPeerIds, pcmBytes = ByteArray(0), isFinal = true)
+        if (originPeerId != null && targetPeerIds.isNotEmpty() && frameSender != null) {
+            sendLocalVoiceFrame(originPeerId, targetPeerIds, pcmBytes = ByteArray(0), isFinal = true, frameSender = frameSender)
         }
         synchronized(outgoingEncoderLock) {
             activeOutgoingEncoder?.close()
@@ -103,6 +136,7 @@ class VoiceRuntime(
         }
         activeTalkingOriginPeerId = null
         activeTalkingTargetPeerIds = emptySet()
+        activeFrameSender = null
         Log.i(TAG, "[stopTalking] Передача голоса opus-frame-mode остановлена")
     }
 
@@ -184,6 +218,24 @@ class VoiceRuntime(
         pcmBytes: ByteArray,
         isFinal: Boolean,
     ) {
+        val frameSender = activeFrameSender
+        if (frameSender == null) {
+            Log.w(TAG, "[sendLocalVoiceFrame] Нет активного отправителя voice frame")
+            return
+        }
+        sendLocalVoiceFrame(originPeerId, targetPeerIds, pcmBytes, isFinal, frameSender)
+    }
+
+    /**
+     * Кодирует локальный PCM-фрейм в Opus, передает его наружу через sender и двигает sequence локальной передачи.
+     */
+    private fun sendLocalVoiceFrame(
+        originPeerId: PeerId,
+        targetPeerIds: Set<PeerId>,
+        pcmBytes: ByteArray,
+        isFinal: Boolean,
+        frameSender: VoiceFrameSender,
+    ) {
         val sequence = outgoingVoiceSequence++
         val encodedBytes = if (isFinal) {
             ByteArray(0)
@@ -195,7 +247,7 @@ class VoiceRuntime(
                 return
             }
         }
-        voiceTransport.sendFrameToPeers(
+        frameSender.send(
             targetPeerIds,
             VoiceFrame(
                 originPeerId = originPeerId,

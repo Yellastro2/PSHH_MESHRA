@@ -71,3 +71,5 @@ ViewModel-слой готовит состояние для XML-фрагмент
 Для MESHRA-комнат `RoomViewModel` также combine-ит `RoomRepository.directMeshPeerIds` и помечает `MemberUi.isDirectlyConnected`. `RoomFragment` показывает `view_connect_indicator`: в MESHRA он фиолетовый (`bg_dot_connect`) для прямого mesh-соседа, для собственной карточки при наличии хотя бы одного прямого mesh-link-а, и серый для участника без прямого link-а, а в Nearby Star скрыт.
 
 Participant-цвета назначаются на UI-слое в `RoomViewModel`: self не получает цвет, а остальные текущие участники получают случайные цвета из `participant_color_01..10` без повторов, пока участников не больше размера палетки. `RoomFragment` применяет этот цвет к рамке карточки участника и к фону bubble чужих сообщений.
+
+Для MESHRA voice `RoomViewModel.canTalk` включается только когда `directMeshPeerIds` не пустой: без прямого mesh-соседа PTT не стартует, даже если комната активна.

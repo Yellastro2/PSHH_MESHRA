@@ -22,6 +22,7 @@ import android.widget.ImageView
 import android.widget.PopupMenu
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -124,7 +125,8 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Настраивает списки участников, чат, меню комнаты, выход/закрытие по типу комнаты, PTT-визуализацию и размер кнопки микрофона при IME.
+     * Настраивает списки участников, чат, меню комнаты, выход/закрытие по типу комнаты, системный Back,
+     * PTT-визуализацию и размер кнопки микрофона при IME.
      */
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
@@ -166,12 +168,20 @@ class RoomFragment : Fragment() {
         rvMembers.adapter = memberAdapter
 
         btnBack.setOnClickListener {
-            if (latestState.isHost && !latestState.isMeshRoom) {
-                showCloseRoomConfirmationDialog()
-            } else {
-                viewModel.onLeaveClicked()
-            }
+            handleBackNavigation()
         }
+
+        requireActivity().onBackPressedDispatcher.addCallback(
+            viewLifecycleOwner,
+            object : OnBackPressedCallback(true) {
+                /**
+                 * Направляет системную кнопку Back в ту же логику выхода, что и кнопка в шапке комнаты.
+                 */
+                override fun handleOnBackPressed() {
+                    handleBackNavigation()
+                }
+            },
+        )
 
         btnSend.setOnClickListener {
             viewModel.onSendClicked()
@@ -423,6 +433,17 @@ class RoomFragment : Fragment() {
             state.directAudioIssueMessage != null -> ContextCompat.getColor(requireContext(), android.R.color.holo_red_light)
             state.directAudioStatusText.isNotBlank() -> ContextCompat.getColor(requireContext(), R.color.second_accent_green)
             else -> ContextCompat.getColor(requireContext(), R.color.second_accent_green)
+        }
+    }
+
+    /**
+     * Обрабатывает уход с экрана комнаты через кнопку в шапке или системный Back без обхода runtime-выхода.
+     */
+    private fun handleBackNavigation() {
+        if (latestState.isHost && !latestState.isMeshRoom) {
+            showCloseRoomConfirmationDialog()
+        } else {
+            viewModel.onLeaveClicked()
         }
     }
 

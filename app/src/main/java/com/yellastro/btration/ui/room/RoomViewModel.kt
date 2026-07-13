@@ -172,8 +172,18 @@ class RoomViewModel(
         val canSend = input.isNotBlank() &&
             (runtimeState is RoomRuntimeState.Hosting || runtimeState is RoomRuntimeState.Client)
         val directAudioStatus = directAudioStatusOf(runtimeState)
+        val isMeshActiveRoom = when (runtimeState) {
+            is RoomRuntimeState.Hosting -> runtimeState.room.roomTransportMode == RoomTransportMode.MESHRA
+            is RoomRuntimeState.Client -> runtimeState.room.roomTransportMode == RoomTransportMode.MESHRA
+            RoomRuntimeState.Idle,
+            RoomRuntimeState.Searching,
+            is RoomRuntimeState.Joining,
+            is RoomRuntimeState.Error,
+            -> false
+        }
         val canTalk = (runtimeState is RoomRuntimeState.Hosting || runtimeState is RoomRuntimeState.Client) &&
-            directAudioStatus !is DirectAudioStatus.Unavailable
+            directAudioStatus !is DirectAudioStatus.Unavailable &&
+            (!isMeshActiveRoom || directMeshPeerIds.isNotEmpty())
 
         return when (runtimeState) {
             is RoomRuntimeState.Hosting -> {
@@ -193,7 +203,7 @@ class RoomViewModel(
                     isClosed = false,
                     voiceTransportPreference = voiceTransportPreference,
                     roomVoiceTransportPreference = roomVoiceTransportPreference,
-                    directAudioStatusText = directAudioStatusText(runtimeState.directAudioStatus, roomVoiceTransportPreference),
+                    directAudioStatusText = directAudioStatusText(runtimeState.directAudioStatus, roomVoiceTransportPreference, runtimeState.room.roomTransportMode),
                     directAudioIssueMessage = directAudioIssueMessage(runtimeState.directAudioStatus),
                     errorMessage = null,
                 )
@@ -216,7 +226,7 @@ class RoomViewModel(
                     isClosed = false,
                     voiceTransportPreference = voiceTransportPreference,
                     roomVoiceTransportPreference = roomVoiceTransportPreference,
-                    directAudioStatusText = directAudioStatusText(runtimeState.directAudioStatus, roomVoiceTransportPreference),
+                    directAudioStatusText = directAudioStatusText(runtimeState.directAudioStatus, roomVoiceTransportPreference, runtimeState.room.roomTransportMode),
                     directAudioIssueMessage = directAudioIssueMessage(runtimeState.directAudioStatus),
                     errorMessage = null,
                 )
@@ -235,7 +245,7 @@ class RoomViewModel(
                     isClosed = false,
                     voiceTransportPreference = voiceTransportPreference,
                     roomVoiceTransportPreference = roomVoiceTransportPreference,
-                    directAudioStatusText = directAudioStatusText(runtimeState.directAudioStatus, roomVoiceTransportPreference),
+                    directAudioStatusText = directAudioStatusText(runtimeState.directAudioStatus, roomVoiceTransportPreference, runtimeState.room.roomTransportMode),
                     directAudioIssueMessage = directAudioIssueMessage(runtimeState.directAudioStatus),
                 )
             }
@@ -288,8 +298,13 @@ class RoomViewModel(
     private fun directAudioStatusText(
         status: DirectAudioStatus?,
         roomVoiceTransportPreference: VoiceTransportPreference,
+        roomTransportMode: RoomTransportMode,
     ): String {
-        val transportName = roomVoiceTransportPreference.shortName.uppercase(Locale.ROOT)
+        val transportName = if (roomTransportMode == RoomTransportMode.MESHRA) {
+            MESH_VOICE_TRANSPORT_NAME
+        } else {
+            roomVoiceTransportPreference.shortName.uppercase(Locale.ROOT)
+        }
         return when (status) {
             DirectAudioStatus.Connecting -> "$transportName • ПОДКЛЮЧЕНИЕ"
             DirectAudioStatus.Ready -> "$transportName • ГОТОВ"
@@ -424,6 +439,7 @@ class RoomViewModel(
         private const val STOP_TIMEOUT_MILLIS = 5_000L
         private const val TIME_PATTERN = "HH:mm"
         private const val DIRECT_AUDIO_UNAVAILABLE_MESSAGE = "Прямой аудиоканал не установлен"
+        private const val MESH_VOICE_TRANSPORT_NAME = "MESH"
         private val PARTICIPANT_COLOR_RES_IDS = listOf(
             R.color.participant_color_03,
             R.color.participant_color_04,

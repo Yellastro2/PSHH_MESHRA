@@ -11,7 +11,9 @@ import com.yellastro.btration.domain.transport.NeighborCandidateId
 import com.yellastro.btration.domain.transport.NeighborLinkId
 import com.yellastro.btration.domain.transport.NeighborTransport
 import com.yellastro.btration.domain.transport.NeighborTransportEvent
+import com.yellastro.btration.voice.VoiceFrame
 import com.yellastro.btration.voice.VoiceTransportMode
+import java.util.LinkedHashSet
 import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -40,6 +42,7 @@ class MeshTransport(
     private val pendingGatewayPeerIds = mutableMapOf<NeighborCandidateId, PeerId>()
     private val linkPeerIds = mutableMapOf<NeighborLinkId, PeerId>()
     private val seenEventIds = mutableSetOf<MeshRoomEventId>()
+    private val seenVoiceFrameIds = LinkedHashSet<MeshVoiceFrameId>()
     private val roomSnapshots = mutableMapOf<RoomId, MeshRoomSnapshot>()
     private val advertisingLock = Any()
     private var advertisedEndpointName: String? = null
@@ -160,6 +163,7 @@ class MeshTransport(
         pendingGatewayConnections.clear()
         pendingGatewayPeerIds.clear()
         linkPeerIds.clear()
+        seenVoiceFrameIds.clear()
         publishDirectPeerIds()
         Log.i(TAG, "[disconnectAll] Все mesh link-и разорваны")
     }
@@ -174,6 +178,7 @@ class MeshTransport(
         pendingGatewayPeerIds.clear()
         linkPeerIds.clear()
         seenEventIds.clear()
+        seenVoiceFrameIds.clear()
         roomSnapshots.clear()
         synchronized(advertisingLock) {
             advertisedEndpointName = null
@@ -297,6 +302,29 @@ class MeshTransport(
                 createdAtMillis = message.createdAtMillis,
             ),
         )
+    }
+
+    /**
+     * Публикует локальный ephemeral voice frame в MESHRA flood без сохранения в event-log комнаты.
+     */
+    fun publishVoiceFrame(roomId: RoomId, frame: VoiceFrame) {
+        val meshVoiceFrame = MeshVoiceFrame(
+            frameId = newVoiceFrameId(),
+            originPeerId = frame.originPeerId,
+            sequence = frame.sequence,
+            encodedBytes = frame.encodedBytes,
+            isFinal = frame.isFinal,
+        )
+        rememberVoiceFrameId(meshVoiceFrame.frameId)
+        floodVoiceFrame(
+            roomId = roomId,
+            voiceFrame = meshVoiceFrame,
+            incomingLinkId = null,
+            ttl = VOICE_TTL,
+        )
+        if (frame.sequence == FIRST_VOICE_FRAME_SEQUENCE || frame.isFinal) {
+            Log.i(TAG, "[publishVoiceFrame] Mesh voice frame опубликован roomId=${roomId.value} frameId=${meshVoiceFrame.frameId.value} originPeerId=${frame.originPeerId.value} sequence=${frame.sequence} final=${frame.isFinal}")
+        }
     }
 
     /**
@@ -451,6 +479,7 @@ class MeshTransport(
             MeshPayloadKind.ROOM_EVENT -> handleRoomEventEnvelope(linkId, envelope)
             MeshPayloadKind.ROOM_SNAPSHOT -> handleSnapshotEnvelope(linkId, envelope)
             MeshPayloadKind.PEER_HELLO -> handlePeerHelloEnvelope(linkId, envelope)
+            MeshPayloadKind.VOICE_FRAME -> handleVoiceFrameEnvelope(linkId, envelope)
         }
     }
 
@@ -496,6 +525,41 @@ class MeshTransport(
         mergeSnapshot(snapshot)
         emitEvent(MeshTransportEvent.SnapshotReceived(snapshot, linkId))
         Log.i(TAG, "[handleSnapshotEnvelope] Snapshot принят roomId=${snapshot.roomId.value} eventCount=${snapshot.events.size} linkId=${linkId.value}")
+    }
+
+    /**
+     * Принимает ephemeral voice frame, дедупит его, flood-ит дальше и отдает runtime для playback.
+     */
+    private fun handleVoiceFrameEnvelope(linkId: NeighborLinkId, envelope: MeshEnvelope) {
+        val roomId = envelope.roomId
+        val voiceFrame = envelope.voiceFrame
+        if (roomId == null || voiceFrame == null) {
+            Log.w(TAG, "[handleVoiceFrameEnvelope] Mesh voice envelope неполный linkId=${linkId.value} roomId=${roomId?.value}")
+            return
+        }
+        if (!rememberVoiceFrameId(voiceFrame.frameId)) {
+            return
+        }
+        val nextTtl = envelope.ttl - 1
+        if (nextTtl >= 0) {
+            floodVoiceFrame(
+                roomId = roomId,
+                voiceFrame = voiceFrame,
+                incomingLinkId = linkId,
+                ttl = nextTtl,
+            )
+        }
+        emitEvent(
+            MeshTransportEvent.VoiceFrameReceived(
+                roomId = roomId,
+                frame = voiceFrame.toVoiceFrame(),
+                sourceLinkId = linkId,
+                previousHopPeerId = envelope.previousHopPeerId,
+            ),
+        )
+        if (voiceFrame.sequence == FIRST_VOICE_FRAME_SEQUENCE || voiceFrame.isFinal) {
+            Log.i(TAG, "[handleVoiceFrameEnvelope] Mesh voice frame принят roomId=${roomId.value} frameId=${voiceFrame.frameId.value} originPeerId=${voiceFrame.originPeerId.value} sequence=${voiceFrame.sequence} final=${voiceFrame.isFinal}")
+        }
     }
 
     /**
@@ -554,6 +618,38 @@ class MeshTransport(
             emitEvent(MeshTransportEvent.SendFailed(roomId = event.roomId, eventId = event.eventId, cause = cause))
         }
         Log.i(TAG, "[floodEvent] Mesh-событие переслано eventId=${event.eventId.value} targetCount=${targetLinks.size} ttl=$ttl")
+    }
+
+    /**
+     * Отправляет ephemeral voice frame всем активным соседям, кроме link-а, с которого он пришел.
+     */
+    private fun floodVoiceFrame(
+        roomId: RoomId,
+        voiceFrame: MeshVoiceFrame,
+        incomingLinkId: NeighborLinkId?,
+        ttl: Int,
+    ) {
+        if (ttl < 0) {
+            return
+        }
+        val targetLinks = activeLinks.filterNot { linkId -> linkId == incomingLinkId }
+        if (targetLinks.isEmpty()) {
+            return
+        }
+        val envelope = MeshEnvelope(
+            roomId = roomId,
+            previousHopPeerId = selfPeerId,
+            ttl = ttl,
+            payloadKind = MeshPayloadKind.VOICE_FRAME,
+            voiceFrame = voiceFrame,
+            sentAtMillis = now(),
+        )
+        neighborTransport.sendMessage(targetLinks, codec.encode(envelope)) { cause ->
+            emitEvent(MeshTransportEvent.SendFailed(roomId = roomId, eventId = null, cause = cause, isRealtime = true))
+        }
+        if (voiceFrame.sequence == FIRST_VOICE_FRAME_SEQUENCE || voiceFrame.isFinal) {
+            Log.i(TAG, "[floodVoiceFrame] Mesh voice frame переслан frameId=${voiceFrame.frameId.value} targetCount=${targetLinks.size} ttl=$ttl final=${voiceFrame.isFinal}")
+        }
     }
 
     /**
@@ -668,6 +764,32 @@ class MeshTransport(
     }
 
     /**
+     * Запоминает voice frame id в ограниченном LRU-подобном cache и возвращает false для дублей.
+     */
+    private fun rememberVoiceFrameId(frameId: MeshVoiceFrameId): Boolean {
+        if (!seenVoiceFrameIds.add(frameId)) {
+            return false
+        }
+        while (seenVoiceFrameIds.size > MAX_SEEN_VOICE_FRAME_IDS) {
+            val oldestFrameId = seenVoiceFrameIds.iterator().next()
+            seenVoiceFrameIds.remove(oldestFrameId)
+        }
+        return true
+    }
+
+    /**
+     * Преобразует mesh voice payload в обычный VoiceFrame для VoiceRuntime playback.
+     */
+    private fun MeshVoiceFrame.toVoiceFrame(): VoiceFrame {
+        return VoiceFrame(
+            originPeerId = originPeerId,
+            sequence = sequence,
+            encodedBytes = encodedBytes,
+            isFinal = isFinal,
+        )
+    }
+
+    /**
      * Публикует событие mesh-слоя без подвешивания callback-потока.
      */
     private fun emitEvent(event: MeshTransportEvent) {
@@ -684,6 +806,13 @@ class MeshTransport(
     }
 
     /**
+     * Создает уникальный идентификатор ephemeral voice frame-а для dedup в mesh flood.
+     */
+    private fun newVoiceFrameId(): MeshVoiceFrameId {
+        return MeshVoiceFrameId("mesh_voice_${UUID.randomUUID()}")
+    }
+
+    /**
      * Возвращает текущее системное время.
      */
     private fun now(): Long {
@@ -693,7 +822,10 @@ class MeshTransport(
     private companion object {
         private const val TAG = "MeshTransport"
         private const val DEFAULT_TTL = 16
+        private const val VOICE_TTL = 8
+        private const val MAX_SEEN_VOICE_FRAME_IDS = 4_096
         private const val EVENT_BUFFER_CAPACITY = 64
+        private const val FIRST_VOICE_FRAME_SEQUENCE = 0L
     }
 }
 
@@ -735,6 +867,16 @@ sealed class MeshTransportEvent {
     data class SnapshotReceived(val snapshot: MeshRoomSnapshot, val sourceLinkId: NeighborLinkId) : MeshTransportEvent()
 
     /**
+     * Ephemeral voice frame принят из MESHRA flood и готов к локальному playback.
+     */
+    data class VoiceFrameReceived(
+        val roomId: RoomId,
+        val frame: VoiceFrame,
+        val sourceLinkId: NeighborLinkId,
+        val previousHopPeerId: PeerId?,
+    ) : MeshTransportEvent()
+
+    /**
      * Входящий mesh payload не удалось декодировать.
      */
     data class DecodeFailed(val linkId: NeighborLinkId, val cause: Throwable) : MeshTransportEvent()
@@ -742,7 +884,12 @@ sealed class MeshTransportEvent {
     /**
      * Отправка mesh payload-а завершилась ошибкой; roomId null означает служебный payload вне комнаты.
      */
-    data class SendFailed(val roomId: RoomId?, val eventId: MeshRoomEventId?, val cause: Throwable) : MeshTransportEvent()
+    data class SendFailed(
+        val roomId: RoomId?,
+        val eventId: MeshRoomEventId?,
+        val cause: Throwable,
+        val isRealtime: Boolean = false,
+    ) : MeshTransportEvent()
 
     /**
      * Нижний транспорт сообщил ошибку connection lifecycle.

@@ -35,7 +35,7 @@ RoomTransport.events + MeshTransport.events + VoiceTransport.events
 
 `RoomTransport` держит Nearby Star room-level протокол поверх `NeighborTransport`: декодирует/кодирует `WirePacket`, разбирает короткую визитку комнаты, ведет связь `PeerId <-> linkId` и прячет детали конкретного нижнего транспорта от `RoomRuntime`.
 
-`MeshTransport` держит MESHRA room-level протокол поверх того же `NeighborTransport`: принимает gateway-рекламу, snapshot-ы и durable room events, дедупит их по `eventId` и flood-ит соседям.
+`MeshTransport` держит MESHRA room-level протокол поверх того же `NeighborTransport`: принимает gateway-рекламу, snapshot-ы, durable room events и ephemeral voice frames, дедупит их и flood-ит соседям.
 Для live-UI он также держит `directPeerIds` — набор `PeerId`, с которыми есть прямой mesh link. Эта информация строится из gateway-рекламы и служебного `PEER_HELLO`, а не из `endpointId` в UI.
 
 ## StateFlow
@@ -115,6 +115,7 @@ Client:
 - `RoomRuntime.stopTalking()` убирает локальный `PeerId` из `talkingPeerIds`.
 - При `VoiceTransportEvent.FrameReceived` runtime добавляет `originPeerId` отправителя в `talkingPeerIds`, передает Opus frame в `VoiceRuntime.playIncomingFrame(...)` и снимает индикатор через callback после final-frame/EOF.
 - Для UDP media-plane есть fallback: каждый non-final voice frame продлевает таймер говорящего, а если final-frame потерялся, runtime гасит индикатор и закрывает входящую frame-сессию по таймауту тишины.
+- Для MESHRA media-plane `VoiceRuntime` кодирует Opus frames через callback, а `RoomRuntime` публикует их в `MeshTransport.publishVoiceFrame(...)`. Входящие `MeshTransportEvent.VoiceFrameReceived` проигрываются через `VoiceRuntime` без старого host relay, потому что relay уже сделан mesh flooding-ом.
 - `resetSession()`, `setError()`, disconnect и `MEMBER_LEFT` очищают соответствующие talking-состояния.
 
 ## PacketId / TTL
@@ -129,6 +130,6 @@ Client:
 
 ## Ограничения текущего слоя
 
-- Нет mesh relay, только задел через `packetId` и `ttl`.
-- MESHRA сейчас покрывает вступление, выход/разрыв и текстовый чат. Voice в MESHRA-комнатах намеренно помечается как недоступный до отдельной realtime-политики.
-- Voice MVP использует `VoiceTransport`; дефолтный режим в настройках — `WIFI_DIRECT_UDP`, при этом реальный delegate создается только после применения режима конкретной комнаты.
+- В MESHRA есть flooding/relay для text events и ephemeral voice frames; отдельной политики маршрутизации и приоритетов пока нет.
+- MESHRA сейчас покрывает вступление, выход/разрыв, текстовый чат и Opus voice frames через ephemeral mesh payload.
+- Nearby Star voice использует `VoiceTransport`; MESHRA voice идет через `MeshTransport` как ephemeral payload. Дефолтный режим в настройках — `WIFI_DIRECT_UDP`, при этом реальный delegate создается только после применения режима конкретной комнаты.

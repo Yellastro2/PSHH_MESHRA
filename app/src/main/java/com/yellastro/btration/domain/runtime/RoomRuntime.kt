@@ -22,6 +22,7 @@ import com.yellastro.btration.domain.util.IdGenerator
 import com.yellastro.btration.repository.ProfileRepository
 import com.yellastro.btration.repository.VoiceSettingsRepository
 import com.yellastro.btration.voice.SwitchableVoiceTransport
+import com.yellastro.btration.voice.VoiceFrame
 import com.yellastro.btration.voice.VoiceTransportEvent
 import com.yellastro.btration.voice.VoiceRuntime
 import com.yellastro.btration.voice.VoiceTransportMode
@@ -261,7 +262,7 @@ class RoomRuntime(
         _state.value = RoomRuntimeState.Hosting(
             room = room,
             members = listOf(self),
-            directAudioStatus = DirectAudioStatus.Unavailable(MESH_VOICE_UNAVAILABLE_MESSAGE),
+            directAudioStatus = DirectAudioStatus.Ready,
         )
         meshTransport.publishMemberJoined(
             roomId = room.roomId,
@@ -340,7 +341,7 @@ class RoomRuntime(
         _messages.value = emptyList()
         _state.value = RoomRuntimeState.Joining(
             room = room,
-            directAudioStatus = DirectAudioStatus.Unavailable(MESH_VOICE_UNAVAILABLE_MESSAGE),
+            directAudioStatus = DirectAudioStatus.Connecting,
         )
         Log.i(TAG, "[joinMeshRoom] Runtime переведен в Joining MESHRA roomId=${room.roomId.value} endpointId=$endpointId")
         meshTransport.connectToGateway(
@@ -495,6 +496,9 @@ class RoomRuntime(
         val selfPeerId = profileRepository.getOrCreatePeerId()
         when (val currentState = _state.value) {
             is RoomRuntimeState.Hosting -> {
+                if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
+                    return startMeshTalking(currentState.room, currentState.members, selfPeerId)
+                }
                 val targetPeerIds = currentState.members
                     .map { peer -> peer.peerId }
                     .filterNot { peerId -> peerId == selfPeerId }
@@ -521,6 +525,9 @@ class RoomRuntime(
             }
 
             is RoomRuntimeState.Client -> {
+                if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
+                    return startMeshTalking(currentState.room, currentState.members, selfPeerId)
+                }
                 val targetPeerIds = setOf(currentState.room.host.peerId)
                 if (!voiceTransport.isReadyForPeers(targetPeerIds)) {
                     val message = voiceTransportUnavailableMessage(currentState.room)
@@ -546,6 +553,36 @@ class RoomRuntime(
                 return false
             }
         }
+    }
+
+    /**
+     * Запускает голос в MESHRA-комнате: VoiceRuntime кодирует Opus, а MeshTransport flood-ит ephemeral voice frames.
+     */
+    private fun startMeshTalking(room: RoomInfo, members: List<Peer>, selfPeerId: PeerId): Boolean {
+        val memberPeerIds = members
+            .map { peer -> peer.peerId }
+            .filterNot { peerId -> peerId == selfPeerId }
+            .toSet()
+        val directMeshPeerIds = meshTransport.directPeerIds.value
+            .filterTo(mutableSetOf()) { peerId -> peerId in memberPeerIds }
+        if (directMeshPeerIds.isEmpty()) {
+            val message = "Mesh-аудиоканал не установлен: нет прямых mesh-соседей"
+            Log.w(TAG, "[startMeshTalking] Нет прямых mesh-соседей roomId=${room.roomId.value} memberCount=${members.size}")
+            emitNotice(message)
+            return false
+        }
+        val started = voiceRuntime.startTalking(
+            originPeerId = selfPeerId,
+            targetPeerIds = directMeshPeerIds,
+        ) { _, frame ->
+            meshTransport.publishVoiceFrame(roomId = room.roomId, frame = frame)
+        }
+        if (started) {
+            addTalkingPeer(selfPeerId)
+            Log.i(TAG, "[startMeshTalking] MESHRA-голос запущен roomId=${room.roomId.value} directMeshPeerCount=${directMeshPeerIds.size}")
+            return true
+        }
+        return false
     }
 
     /**
@@ -623,6 +660,7 @@ class RoomRuntime(
             is MeshTransportEvent.LinkDisconnected -> handleMeshLinkDisconnected(event)
             is MeshTransportEvent.EventAccepted -> handleMeshRoomUpdated(event.event.roomId)
             is MeshTransportEvent.SnapshotReceived -> handleMeshSnapshotReceived(event.snapshot)
+            is MeshTransportEvent.VoiceFrameReceived -> handleMeshVoiceFrameReceived(event)
             is MeshTransportEvent.DecodeFailed -> {
                 if (isCurrentStateMesh()) {
                     setError("Не удалось прочитать mesh-пакет: ${event.cause.message.orEmpty()}")
@@ -631,8 +669,8 @@ class RoomRuntime(
                 }
             }
             is MeshTransportEvent.SendFailed -> {
-                if (event.roomId == null) {
-                    Log.w(TAG, "[handleMeshTransportEvent] Служебный mesh-пакет не отправлен, комнату не роняем: ${event.cause.message}", event.cause)
+                if (event.roomId == null || event.isRealtime) {
+                    Log.w(TAG, "[handleMeshTransportEvent] Служебный/realtime mesh-пакет не отправлен, комнату не роняем: ${event.cause.message}", event.cause)
                     return
                 }
                 setError("Не удалось отправить mesh-пакет: ${event.cause.message.orEmpty()}")
@@ -835,19 +873,79 @@ class RoomRuntime(
             Log.w(TAG, "[handleVoiceFrameReceived] Voice frame получен вне активной комнаты currentState=${_state.value.javaClass.simpleName}")
             return
         }
-        if (event.frame.isFinal) {
-            cancelTalkingPeerTimeout(event.frame.originPeerId)
-        } else {
-            addTalkingPeer(event.frame.originPeerId)
-            scheduleTalkingPeerTimeout(event.frame.originPeerId)
-        }
-
-        voiceRuntime.playIncomingFrame(
+        handlePlayableVoiceFrame(
             directPeerId = peerId,
             frame = event.frame,
             resolveRelayTargets = ::resolveVoiceRelayTargets,
+        )
+    }
+
+    /**
+     * Обновляет talking-индикатор и передает валидный voice frame в VoiceRuntime.
+     */
+    private fun handlePlayableVoiceFrame(
+        directPeerId: PeerId,
+        frame: VoiceFrame,
+        resolveRelayTargets: (directPeerId: PeerId, originPeerId: PeerId) -> Set<PeerId>?,
+    ) {
+        if (frame.isFinal) {
+            cancelTalkingPeerTimeout(frame.originPeerId)
+        } else {
+            addTalkingPeer(frame.originPeerId)
+            scheduleTalkingPeerTimeout(frame.originPeerId)
+        }
+
+        voiceRuntime.playIncomingFrame(
+            directPeerId = directPeerId,
+            frame = frame,
+            resolveRelayTargets = resolveRelayTargets,
             onStarted = ::addTalkingPeer,
             onFinished = ::removeTalkingPeer,
+        )
+    }
+
+    /**
+     * Передает входящий MESHRA voice frame в VoiceRuntime: flood уже выполнен на уровне MeshTransport.
+     */
+    private fun handleMeshVoiceFrameReceived(event: MeshTransportEvent.VoiceFrameReceived) {
+        val currentState = _state.value
+        val members = when (currentState) {
+            is RoomRuntimeState.Hosting -> {
+                if (currentState.room.roomTransportMode != RoomTransportMode.MESHRA || currentState.room.roomId != event.roomId) {
+                    Log.w(TAG, "[handleMeshVoiceFrameReceived] Voice frame не для текущей host MESHRA-комнаты roomId=${event.roomId.value}")
+                    return
+                }
+                currentState.members
+            }
+            is RoomRuntimeState.Client -> {
+                if (currentState.room.roomTransportMode != RoomTransportMode.MESHRA || currentState.room.roomId != event.roomId) {
+                    Log.w(TAG, "[handleMeshVoiceFrameReceived] Voice frame не для текущей client MESHRA-комнаты roomId=${event.roomId.value}")
+                    return
+                }
+                currentState.members
+            }
+            RoomRuntimeState.Idle,
+            RoomRuntimeState.Searching,
+            is RoomRuntimeState.Joining,
+            is RoomRuntimeState.Error,
+            -> {
+                Log.w(TAG, "[handleMeshVoiceFrameReceived] Mesh voice frame получен вне активной MESHRA-комнаты currentState=${currentState.javaClass.simpleName}")
+                return
+            }
+        }
+        val selfPeerId = profileRepository.getOrCreatePeerId()
+        if (event.frame.originPeerId == selfPeerId) {
+            Log.i(TAG, "[handleMeshVoiceFrameReceived] Собственный mesh voice frame проигнорирован sequence=${event.frame.sequence}")
+            return
+        }
+        if (members.none { peer -> peer.peerId == event.frame.originPeerId }) {
+            Log.w(TAG, "[handleMeshVoiceFrameReceived] Автор mesh voice frame не является участником originPeerId=${event.frame.originPeerId.value} roomId=${event.roomId.value}")
+            return
+        }
+        handlePlayableVoiceFrame(
+            directPeerId = event.previousHopPeerId ?: event.frame.originPeerId,
+            frame = event.frame,
+            resolveRelayTargets = { _, _ -> emptySet() },
         )
     }
 
@@ -987,7 +1085,7 @@ class RoomRuntime(
         _state.value = RoomRuntimeState.Client(
             room = room,
             members = members,
-            directAudioStatus = DirectAudioStatus.Unavailable(MESH_VOICE_UNAVAILABLE_MESSAGE),
+            directAudioStatus = DirectAudioStatus.Ready,
         )
         clearConnectionRecovery()
         activateRoomTransportMode(room.roomTransportMode, reason = "mesh_snapshot_received")
@@ -1021,7 +1119,7 @@ class RoomRuntime(
                 _state.value = currentState.copy(
                     room = room,
                     members = snapshot.members,
-                    directAudioStatus = DirectAudioStatus.Unavailable(MESH_VOICE_UNAVAILABLE_MESSAGE),
+                    directAudioStatus = DirectAudioStatus.Ready,
                 )
                 advertiseMeshSnapshot(roomId, profileRepository.getSelfPeer())
                 connectToKnownMeshGatewaysForHealing(roomId)
@@ -1036,7 +1134,7 @@ class RoomRuntime(
                 _state.value = currentState.copy(
                     room = room,
                     members = snapshot.members,
-                    directAudioStatus = DirectAudioStatus.Unavailable(MESH_VOICE_UNAVAILABLE_MESSAGE),
+                    directAudioStatus = DirectAudioStatus.Ready,
                 )
                 advertiseMeshSnapshot(roomId, profileRepository.getSelfPeer())
                 connectToKnownMeshGatewaysForHealing(roomId)
@@ -2118,6 +2216,5 @@ class RoomRuntime(
         private const val MESH_MIN_LINKS = 3
         private const val MESH_MAX_LINKS = 64
         private const val DIRECT_AUDIO_UNAVAILABLE_MESSAGE = "Прямой аудиоканал не установлен"
-        private const val MESH_VOICE_UNAVAILABLE_MESSAGE = "Голос в MESHRA-комнатах пока не поддерживается"
     }
 }

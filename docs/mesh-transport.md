@@ -2,7 +2,7 @@
 
 ## Назначение
 
-`MeshTransport` — экспериментальный слой текстового mesh-протокола поверх `NeighborTransport`.
+`MeshTransport` — экспериментальный слой текстового и voice mesh-протокола поверх `NeighborTransport`.
 
 Он подключен к основному `AppContainer` и включается `RoomRuntime`, когда комната создана или найдена с типом `MESHRA`.
 Обычный `Nearby Star` продолжает работать через `RoomTransport`.
@@ -31,7 +31,7 @@
 - `PEER_DISCONNECTED`;
 - `CHAT_MESSAGE`.
 
-События дедупятся по `MeshRoomEventId`. Отдельного `envelopeId` сейчас нет: mesh envelope несет событие, snapshot или служебный `PEER_HELLO` через соседский transport.
+События дедупятся по `MeshRoomEventId`. Отдельного `envelopeId` сейчас нет: mesh envelope несет событие, snapshot, служебный `PEER_HELLO` или ephemeral `VOICE_FRAME` через соседский transport.
 
 ## Payload
 
@@ -40,6 +40,8 @@
 Это позволяет mesh-слою игнорировать обычные room/voice bytes, а будущим соседним слоям — аналогично игнорировать mesh payload.
 
 `PEER_HELLO` — ephemeral payload вне event-log комнаты. Он отправляется сразу после `LinkConnected`, содержит `previousHopPeerId=selfPeerId` и нужен только для live-мапы `NeighborLinkId -> PeerId`. Если hello не отправился, комната не падает: связь может определиться позже по любому входящему mesh envelope от этого же link-а.
+
+`VOICE_FRAME` — ephemeral Opus frame вне event-log комнаты. Он содержит `MeshVoiceFrameId`, `originPeerId`, sequence, encoded bytes и final-флаг. Такие frames дедупятся по `MeshVoiceFrameId` в ограниченном cache на `4096` последних id и flood-ятся с TTL `8`; ошибки отправки отдельных realtime frames логируются, но не роняют комнату.
 
 ## Advertising / discovery
 
@@ -75,6 +77,7 @@
 4. При входе гость подключается к выбранному gateway и ждет `ROOM_SNAPSHOT`.
 5. После snapshot-а runtime заменяет временную комнату настоящим `RoomInfo`, публикует свой `MEMBER_JOINED` и тоже начинает advertising как gateway.
 6. Текстовые сообщения идут как `CHAT_MESSAGE` event и flood-ятся соседям с TTL/dedup.
+7. Голос в MESHRA идет как ephemeral `VOICE_FRAME`: `VoiceRuntime` кодирует Opus, `RoomRuntime` публикует frame в `MeshTransport`, а `MeshTransport` дедупит/flood-ит его без сохранения в snapshot.
 
 Если выбранный gateway успел протухнуть и Nearby вернул `STATUS_ENDPOINT_UNKNOWN`, `RoomRuntime` запускает clean discovery и повторяет connection при новом `GatewayFound` только для того же временного `mesh_room_<token>_gw_<gateway>` `RoomId`. Это не дает recovery перескочить на другой gateway той же комнаты, например на ignored host.
 
@@ -82,7 +85,7 @@
 
 Для UI-индикатора прямого соседства `MeshTransport` публикует `directPeerIds: StateFlow<Set<PeerId>>`. Outgoing link привязывается к `PeerId` сразу по `gatewayPeerId` из рекламы, incoming link — после `PEER_HELLO` или первого другого mesh envelope от соседа. UI не получает `endpointId`/`linkId`, только доменный `PeerId`.
 
-Для MESHRA-комнат voice сейчас явно помечается как недоступный: текстовый mesh уже включен, но отдельная realtime voice-политика еще не реализована.
+Для MESHRA-комнат voice считается готовым, когда есть хотя бы один прямой mesh link. PTT стартует только при наличии прямого mesh-соседа; дальше voice frame flood-ится по активной mesh-связности.
 
 ## Flooding
 
@@ -98,8 +101,10 @@
 
 `PEER_HELLO` принимается локально, не flood-ится и не меняет snapshot комнаты.
 
+`VOICE_FRAME` принимается локально, не меняет snapshot комнаты, дедупится по `MeshVoiceFrameId`, пересылается соседям кроме предыдущего hop-а и отдается в `RoomRuntime` для playback через `VoiceRuntime`.
+
 ## Ограничения
 
 - Нет криптографических подписей событий.
-- Нет отдельного audio payload: голос должен идти отдельным realtime payload и не попадать в event log.
+- Голос идет через flooding без jitter buffer и без отдельной политики приоритетов маршрута.
 - Нет политик доступа, rename, ban и других фич вне текущего текстового MVP.
