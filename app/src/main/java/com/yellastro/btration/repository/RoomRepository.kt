@@ -7,14 +7,23 @@ import com.yellastro.btration.domain.model.RoomTransportMode
 import com.yellastro.btration.domain.runtime.RoomRuntime
 import com.yellastro.btration.domain.runtime.RoomRuntimeState
 import com.yellastro.btration.service.RoomServiceController
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
- * Фасад комнаты для ViewModel: прокидывает discovery-циклы, команды комнаты, чат, голос и mesh-connect статусы в runtime.
+ * Фасад комнаты для ViewModel и foreground service: прокидывает discovery-циклы, команды комнаты,
+ * чат, общее локальное состояние микрофона и mesh-connect статусы в runtime.
  */
 class RoomRepository(
     private val roomRuntime: RoomRuntime,
     private val roomServiceController: RoomServiceController,
 ) {
+    private val _isTalking = MutableStateFlow(false)
+    private val _isMicrophoneLocked = MutableStateFlow(false)
+    private val microphoneMutex = Mutex()
+
     /**
      * Состояние runtime для наблюдения из ViewModel.
      */
@@ -44,6 +53,16 @@ class RoomRepository(
      * Одноразовые уведомления runtime для snackbar во ViewModel/UI.
      */
     val notices = roomRuntime.notices
+
+    /**
+     * Показывает UI и service, передает ли локальный пользователь голос прямо сейчас.
+     */
+    val isTalking = _isTalking.asStateFlow()
+
+    /**
+     * Показывает foreground service, закреплена ли передача без удержания PTT-кнопки.
+     */
+    val isMicrophoneLocked = _isMicrophoneLocked.asStateFlow()
 
     /**
      * Возвращает PeerId локального пользователя для маппинга UI-состояний комнаты.
@@ -102,21 +121,25 @@ class RoomRepository(
     }
 
     /**
-     * Покидает текущую комнату и просит service-обвязку остановиться, если runtime idle.
+     * Покидает текущую комнату, сбрасывает локальное состояние микрофона
+     * и просит service-обвязку остановиться, если runtime idle.
      */
     suspend fun leaveRoom() {
         Log.i(TAG, "[leaveRoom] Покидаем комнату через RoomRepository")
         roomRuntime.leaveRoom()
+        resetMicrophoneState()
         roomServiceController.stopIfIdle(roomRuntime.state.value.isIdle())
         Log.i(TAG, "[leaveRoom] Выход обработан state=${roomRuntime.state.value.javaClass.simpleName}")
     }
 
     /**
-     * Закрывает хостимую комнату и просит service-обвязку остановиться, если runtime idle.
+     * Закрывает хостимую комнату, сбрасывает локальное состояние микрофона
+     * и просит service-обвязку остановиться, если runtime idle.
      */
     suspend fun closeRoom() {
         Log.i(TAG, "[closeRoom] Закрываем комнату через RoomRepository")
         roomRuntime.closeRoom()
+        resetMicrophoneState()
         roomServiceController.stopIfIdle(roomRuntime.state.value.isIdle())
         Log.i(TAG, "[closeRoom] Закрытие обработано state=${roomRuntime.state.value.javaClass.simpleName}")
     }
@@ -130,21 +153,51 @@ class RoomRepository(
     }
 
     /**
-     * Начинает передачу микрофона в активную комнату и возвращает true при реальном старте.
+     * Сериализованно начинает передачу микрофона в активную комнату, публикует результат
+     * для UI/service и возвращает true при реальном старте.
      */
     suspend fun startTalking(): Boolean {
         Log.i(TAG, "[startTalking] Запускаем передачу голоса через RoomRepository")
-        val started = roomRuntime.startTalking()
-        roomServiceController.startIfNeeded(roomRuntime.state.value.needsService())
-        return started
+        return microphoneMutex.withLock {
+            val started = roomRuntime.startTalking()
+            _isTalking.value = started
+            if (!started) {
+                _isMicrophoneLocked.value = false
+            }
+            roomServiceController.startIfNeeded(roomRuntime.state.value.needsService())
+            started
+        }
     }
 
     /**
-     * Останавливает передачу микрофона.
+     * Сразу публикует выключение микрофона, снимает закрепление и сериализованно
+     * останавливает runtime-передачу после возможного незавершенного старта.
      */
     suspend fun stopTalking() {
         Log.i(TAG, "[stopTalking] Останавливаем передачу голоса через RoomRepository")
-        roomRuntime.stopTalking()
+        resetMicrophoneState()
+        microphoneMutex.withLock {
+            _isTalking.value = false
+            _isMicrophoneLocked.value = false
+            roomRuntime.stopTalking()
+        }
+    }
+
+    /**
+     * Публикует включение или снятие закрепленного PTT-режима для foreground notification.
+     */
+    fun setMicrophoneLocked(isLocked: Boolean) {
+        _isMicrophoneLocked.value = isLocked
+        Log.i(TAG, "[setMicrophoneLocked] Обновляем закрепление микрофона isLocked=$isLocked")
+    }
+
+    /**
+     * Возвращает общие локальные признаки микрофона в выключенное состояние.
+     */
+    private fun resetMicrophoneState() {
+        _isTalking.value = false
+        _isMicrophoneLocked.value = false
+        Log.i(TAG, "[resetMicrophoneState] Локальное состояние микрофона сброшено")
     }
 
     /**

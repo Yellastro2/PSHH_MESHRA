@@ -54,7 +54,7 @@ class NearbyVoiceTransport(
             )
             return
         }
-        neighborTransport.sendMessage(linkIds, VoiceFrameCodec.encode(frame)) { cause ->
+        neighborTransport.sendMessage(linkIds, VoiceFrameCodec.encode(frame), isRealtime = true) { cause ->
             emitEvent(
                 VoiceTransportEvent.FrameSendFailed(
                     peerIds = peerIds,

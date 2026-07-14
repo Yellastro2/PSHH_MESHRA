@@ -41,7 +41,7 @@
 
 `PEER_HELLO` — ephemeral payload вне event-log комнаты. Он отправляется сразу после `LinkConnected`, содержит `previousHopPeerId=selfPeerId` и нужен только для live-мапы `NeighborLinkId -> PeerId`. Если hello не отправился, комната не падает: связь может определиться позже по любому входящему mesh envelope от этого же link-а.
 
-`VOICE_FRAME` — ephemeral Opus frame вне event-log комнаты. Он содержит `MeshVoiceFrameId`, `originPeerId`, sequence, encoded bytes и final-флаг. Такие frames дедупятся по `MeshVoiceFrameId` в ограниченном cache на `4096` последних id и flood-ятся с TTL `8`; ошибки отправки отдельных realtime frames логируются, но не роняют комнату.
+`VOICE_FRAME` — ephemeral Opus frame вне event-log комнаты. Он содержит `MeshVoiceFrameId`, `originPeerId`, sequence, encoded bytes и final-флаг. Такие frames дедупятся по `MeshVoiceFrameId` в ограниченном cache на `4096` последних id и flood-ятся с TTL `8`; ошибки отправки отдельных realtime frames логируются, но не роняют комнату. Успешные realtime-отправки помечаются `isRealtime=true` в `NeighborTransport` и на Nearby payload-уровне логируются агрегированно примерно раз в секунду, а не строкой на каждый audio frame.
 
 ## Advertising / discovery
 

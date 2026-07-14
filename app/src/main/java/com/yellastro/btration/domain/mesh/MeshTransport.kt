@@ -644,7 +644,7 @@ class MeshTransport(
             voiceFrame = voiceFrame,
             sentAtMillis = now(),
         )
-        neighborTransport.sendMessage(targetLinks, codec.encode(envelope)) { cause ->
+        neighborTransport.sendMessage(targetLinks, codec.encode(envelope), isRealtime = true) { cause ->
             emitEvent(MeshTransportEvent.SendFailed(roomId = roomId, eventId = null, cause = cause, isRealtime = true))
         }
         if (voiceFrame.sequence == FIRST_VOICE_FRAME_SEQUENCE || voiceFrame.isFinal) {

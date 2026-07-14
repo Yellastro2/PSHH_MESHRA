@@ -28,11 +28,13 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 /**
- * Foreground service, который показывает постоянное уведомление о поиске или активной комнате.
+ * Foreground service, который показывает постоянное уведомление о поиске или активной комнате,
+ * отражает закрепленный микрофон и позволяет выключить его из notification action.
  */
 class RoomConnectionService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -47,17 +49,25 @@ class RoomConnectionService : Service() {
         get() = (application as BtRationApplication).appVisibilityTracker
 
     /**
-     * Создает notification channels и запускает foreground notification.
+     * Создает notification channels и запускает foreground notification
+     * с актуальным признаком закрепленного микрофона.
      */
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "[onCreate] Создаем RoomConnectionService")
         createNotificationChannels()
-        startForegroundSafely(buildForegroundNotification(roomRepository.runtimeState.value))
+        startForegroundSafely(
+            notification = buildForegroundNotification(
+                state = roomRepository.runtimeState.value,
+                isMicrophoneLocked = roomRepository.isMicrophoneLocked.value,
+            ),
+            includesMicrophone = roomRepository.isMicrophoneLocked.value,
+        )
     }
 
     /**
-     * Обрабатывает команды запуска/остановки и запускает наблюдение за состоянием runtime.
+     * Обрабатывает команды запуска/остановки, отключения runtime и микрофона,
+     * после чего запускает наблюдение за общим состоянием repository.
      */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(TAG, "[onStartCommand] Получена команда action=${intent?.action} startId=$startId")
@@ -71,6 +81,11 @@ class RoomConnectionService : Service() {
             Log.i(TAG, "[onStartCommand] Останавливаем service по ACTION_STOP")
             stopSelf()
             return START_NOT_STICKY
+        }
+
+        if (intent?.action == ACTION_DISABLE_MICROPHONE) {
+            Log.i(TAG, "[onStartCommand] Отключаем закрепленный микрофон по ACTION_DISABLE_MICROPHONE")
+            handleDisableMicrophoneAction()
         }
 
         startStateCollection()
@@ -95,7 +110,8 @@ class RoomConnectionService : Service() {
     }
 
     /**
-     * Подписывается на состояние комнаты и обновляет foreground notification.
+     * Подписывается на состояние комнаты и признак закрепленного микрофона,
+     * чтобы обновлять foreground notification и его service type.
      */
     private fun startStateCollection() {
         if (stateCollectorStarted) {
@@ -105,14 +121,22 @@ class RoomConnectionService : Service() {
         Log.i(TAG, "[startStateCollection] Запускаем подписку на state runtime")
         stateCollectorStarted = true
         serviceScope.launch {
-            roomRepository.runtimeState.collectLatest { state ->
-                Log.i(TAG, "[startStateCollection] Получено состояние runtime state=${state.javaClass.simpleName}")
+            combine(
+                roomRepository.runtimeState,
+                roomRepository.isMicrophoneLocked,
+            ) { state, isMicrophoneLocked ->
+                state to isMicrophoneLocked
+            }.collectLatest { (state, isMicrophoneLocked) ->
+                Log.i(
+                    TAG,
+                    "[startStateCollection] Получено состояние runtime state=${state.javaClass.simpleName} isMicrophoneLocked=$isMicrophoneLocked",
+                )
                 if (state is RoomRuntimeState.Idle || state is RoomRuntimeState.Error) {
                     Log.i(TAG, "[startStateCollection] Runtime idle/error, останавливаем service")
                     stopSelf()
                     return@collectLatest
                 }
-                updateForegroundNotification(state)
+                updateForegroundNotification(state, isMicrophoneLocked)
             }
         }
     }
@@ -144,6 +168,24 @@ class RoomConnectionService : Service() {
                 Log.w(TAG, "[handleDisconnectAction] Не удалось отключить runtime из кнопки уведомления: ${cause.message}", cause)
             }
             stopSelf()
+        }
+    }
+
+    /**
+     * Останавливает передачу микрофона из action-кнопки, не покидая текущую комнату.
+     */
+    private fun handleDisableMicrophoneAction() {
+        serviceScope.launch {
+            runCatching {
+                roomRepository.stopTalking()
+                Log.i(TAG, "[handleDisableMicrophoneAction] Микрофон отключен из кнопки уведомления")
+            }.onFailure { cause ->
+                Log.w(
+                    TAG,
+                    "[handleDisableMicrophoneAction] Не удалось отключить микрофон из кнопки уведомления: ${cause.message}",
+                    cause,
+                )
+            }
         }
     }
 
@@ -238,18 +280,30 @@ class RoomConnectionService : Service() {
     }
 
     /**
-     * Безопасно переводит сервис в foreground с типом connectedDevice.
+     * Безопасно переводит сервис в foreground с типом connectedDevice и при закреплении
+     * на поддерживаемых SDK добавляет microphone, чтобы запись могла продолжаться вне активного экрана приложения.
      */
     @SuppressLint("MissingPermission")
-    private fun startForegroundSafely(notification: Notification) {
+    private fun startForegroundSafely(notification: Notification, includesMicrophone: Boolean) {
+        val foregroundServiceType = if (
+            includesMicrophone && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+        ) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        } else {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        }
         runCatching {
             ServiceCompat.startForeground(
                 this,
                 FOREGROUND_NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+                foregroundServiceType,
             )
-            Log.i(TAG, "[startForegroundSafely] Service переведен в foreground")
+            Log.i(
+                TAG,
+                "[startForegroundSafely] Foreground notification применен includesMicrophone=$includesMicrophone",
+            )
         }.onFailure { cause ->
             Log.w(TAG, "[startForegroundSafely] Не удалось перевести service в foreground: ${cause.message}", cause)
             stopSelf()
@@ -257,25 +311,26 @@ class RoomConnectionService : Service() {
     }
 
     /**
-     * Обновляет постоянное foreground notification текущим состоянием runtime.
+     * Обновляет foreground notification и активный service type по состоянию runtime и закрепления микрофона.
      */
-    @SuppressLint("MissingPermission")
-    private fun updateForegroundNotification(state: RoomRuntimeState) {
-        runCatching {
-            NotificationManagerCompat.from(this).notify(
-                FOREGROUND_NOTIFICATION_ID,
-                buildForegroundNotification(state),
-            )
-            Log.i(TAG, "[updateForegroundNotification] Foreground notification обновлен state=${state.javaClass.simpleName}")
-        }.onFailure { cause ->
-            Log.w(TAG, "[updateForegroundNotification] Не удалось обновить foreground notification: ${cause.message}", cause)
-        }
+    private fun updateForegroundNotification(state: RoomRuntimeState, isMicrophoneLocked: Boolean) {
+        startForegroundSafely(
+            notification = buildForegroundNotification(state, isMicrophoneLocked),
+            includesMicrophone = isMicrophoneLocked,
+        )
+        Log.i(
+            TAG,
+            "[updateForegroundNotification] Foreground notification обновлен state=${state.javaClass.simpleName} isMicrophoneLocked=$isMicrophoneLocked",
+        )
     }
 
     /**
-     * Создает notification о текущем состоянии поиска или комнаты.
+     * Создает notification о текущем состоянии поиска или комнаты и добавляет управление закрепленным микрофоном.
      */
-    private fun buildForegroundNotification(state: RoomRuntimeState): Notification {
+    private fun buildForegroundNotification(
+        state: RoomRuntimeState,
+        isMicrophoneLocked: Boolean,
+    ): Notification {
         val title = when (state) {
             is RoomRuntimeState.Hosting -> "$APP_DISPLAY_NAME: комната запущена"
             is RoomRuntimeState.Client -> "$APP_DISPLAY_NAME: вы в комнате"
@@ -285,7 +340,7 @@ class RoomConnectionService : Service() {
             is RoomRuntimeState.Error,
             -> APP_DISPLAY_NAME
         }
-        val text = when (state) {
+        val runtimeText = when (state) {
             is RoomRuntimeState.Hosting -> "Хостим ${state.room.name}"
             is RoomRuntimeState.Client -> "Подключены к ${state.room.name}"
             is RoomRuntimeState.Joining -> "Входим в ${state.room.name}"
@@ -293,8 +348,13 @@ class RoomConnectionService : Service() {
             RoomRuntimeState.Idle -> "Соединение не активно"
             is RoomRuntimeState.Error -> state.message
         }
+        val text = if (isMicrophoneLocked) {
+            "$MICROPHONE_ENABLED_TEXT · $runtimeText"
+        } else {
+            runtimeText
+        }
 
-        return NotificationCompat.Builder(this, ROOM_CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, ROOM_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_radio)
             .setContentTitle(title)
             .setContentText(text)
@@ -302,10 +362,17 @@ class RoomConnectionService : Service() {
             .setContentIntent(createOpenAppPendingIntent())
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .addAction(R.drawable.ic_radio, DISCONNECT_ACTION_TITLE, createDisconnectPendingIntent())
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
+        if (isMicrophoneLocked) {
+            builder.addAction(
+                R.drawable.ic_mute,
+                DISABLE_MICROPHONE_ACTION_TITLE,
+                createDisableMicrophonePendingIntent(),
+            )
+        }
+        builder.addAction(R.drawable.ic_radio, DISCONNECT_ACTION_TITLE, createDisconnectPendingIntent())
+        return builder.build()
     }
 
     /**
@@ -364,6 +431,18 @@ class RoomConnectionService : Service() {
     }
 
     /**
+     * Создает PendingIntent для отключения только закрепленного микрофона без выхода из комнаты.
+     */
+    private fun createDisableMicrophonePendingIntent(): PendingIntent {
+        return PendingIntent.getService(
+            this,
+            DISABLE_MICROPHONE_REQUEST_CODE,
+            createDisableMicrophoneIntent(this),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
+    /**
      * Возвращает стабильный notification id для сообщения.
      */
     private fun notificationIdFor(messageId: MessageId): Int {
@@ -379,14 +458,18 @@ class RoomConnectionService : Service() {
         private const val ACTION_START = "com.yellastro.btration.service.START_ROOM_CONNECTION"
         private const val ACTION_STOP = "com.yellastro.btration.service.STOP_ROOM_CONNECTION"
         private const val ACTION_DISCONNECT = "com.yellastro.btration.service.DISCONNECT_ROOM_CONNECTION"
+        private const val ACTION_DISABLE_MICROPHONE = "com.yellastro.btration.service.DISABLE_MICROPHONE"
         private const val ROOM_CHANNEL_ID = "room_connection"
         private const val MESSAGE_CHANNEL_ID = "room_messages"
         private const val DISCONNECT_ACTION_TITLE = "Отключить"
+        private const val DISABLE_MICROPHONE_ACTION_TITLE = "Откл. микро"
+        private const val MICROPHONE_ENABLED_TEXT = "Микрофон включён"
         private const val FOREGROUND_NOTIFICATION_ID = 1001
         private const val MESSAGE_NOTIFICATION_BASE_ID = 2_000
         private const val MESSAGE_NOTIFICATION_BUCKET = 100_000
         private const val OPEN_APP_REQUEST_CODE = 2001
         private const val DISCONNECT_REQUEST_CODE = 2002
+        private const val DISABLE_MICROPHONE_REQUEST_CODE = 2003
 
         /**
          * Создает intent запуска foreground service.
@@ -412,6 +495,15 @@ class RoomConnectionService : Service() {
         fun createDisconnectIntent(context: Context): Intent {
             return Intent(context, RoomConnectionService::class.java).apply {
                 action = ACTION_DISCONNECT
+            }
+        }
+
+        /**
+         * Создает intent отключения закрепленного микрофона без выхода из комнаты.
+         */
+        fun createDisableMicrophoneIntent(context: Context): Intent {
+            return Intent(context, RoomConnectionService::class.java).apply {
+                action = ACTION_DISABLE_MICROPHONE
             }
         }
     }

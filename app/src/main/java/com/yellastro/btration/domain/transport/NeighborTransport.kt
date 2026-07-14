@@ -64,13 +64,27 @@ interface NeighborTransport {
 
     /**
      * Отправляет атомарное сообщение байт в один линк и возвращает ошибку только владельцу этой отправки.
+     *
+     * Флаг isRealtime помечает частые payload-ы голоса/медиа, чтобы нижний транспорт мог логировать их агрегированно.
      */
-    fun sendMessage(linkId: NeighborLinkId, bytes: ByteArray, onFailure: (Throwable) -> Unit = {})
+    fun sendMessage(
+        linkId: NeighborLinkId,
+        bytes: ByteArray,
+        isRealtime: Boolean = false,
+        onFailure: (Throwable) -> Unit = {},
+    )
 
     /**
      * Отправляет атомарное сообщение байт в несколько линков и возвращает ошибку только владельцу этой отправки.
+     *
+     * Флаг isRealtime помечает частые payload-ы голоса/медиа, чтобы нижний транспорт мог логировать их агрегированно.
      */
-    fun sendMessage(linkIds: Collection<NeighborLinkId>, bytes: ByteArray, onFailure: (Throwable) -> Unit = {})
+    fun sendMessage(
+        linkIds: Collection<NeighborLinkId>,
+        bytes: ByteArray,
+        isRealtime: Boolean = false,
+        onFailure: (Throwable) -> Unit = {},
+    )
 
     /**
      * Отправляет поток байт в несколько линков и возвращает ошибку только владельцу этой отправки.

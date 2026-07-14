@@ -24,6 +24,7 @@
 - Ignore-list для MESHRA применяется к gateway из `BTM4`, а не к known host комнаты. `RoomTransport` получает predicate `shouldAcceptConnection(...)` и отклоняет входящий request, если endpointName распознается как реклама ignored gateway.
 - `NearbyVoiceTransport` сидит рядом с `RoomTransport` поверх того же `NeighborTransport`: он читает только BYTES с сигнатурой `BTVO`, а все room/control сообщения игнорирует.
 - Ошибка отправки BYTES/STREAM возвращается callback-ом конкретному вызывающему слою, а не широковещательным event-ом: иначе voice send failure мог бы случайно превратиться в room packet failure.
+- Частые voice BYTES отправляются через `NeighborTransport.sendMessage(..., isRealtime=true)`: `NearbyPayloadTransport` не пишет `Log.i` на каждый успешный frame, а агрегирует успешные realtime-отправки примерно раз в секунду. Ошибки отправки realtime payload-а логируются сразу.
 - `endpointId -> PeerId` описывает только прямого физического Nearby-соседа. Автор `CHAT_MESSAGE` или другого relayed-пакета не должен перезаписывать эту связь.
 - `RoomTransport` автоматически принимает Nearby connection, а бизнес-решение входа в комнату остаётся выше, в `RoomRuntime`, через `JOIN_ACCEPTED` / `JOIN_REJECTED`.
 - Для будущего mesh/relay в `WirePacket` уже есть поля `packetId` и `ttl`, но Nearby-слой пока не делает dedup и relay.

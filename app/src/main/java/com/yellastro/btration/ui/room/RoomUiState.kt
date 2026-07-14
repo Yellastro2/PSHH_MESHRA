@@ -7,7 +7,8 @@ import com.yellastro.btration.domain.runtime.RoomRuntimeErrorAction
 import com.yellastro.btration.voice.VoiceTransportPreference
 
 /**
- * UI-состояние экрана комнаты, включая роль пользователя, mesh-режим комнаты, voice-настройку, чат и ошибки.
+ * UI-состояние экрана комнаты, включая роль пользователя, mesh-режим комнаты, локальную передачу
+ * и ее закрепление, voice-настройку, чат и ошибки.
  */
 data class RoomUiState(
     val roomName: String = "",
@@ -20,6 +21,7 @@ data class RoomUiState(
     val canTalk: Boolean = false,
     val isConnecting: Boolean = false,
     val isTalking: Boolean = false,
+    val isMicrophoneLocked: Boolean = false,
     val isClosed: Boolean = false,
     val voiceTransportPreference: VoiceTransportPreference = VoiceTransportPreference.WIFI_DIRECT,
     val roomVoiceTransportPreference: VoiceTransportPreference = voiceTransportPreference,

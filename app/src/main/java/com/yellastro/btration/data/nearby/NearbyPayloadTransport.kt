@@ -14,6 +14,11 @@ internal class NearbyPayloadTransport(
     private val connectionsClient: ConnectionsClient,
     private val emitEvent: (NearbyPayloadTransportEvent) -> Unit,
 ) {
+    private var realtimeLogWindowStartedAtMillis = 0L
+    private var realtimePayloadCount = 0
+    private var realtimeEndpointDeliveryCount = 0
+    private var realtimeByteCount = 0L
+
     /**
      * Callback Nearby Connections для приема bytes/stream payload-ов.
      */
@@ -42,28 +47,50 @@ internal class NearbyPayloadTransport(
 
     /**
      * Отправляет атомарное bytes-сообщение в один Nearby endpointId.
+     *
+     * Realtime payload-ы логируются отдельной секундной статистикой вместо строки на каждый voice frame.
      */
-    fun sendMessageToEndpoint(endpointId: String, bytes: ByteArray, onFailure: (Throwable) -> Unit) {
+    fun sendMessageToEndpoint(
+        endpointId: String,
+        bytes: ByteArray,
+        isRealtime: Boolean = false,
+        onFailure: (Throwable) -> Unit,
+    ) {
         connectionsClient.sendPayload(endpointId, Payload.fromBytes(bytes))
             .addOnSuccessListener {
-                Log.i(TAG, "[sendMessageToEndpoint] Bytes payload передан Nearby endpointId=$endpointId bytes=${bytes.size}")
+                if (isRealtime) {
+                    recordRealtimeBytesSent(endpointCount = 1, bytes = bytes.size)
+                } else {
+                    Log.i(TAG, "[sendMessageToEndpoint] Bytes payload передан Nearby endpointId=$endpointId bytes=${bytes.size}")
+                }
             }
             .addOnFailureListener { cause ->
-                Log.w(TAG, "[sendMessageToEndpoint] Не удалось отправить bytes payload endpointId=$endpointId bytes=${bytes.size}: ${cause.message}", cause)
+                Log.w(TAG, "[sendMessageToEndpoint] Не удалось отправить bytes payload endpointId=$endpointId bytes=${bytes.size} realtime=$isRealtime: ${cause.message}", cause)
                 onFailure(cause)
             }
     }
 
     /**
      * Отправляет атомарное bytes-сообщение списку Nearby endpointId.
+     *
+     * Realtime payload-ы логируются отдельной секундной статистикой вместо строки на каждый voice frame.
      */
-    fun sendMessageToEndpoints(endpointIds: List<String>, bytes: ByteArray, onFailure: (Throwable) -> Unit) {
+    fun sendMessageToEndpoints(
+        endpointIds: List<String>,
+        bytes: ByteArray,
+        isRealtime: Boolean = false,
+        onFailure: (Throwable) -> Unit,
+    ) {
         connectionsClient.sendPayload(endpointIds, Payload.fromBytes(bytes))
             .addOnSuccessListener {
-                Log.i(TAG, "[sendMessageToEndpoints] Bytes payload передан Nearby endpointCount=${endpointIds.size} bytes=${bytes.size}")
+                if (isRealtime) {
+                    recordRealtimeBytesSent(endpointCount = endpointIds.size, bytes = bytes.size)
+                } else {
+                    Log.i(TAG, "[sendMessageToEndpoints] Bytes payload передан Nearby endpointCount=${endpointIds.size} bytes=${bytes.size}")
+                }
             }
             .addOnFailureListener { cause ->
-                Log.w(TAG, "[sendMessageToEndpoints] Не удалось отправить bytes payload endpointCount=${endpointIds.size} bytes=${bytes.size}: ${cause.message}", cause)
+                Log.w(TAG, "[sendMessageToEndpoints] Не удалось отправить bytes payload endpointCount=${endpointIds.size} bytes=${bytes.size} realtime=$isRealtime: ${cause.message}", cause)
                 onFailure(cause)
             }
     }
@@ -135,6 +162,34 @@ internal class NearbyPayloadTransport(
         }
         Log.i(TAG, "[handleStreamPayload] Получен stream endpointId=$endpointId receivedAtMs=$receivedAtMillis")
         emitEvent(NearbyPayloadTransportEvent.StreamReceived(endpointId, inputStream))
+    }
+
+    /**
+     * Накопительно логирует успешную отправку realtime bytes payload-ов не чаще одного раза в секунду.
+     */
+    @Synchronized
+    private fun recordRealtimeBytesSent(endpointCount: Int, bytes: Int) {
+        val nowMillis = System.currentTimeMillis()
+        if (realtimeLogWindowStartedAtMillis == 0L) {
+            realtimeLogWindowStartedAtMillis = nowMillis
+        }
+        realtimePayloadCount += 1
+        realtimeEndpointDeliveryCount += endpointCount
+        realtimeByteCount += bytes.toLong()
+
+        val windowMillis = nowMillis - realtimeLogWindowStartedAtMillis
+        if (windowMillis < REALTIME_LOG_WINDOW_MILLIS) {
+            return
+        }
+
+        Log.i(
+            TAG,
+            "[recordRealtimeBytesSent] Realtime voice bytes переданы Nearby payloadCount=$realtimePayloadCount endpointDeliveries=$realtimeEndpointDeliveryCount bytes=$realtimeByteCount windowMs=$windowMillis",
+        )
+        realtimeLogWindowStartedAtMillis = 0L
+        realtimePayloadCount = 0
+        realtimeEndpointDeliveryCount = 0
+        realtimeByteCount = 0L
     }
 
     /**
@@ -210,6 +265,7 @@ internal class NearbyPayloadTransport(
     private companion object {
         private const val TAG = "NearbyPayloadTransport"
         private const val STREAM_READ_LIMIT_BYTES = 320
+        private const val REALTIME_LOG_WINDOW_MILLIS = 1_000L
     }
 }
 

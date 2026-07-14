@@ -119,17 +119,31 @@ class NearbyTransport(
 
     /**
      * Отправляет непрозрачное bytes-сообщение в Nearby link и возвращает ошибку вызывающему слою.
+     *
+     * Realtime bytes логируются агрегированно на payload-слое, чтобы голос не спамил logcat.
      */
-    override fun sendMessage(linkId: NeighborLinkId, bytes: ByteArray, onFailure: (Throwable) -> Unit) {
-        payloadTransport.sendMessageToEndpoint(linkId.value, bytes, onFailure)
+    override fun sendMessage(
+        linkId: NeighborLinkId,
+        bytes: ByteArray,
+        isRealtime: Boolean,
+        onFailure: (Throwable) -> Unit,
+    ) {
+        payloadTransport.sendMessageToEndpoint(linkId.value, bytes, isRealtime, onFailure)
     }
 
     /**
      * Отправляет непрозрачное bytes-сообщение в несколько Nearby link-ов и возвращает ошибку вызывающему слою.
+     *
+     * Realtime bytes логируются агрегированно на payload-слое, чтобы голос не спамил logcat.
      */
-    override fun sendMessage(linkIds: Collection<NeighborLinkId>, bytes: ByteArray, onFailure: (Throwable) -> Unit) {
+    override fun sendMessage(
+        linkIds: Collection<NeighborLinkId>,
+        bytes: ByteArray,
+        isRealtime: Boolean,
+        onFailure: (Throwable) -> Unit,
+    ) {
         val endpointIds = linkIds.map { linkId -> linkId.value }
-        payloadTransport.sendMessageToEndpoints(endpointIds, bytes, onFailure)
+        payloadTransport.sendMessageToEndpoints(endpointIds, bytes, isRealtime, onFailure)
     }
 
     /**

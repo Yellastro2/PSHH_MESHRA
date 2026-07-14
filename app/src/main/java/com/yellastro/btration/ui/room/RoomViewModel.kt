@@ -23,14 +23,14 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /**
- * ViewModel комнаты: собирает runtime, voice-настройки, mesh-connect статусы, участников, чат и команды UI.
+ * ViewModel комнаты: собирает runtime, общее repository-состояние микрофона, voice-настройки,
+ * mesh-connect статусы, участников, чат и команды UI.
  */
 class RoomViewModel(
     private val roomRepository: RoomRepository,
     private val voiceSettingsRepository: VoiceSettingsRepository,
 ) : ViewModel() {
     private val inputText = MutableStateFlow("")
-    private val isTalking = MutableStateFlow(false)
     private val participantColorByPeerId = mutableMapOf<PeerId, Int>()
 
     private val roomUiInputs = combine(
@@ -54,14 +54,17 @@ class RoomViewModel(
     }
 
     /**
-     * UI-состояние комнаты, собранное из runtime, voice-настроек, сообщений, talking/direct-connect состояний и ввода.
+     * UI-состояние комнаты, собранное из runtime, voice-настроек, сообщений,
+     * локальной передачи/закрепления, talking/direct-connect состояний и ввода.
      */
     val uiState: StateFlow<RoomUiState> = combine(
         roomUiInputs,
-        isTalking,
+        roomRepository.isTalking,
+        roomRepository.isMicrophoneLocked,
         voiceSettingsRepository.voiceTransportPreference,
     ) { inputs: RoomUiInputs,
         talking: Boolean,
+        isMicrophoneLocked: Boolean,
         voiceTransportPreference: VoiceTransportPreference ->
         mapUiState(
             runtimeState = inputs.runtimeState,
@@ -70,6 +73,7 @@ class RoomViewModel(
             directMeshPeerIds = inputs.directMeshPeerIds,
             input = inputs.input,
             talking = talking,
+            isMicrophoneLocked = isMicrophoneLocked,
             voiceTransportPreference = voiceTransportPreference,
         )
     }.stateIn(
@@ -81,7 +85,8 @@ class RoomViewModel(
             talkingPeerIds = roomRepository.talkingPeerIds.value,
             directMeshPeerIds = roomRepository.directMeshPeerIds.value,
             input = inputText.value,
-            talking = isTalking.value,
+            talking = roomRepository.isTalking.value,
+            isMicrophoneLocked = roomRepository.isMicrophoneLocked.value,
             voiceTransportPreference = voiceSettingsRepository.voiceTransportPreference.value,
         ),
     )
@@ -132,32 +137,39 @@ class RoomViewModel(
     }
 
     /**
-     * Начинает передачу микрофона, если runtime сейчас находится в активной комнате.
+     * Начинает передачу микрофона, если runtime сейчас находится в активной комнате
+     * и repository еще не подтверждает собственную передачу.
      */
     fun onMicPressed() {
-        if (!uiState.value.canTalk || isTalking.value) {
+        if (!uiState.value.canTalk || roomRepository.isTalking.value) {
             return
         }
         viewModelScope.launch {
-            isTalking.value = roomRepository.startTalking()
+            roomRepository.startTalking()
         }
     }
 
     /**
-     * Останавливает передачу микрофона.
+     * Снимает закрепление и останавливает передачу, в том числе после короткого нажатия,
+     * пока асинхронный старт еще не успел завершиться.
      */
     fun onMicReleased() {
-        if (!isTalking.value) {
-            return
-        }
-        isTalking.value = false
+        roomRepository.setMicrophoneLocked(false)
         viewModelScope.launch {
             roomRepository.stopTalking()
         }
     }
 
     /**
-     * Преобразует runtime-состояние комнаты в UI-состояние с явным типом комнаты и статусом прямого аудиоканала.
+     * Публикует закрепление PTT после отпускания пальца на активном замке.
+     */
+    fun onMicLocked() {
+        roomRepository.setMicrophoneLocked(true)
+    }
+
+    /**
+     * Преобразует runtime и общее состояние микрофона в UI-состояние
+     * с явным типом комнаты и статусом прямого аудиоканала.
      */
     private fun mapUiState(
         runtimeState: RoomRuntimeState,
@@ -166,6 +178,7 @@ class RoomViewModel(
         directMeshPeerIds: Set<PeerId>,
         input: String,
         talking: Boolean,
+        isMicrophoneLocked: Boolean,
         voiceTransportPreference: VoiceTransportPreference,
     ): RoomUiState {
         val selfPeerId = roomRepository.getSelfPeerId()
@@ -200,6 +213,7 @@ class RoomViewModel(
                     canSend = canSend,
                     canTalk = canTalk,
                     isTalking = talking,
+                    isMicrophoneLocked = isMicrophoneLocked,
                     isClosed = false,
                     voiceTransportPreference = voiceTransportPreference,
                     roomVoiceTransportPreference = roomVoiceTransportPreference,
@@ -223,6 +237,7 @@ class RoomViewModel(
                     canSend = canSend,
                     canTalk = canTalk,
                     isTalking = talking,
+                    isMicrophoneLocked = isMicrophoneLocked,
                     isClosed = false,
                     voiceTransportPreference = voiceTransportPreference,
                     roomVoiceTransportPreference = roomVoiceTransportPreference,

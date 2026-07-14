@@ -6,10 +6,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
+import android.view.HapticFeedbackConstants
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
@@ -45,7 +47,8 @@ import com.yellastro.btration.ui.room.RoomViewModel
 import kotlinx.coroutines.launch
 
 /**
- * Экран комнаты с настройками транспорта, direct-аудио статусом, connecting-overlay, чатом, PTT и очисткой клавиатуры.
+ * Экран комнаты с настройками транспорта, direct-аудио статусом, connecting-overlay, чатом,
+ * удерживаемым и закрепляемым жестом PTT, а также очисткой клавиатуры.
  */
 class RoomFragment : Fragment() {
     private val viewModel: RoomViewModel by viewModels {
@@ -65,6 +68,7 @@ class RoomFragment : Fragment() {
     private lateinit var layoutConnectingOverlay: View
 
     private lateinit var btnPushToTalk: View
+    private lateinit var layoutPushToTalkLock: View
     private lateinit var tvTransmissionStatus: TextView
     private lateinit var viewWave1: View
     private lateinit var viewWave2: View
@@ -81,6 +85,9 @@ class RoomFragment : Fragment() {
     private var lastShownSnackbarMessage: String? = null
     private var pushToTalkSizeAnimator: ValueAnimator? = null
     private var pushToTalkTargetSize = 0
+    private var pushToTalkGestureState = PushToTalkGestureState.IDLE
+    private var pushToTalkDownRawY = 0f
+    private val pushToTalkLockBounds = Rect()
     private lateinit var recordAudioPermissionLauncher: ActivityResultLauncher<String>
 
     /**
@@ -90,6 +97,7 @@ class RoomFragment : Fragment() {
         private const val MENU_GROUP_ROOM_SETTINGS = 0
         private const val MENU_ITEM_VOICE_TRANSPORT = 1
         private const val MENU_ORDER_VOICE_TRANSPORT = 0
+        private const val PUSH_TO_TALK_LOCK_RELEASE_SLOP_DP = 24f
 
         /**
          * Создает экран текущей активной комнаты.
@@ -97,6 +105,16 @@ class RoomFragment : Fragment() {
         fun newInstance(): RoomFragment {
             return RoomFragment()
         }
+    }
+
+    /**
+     * Состояния жеста PTT от обычного удержания до закрепленной передачи без удержания пальца.
+     */
+    private enum class PushToTalkGestureState {
+        IDLE,
+        HOLDING,
+        LOCK_TARGET,
+        LOCKED,
     }
 
     /**
@@ -126,7 +144,7 @@ class RoomFragment : Fragment() {
 
     /**
      * Настраивает списки участников, чат, меню комнаты, выход/закрытие по типу комнаты, системный Back,
-     * PTT-визуализацию и размер кнопки микрофона при IME.
+     * удерживаемый/закрепляемый PTT-жест и размер кнопки микрофона при IME.
      */
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
@@ -152,6 +170,7 @@ class RoomFragment : Fragment() {
         layoutConnectingOverlay = view.findViewById(R.id.layout_connecting_overlay)
 
         btnPushToTalk = view.findViewById(R.id.btn_push_to_talk)
+        layoutPushToTalkLock = view.findViewById(R.id.layout_push_to_talk_lock)
         tvTransmissionStatus = view.findViewById(R.id.tv_transmission_status)
         viewWave1 = view.findViewById(R.id.view_wave_1)
         viewWave2 = view.findViewById(R.id.view_wave_2)
@@ -221,18 +240,8 @@ class RoomFragment : Fragment() {
             },
         )
 
-        btnPushToTalk.setOnTouchListener { _, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    startTransmission()
-                    true
-                }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    stopTransmission()
-                    true
-                }
-                else -> false
-            }
+        btnPushToTalk.setOnTouchListener { touchedView, event ->
+            handlePushToTalkTouch(touchedView, event)
         }
 
         collectUiState()
@@ -309,15 +318,20 @@ class RoomFragment : Fragment() {
     }
 
     /**
-     * Скрывает клавиатуру при уходе с экрана комнаты, чтобы IME не оставалась поверх следующего экрана.
+     * При уходе приложения с переднего плана останавливает только незакрепленное удержание,
+     * а закрепленной передаче позволяет продолжаться через foreground service.
      */
     override fun onPause() {
+        if (pushToTalkGestureState != PushToTalkGestureState.LOCKED) {
+            stopTransmission()
+        }
         hideMessageKeyboard()
         super.onPause()
     }
 
     /**
-     * Останавливает передачу микрофона, анимацию PTT-размера и скрывает клавиатуру при уничтожении view комнаты.
+     * Останавливает в том числе закрепленную передачу микрофона, отменяет анимацию PTT-размера
+     * и скрывает клавиатуру при уничтожении view комнаты.
      */
     override fun onDestroyView() {
         stopTransmission()
@@ -352,6 +366,7 @@ class RoomFragment : Fragment() {
 
     /**
      * Отрисовывает connecting-overlay, direct-аудио предупреждение, участников, чат, PTT-состояние и закрытие комнаты.
+     * Восстанавливает закрепленный жест из repository или сбрасывает его после внешней остановки микрофона.
      */
     private fun renderState(state: RoomUiState) {
         latestState = state
@@ -378,7 +393,11 @@ class RoomFragment : Fragment() {
             closedHandled = true
             (activity as? MainActivity)?.popBackStack()
         }
-        if (!state.isTalking && isTransmitting) {
+        if (state.isTalking && state.isMicrophoneLocked && !isTransmitting) {
+            restoreLockedPushToTalkState()
+        }
+        val transmissionEnded = !state.isTalking && !state.isMicrophoneLocked
+        if ((transmissionEnded || !state.canTalk || state.isConnecting) && isTransmitting) {
             stopTransmission()
         }
     }
@@ -494,14 +513,16 @@ class RoomFragment : Fragment() {
 
     /**
      * Включает визуальное состояние передачи и стартует ViewModel-команду микрофона.
+     * Возвращает true, только если передача действительно была запущена.
      */
-    private fun startTransmission() {
-        if (isTransmitting || !latestState.canTalk) return
+    private fun startTransmission(): Boolean {
+        if (isTransmitting || !latestState.canTalk) return false
         if (!hasRecordAudioPermission()) {
             recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-            return
+            return false
         }
         isTransmitting = true
+        Log.i("RoomFragment", "[startTransmission] Запускаем голосовую передачу")
         viewModel.onMicPressed()
 
         tvTransmissionStatus.text = "ПЕРЕДАЧА..."
@@ -512,14 +533,18 @@ class RoomFragment : Fragment() {
         viewWave2.visibility = View.VISIBLE
         viewWave3.visibility = View.VISIBLE
 
+        return true
     }
 
     /**
-     * Выключает визуальное состояние передачи и останавливает ViewModel-команду микрофона.
+     * Сбрасывает любой PTT-жест, выключает визуальное состояние передачи
+     * и останавливает ViewModel-команду микрофона.
      */
     private fun stopTransmission() {
+        resetPushToTalkGesture()
         if (!isTransmitting) return
         isTransmitting = false
+        Log.i("RoomFragment", "[stopTransmission] Останавливаем голосовую передачу")
         viewModel.onMicReleased()
 
         tvTransmissionStatus.text = ""
@@ -529,7 +554,214 @@ class RoomFragment : Fragment() {
         viewWave1.visibility = View.GONE
         viewWave2.visibility = View.GONE
         viewWave3.visibility = View.GONE
+    }
 
+    /**
+     * Обрабатывает полный PTT-жест в экранных координатах, чтобы изменение размера кнопки
+     * при показе клавиатуры не меняло смысл движения пальца к замку.
+     */
+    private fun handlePushToTalkTouch(touchedView: View, event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> handlePushToTalkDown(touchedView, event)
+            MotionEvent.ACTION_MOVE -> handlePushToTalkMove(event)
+            MotionEvent.ACTION_UP -> finishPushToTalkGesture(touchedView)
+            MotionEvent.ACTION_CANCEL -> cancelPushToTalkGesture(touchedView)
+        }
+        return true
+    }
+
+    /**
+     * Начинает удерживаемую передачу либо останавливает уже закрепленную повторным нажатием.
+     */
+    private fun handlePushToTalkDown(touchedView: View, event: MotionEvent) {
+        touchedView.parent.requestDisallowInterceptTouchEvent(true)
+        if (pushToTalkGestureState == PushToTalkGestureState.LOCKED) {
+            Log.i(
+                "RoomFragment",
+                "[handlePushToTalkDown] Останавливаем закрепленную передачу повторным нажатием",
+            )
+            stopTransmission()
+            return
+        }
+
+        pushToTalkDownRawY = event.rawY
+        if (startTransmission()) {
+            pushToTalkGestureState = PushToTalkGestureState.HOLDING
+            showPushToTalkLock()
+        } else {
+            resetPushToTalkGesture()
+        }
+    }
+
+    /**
+     * Обновляет прогресс движения к актуальной позиции замка и переключает цель фиксации
+     * с гистерезисом, защищающим визуальное состояние от дрожания пальца у границы.
+     */
+    private fun handlePushToTalkMove(event: MotionEvent) {
+        if (
+            pushToTalkGestureState != PushToTalkGestureState.HOLDING &&
+            pushToTalkGestureState != PushToTalkGestureState.LOCK_TARGET
+        ) {
+            return
+        }
+        if (!layoutPushToTalkLock.getGlobalVisibleRect(pushToTalkLockBounds)) {
+            return
+        }
+
+        val activationRawY = pushToTalkLockBounds.bottom.toFloat()
+        val releaseRawY = activationRawY + dpToPx(PUSH_TO_TALK_LOCK_RELEASE_SLOP_DP)
+        val previousState = pushToTalkGestureState
+        pushToTalkGestureState = when {
+            previousState == PushToTalkGestureState.HOLDING && event.rawY <= activationRawY -> {
+                PushToTalkGestureState.LOCK_TARGET
+            }
+            previousState == PushToTalkGestureState.LOCK_TARGET && event.rawY > releaseRawY -> {
+                PushToTalkGestureState.HOLDING
+            }
+            else -> previousState
+        }
+
+        if (
+            previousState != PushToTalkGestureState.LOCK_TARGET &&
+            pushToTalkGestureState == PushToTalkGestureState.LOCK_TARGET
+        ) {
+            layoutPushToTalkLock.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+            Log.d("RoomFragment", "[handlePushToTalkMove] Замок PTT активирован жестом вверх")
+        }
+
+        val distanceToLock = (pushToTalkDownRawY - activationRawY).coerceAtLeast(1f)
+        val upwardDistance = (pushToTalkDownRawY - event.rawY).coerceAtLeast(0f)
+        val progress = (upwardDistance / distanceToLock).coerceIn(0f, 1f)
+        renderPushToTalkLockProgress(progress)
+    }
+
+    /**
+     * На отпускании либо закрепляет передачу над активным замком и сообщает об этом service,
+     * либо завершает обычное удержание.
+     */
+    private fun finishPushToTalkGesture(touchedView: View) {
+        touchedView.performClick()
+        touchedView.parent.requestDisallowInterceptTouchEvent(false)
+        if (pushToTalkGestureState == PushToTalkGestureState.LOCK_TARGET && isTransmitting) {
+            pushToTalkGestureState = PushToTalkGestureState.LOCKED
+            viewModel.onMicLocked()
+            showLockedPushToTalkState()
+            Log.i(
+                "RoomFragment",
+                "[finishPushToTalkGesture] Голосовая передача закреплена до следующего нажатия",
+            )
+            return
+        }
+        if (pushToTalkGestureState == PushToTalkGestureState.HOLDING) {
+            stopTransmission()
+        }
+    }
+
+    /**
+     * Безопасно завершает незакрепленный жест, если Android отменил текущую touch-последовательность.
+     */
+    private fun cancelPushToTalkGesture(touchedView: View) {
+        touchedView.parent.requestDisallowInterceptTouchEvent(false)
+        if (pushToTalkGestureState != PushToTalkGestureState.LOCKED) {
+            stopTransmission()
+        }
+    }
+
+    /**
+     * Показывает замок над текущей верхней границей PTT-кнопки независимо от ее размера.
+     */
+    private fun showPushToTalkLock() {
+        layoutPushToTalkLock.animate().cancel()
+        layoutPushToTalkLock.visibility = View.VISIBLE
+        layoutPushToTalkLock.isActivated = false
+        layoutPushToTalkLock.alpha = 0.55f
+        layoutPushToTalkLock.scaleX = 0.82f
+        layoutPushToTalkLock.scaleY = 0.82f
+        layoutPushToTalkLock.animate()
+            .alpha(0.7f)
+            .scaleX(0.9f)
+            .scaleY(0.9f)
+            .setDuration(120L)
+            .start()
+    }
+
+    /**
+     * Отображает приближение пальца к замку и визуально выделяет достигнутую область фиксации.
+     */
+    private fun renderPushToTalkLockProgress(progress: Float) {
+        layoutPushToTalkLock.animate().cancel()
+        layoutPushToTalkLock.isActivated = pushToTalkGestureState == PushToTalkGestureState.LOCK_TARGET
+        layoutPushToTalkLock.alpha = 0.7f + (0.3f * progress)
+        val scale = 0.9f + (0.1f * progress)
+        layoutPushToTalkLock.scaleX = scale
+        layoutPushToTalkLock.scaleY = scale
+    }
+
+    /**
+     * Оставляет активный замок видимым и поясняет, что микрофон пишет без удержания кнопки.
+     * Метод также подходит для восстановления view после пересоздания экрана.
+     */
+    private fun showLockedPushToTalkState() {
+        layoutPushToTalkLock.animate().cancel()
+        layoutPushToTalkLock.visibility = View.VISIBLE
+        layoutPushToTalkLock.isActivated = true
+        layoutPushToTalkLock.alpha = 1f
+        layoutPushToTalkLock.animate()
+            .scaleX(1.08f)
+            .scaleY(1.08f)
+            .setDuration(100L)
+            .withEndAction {
+                layoutPushToTalkLock.animate()
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .setDuration(100L)
+                    .start()
+            }
+            .start()
+        tvTransmissionStatus.text = getString(R.string.ptt_locked_status)
+    }
+
+    /**
+     * Восстанавливает локальные PTT-визуалы из общего repository-состояния без повторного старта AudioRecord.
+     */
+    private fun restoreLockedPushToTalkState() {
+        isTransmitting = true
+        pushToTalkGestureState = PushToTalkGestureState.LOCKED
+        tvTransmissionStatus.setTextColor(requireContext().getColor(android.R.color.holo_green_light))
+        btnPushToTalk.animate().scaleX(1.1f).scaleY(1.1f).setDuration(150).start()
+        viewWave1.visibility = View.VISIBLE
+        viewWave2.visibility = View.VISIBLE
+        viewWave3.visibility = View.VISIBLE
+        showLockedPushToTalkState()
+        Log.i("RoomFragment", "[restoreLockedPushToTalkState] Восстановлена закрепленная передача микрофона")
+    }
+
+    /**
+     * Возвращает жест и замок в исходное состояние после локальной или runtime-остановки передачи.
+     */
+    private fun resetPushToTalkGesture() {
+        pushToTalkGestureState = PushToTalkGestureState.IDLE
+        if (!::layoutPushToTalkLock.isInitialized) {
+            return
+        }
+        layoutPushToTalkLock.animate().cancel()
+        layoutPushToTalkLock.isActivated = false
+        layoutPushToTalkLock.animate()
+            .alpha(0f)
+            .scaleX(0.82f)
+            .scaleY(0.82f)
+            .setDuration(100L)
+            .withEndAction {
+                layoutPushToTalkLock.visibility = View.INVISIBLE
+            }
+            .start()
+    }
+
+    /**
+     * Переводит независимый от density порог жеста из dp в экранные пиксели.
+     */
+    private fun dpToPx(valueDp: Float): Float {
+        return valueDp * resources.displayMetrics.density
     }
 
     /**

@@ -256,6 +256,31 @@
         app:layout_constraintStart_toStartOf="@id/btn_push_to_talk"
         app:layout_constraintTop_toTopOf="@id/btn_push_to_talk" />
 
+    <FrameLayout
+        android:id="@+id/layout_push_to_talk_lock"
+        android:layout_width="52dp"
+        android:layout_height="52dp"
+        android:layout_marginBottom="12dp"
+        android:alpha="0"
+        android:background="@drawable/bg_ptt_lock"
+        android:clickable="false"
+        android:elevation="8dp"
+        android:focusable="false"
+        android:visibility="invisible"
+        app:layout_constraintBottom_toTopOf="@id/btn_push_to_talk"
+        app:layout_constraintEnd_toEndOf="@id/btn_push_to_talk"
+        app:layout_constraintStart_toStartOf="@id/btn_push_to_talk">
+
+        <ImageView
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:layout_gravity="center"
+            android:contentDescription="@string/ptt_lock_description"
+            android:duplicateParentState="true"
+            android:src="@drawable/ic_lock" />
+
+    </FrameLayout>
+
 
 
     <FrameLayout
