@@ -16,7 +16,8 @@ import com.yellastro.btration.domain.model.RoomTransportMode
 import com.yellastro.btration.voice.VoiceTransportPreference
 
 /**
- * Диалог создания комнаты с предзаполнением последнего имени, выбором типа комнаты, voice transport и возвратом результата.
+ * Диалог создания комнаты с предзаполнением последнего имени, выбором типа комнаты, voice transport,
+ * блокировкой Wi-Fi Direct для MESHRA и возвратом результата.
  */
 class CreateRoomDialogFragment : DialogFragment() {
 
@@ -26,6 +27,7 @@ class CreateRoomDialogFragment : DialogFragment() {
     private lateinit var btnCancel: Button
     private lateinit var btnCreate: Button
     private lateinit var tvError: TextView
+    private lateinit var voiceTransportAdapter: ArrayAdapter<String>
     private val roomTransportModes = RoomTransportMode.values()
     private val voiceTransportModes = VoiceTransportPreference.values()
     private var lastSelectableVoiceTransportPosition = 0
@@ -64,6 +66,7 @@ class CreateRoomDialogFragment : DialogFragment() {
         applyInitialRoomName()
         setupRoomTransportSpinner()
         setupVoiceTransportSpinner()
+        syncVoiceTransportWithRoomMode(showToast = false)
 
         btnCancel.setOnClickListener {
             dismiss()
@@ -110,34 +113,95 @@ class CreateRoomDialogFragment : DialogFragment() {
         val initialMode = initialRoomTransportMode()
         spRoomTransport.adapter = createWhiteTextAdapter(roomTransportModes.map { mode -> mode.fullName })
         spRoomTransport.setSelection(roomTransportModes.indexOf(initialMode).coerceAtLeast(0))
+        spRoomTransport.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            /**
+             * Синхронизирует доступность voice transport-а с выбранным типом комнаты.
+             */
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (::voiceTransportAdapter.isInitialized) {
+                    syncVoiceTransportWithRoomMode(showToast = true)
+                }
+            }
+
+            /**
+             * Ничего не делает, потому что spinner всегда держит выбранный тип комнаты.
+             */
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
     }
 
     /**
-     * Настраивает список voice transport и блокирует пока неподдержанные варианты.
+     * Настраивает список voice transport и блокирует неподдержанные для текущего типа комнаты варианты.
      */
     private fun setupVoiceTransportSpinner() {
         val initialPreference = initialVoiceTransportPreference()
         lastSelectableVoiceTransportPosition = voiceTransportModes.indexOf(initialPreference).coerceAtLeast(0)
-        spVoiceTransport.adapter = createWhiteTextAdapter(voiceTransportModes.map { mode -> mode.fullName })
+        voiceTransportAdapter = createVoiceTransportAdapter()
+        spVoiceTransport.adapter = voiceTransportAdapter
         spVoiceTransport.setSelection(lastSelectableVoiceTransportPosition)
         spVoiceTransport.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             /**
-             * Запоминает последний поддержанный transport или откатывает выбор будущей Wi-Fi Aware опции.
+             * Запоминает последний доступный transport или откатывает выбор недоступной опции.
              */
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 val selectedPreference = voiceTransportModes[position]
-                if (selectedPreference.isSelectable) {
+                if (isVoiceTransportAllowedForRoom(selectedPreference, selectedRoomTransportMode())) {
                     lastSelectableVoiceTransportPosition = position
                     return
                 }
-                Toast.makeText(requireContext(), "Wi-Fi Aware пока не поддерживается", Toast.LENGTH_SHORT).show()
-                spVoiceTransport.setSelection(lastSelectableVoiceTransportPosition)
+                showBlockedVoiceTransportToast(selectedPreference)
+                spVoiceTransport.setSelection(fallbackVoiceTransportPosition())
             }
 
             /**
              * Ничего не делает, потому что spinner всегда держит выбранный transport.
              */
             override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+    }
+
+    /**
+     * Создает adapter voice spinner-а, который визуально и интерактивно блокирует недоступные transport-ы.
+     */
+    private fun createVoiceTransportAdapter(): ArrayAdapter<String> {
+        return object : ArrayAdapter<String>(
+            requireContext(),
+            android.R.layout.simple_spinner_item,
+            voiceTransportModes.map { mode -> mode.fullName },
+        ) {
+            /**
+             * Возвращает true только для voice transport-ов, разрешенных выбранным типом комнаты.
+             */
+            override fun isEnabled(position: Int): Boolean {
+                val preference = voiceTransportModes.getOrNull(position) ?: return false
+                return isVoiceTransportAllowedForRoom(preference, selectedRoomTransportMode())
+            }
+
+            /**
+             * Подкрашивает закрытое значение spinner под темную карточку диалога.
+             */
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                return super.getView(position, convertView, parent).also { itemView ->
+                    (itemView as? TextView)?.setTextColor(android.graphics.Color.WHITE)
+                }
+            }
+
+            /**
+             * Затемняет недоступные пункты в выпадающем списке, чтобы Direct не выглядел выбираемым для MESHRA.
+             */
+            override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View {
+                return super.getDropDownView(position, convertView, parent).also { itemView ->
+                    (itemView as? TextView)?.setTextColor(
+                        if (isEnabled(position)) {
+                            android.graphics.Color.BLACK
+                        } else {
+                            android.graphics.Color.GRAY
+                        },
+                    )
+                }
+            }
+        }.also { adapter ->
+            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         }
     }
 
@@ -161,6 +225,67 @@ class CreateRoomDialogFragment : DialogFragment() {
         }.also { adapter ->
             adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         }
+    }
+
+    /**
+     * Обновляет voice spinner после смены типа комнаты и уводит MESHRA с Wi-Fi Direct на безопасный fallback.
+     */
+    private fun syncVoiceTransportWithRoomMode(showToast: Boolean) {
+        voiceTransportAdapter.notifyDataSetChanged()
+        val selectedPosition = spVoiceTransport.selectedItemPosition
+        val selectedPreference = voiceTransportModes.getOrNull(selectedPosition)
+            ?: voiceTransportModes[fallbackVoiceTransportPosition()]
+        if (isVoiceTransportAllowedForRoom(selectedPreference, selectedRoomTransportMode())) {
+            if (selectedPosition in voiceTransportModes.indices) {
+                lastSelectableVoiceTransportPosition = selectedPosition
+            }
+            return
+        }
+        val fallbackPosition = fallbackVoiceTransportPosition()
+        lastSelectableVoiceTransportPosition = fallbackPosition
+        spVoiceTransport.setSelection(fallbackPosition)
+        if (showToast) {
+            showBlockedVoiceTransportToast(selectedPreference)
+        }
+    }
+
+    /**
+     * Проверяет, можно ли выбрать voice transport при текущем типе комнаты.
+     */
+    private fun isVoiceTransportAllowedForRoom(
+        preference: VoiceTransportPreference,
+        roomTransportMode: RoomTransportMode,
+    ): Boolean {
+        if (!preference.isSelectable) {
+            return false
+        }
+        return roomTransportMode != RoomTransportMode.MESHRA || preference != VoiceTransportPreference.WIFI_DIRECT
+    }
+
+    /**
+     * Возвращает позицию fallback voice transport-а: для MESHRA это не-Direct вариант.
+     */
+    private fun fallbackVoiceTransportPosition(): Int {
+        val fallbackPreference = if (selectedRoomTransportMode() == RoomTransportMode.MESHRA) {
+            VoiceTransportPreference.NEARBY_CONNECT
+        } else {
+            voiceTransportModes.getOrNull(lastSelectableVoiceTransportPosition)
+                ?.takeIf { preference -> isVoiceTransportAllowedForRoom(preference, selectedRoomTransportMode()) }
+                ?: VoiceTransportPreference.WIFI_DIRECT
+        }
+        return voiceTransportModes.indexOf(fallbackPreference).coerceAtLeast(0)
+    }
+
+    /**
+     * Показывает причину, по которой выбранный voice transport недоступен.
+     */
+    private fun showBlockedVoiceTransportToast(preference: VoiceTransportPreference) {
+        val message = if (!preference.isSelectable) {
+            "Wi-Fi Aware пока не поддерживается"
+        } else {
+            "Wi-Fi Direct недоступен для MESHRA-комнаты"
+        }
+        Toast.makeText(requireContext(), message, Toast.LENGTH_SHORT).show()
     }
 
     /**
@@ -188,10 +313,10 @@ class CreateRoomDialogFragment : DialogFragment() {
         val position = spVoiceTransport.selectedItemPosition.takeIf { it in voiceTransportModes.indices }
             ?: lastSelectableVoiceTransportPosition
         val preference = voiceTransportModes[position]
-        return if (preference.isSelectable) {
+        return if (isVoiceTransportAllowedForRoom(preference, selectedRoomTransportMode())) {
             preference
         } else {
-            voiceTransportModes[lastSelectableVoiceTransportPosition]
+            voiceTransportModes[fallbackVoiceTransportPosition()]
         }
     }
 
