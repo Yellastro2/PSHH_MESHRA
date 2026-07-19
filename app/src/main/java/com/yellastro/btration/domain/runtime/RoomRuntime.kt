@@ -174,22 +174,32 @@ class RoomRuntime(
     }
 
     /**
-     * Останавливает поиск комнат и возвращает runtime в Idle, если он только искал комнаты.
+     * Останавливает discovery только для состояния Searching; во время Joining не трогает pending connect.
      */
     suspend fun stopSearch() {
         discoveryCycleMutex.withLock {
             val currentState = _state.value
             Log.i(TAG, "[stopSearch] Останавливаем поиск currentState=${currentState.javaClass.simpleName}")
-            roomTransport.stopDiscovery()
-            if (isActiveMeshState(currentState)) {
-                Log.i(TAG, "[stopSearch] Mesh discovery оставлен активным для healing")
-            } else {
-                meshTransport.stopDiscovery()
-            }
-            roomIdsSeenInDiscoveryCycle = null
-            if (currentState is RoomRuntimeState.Searching) {
-                _state.value = RoomRuntimeState.Idle
-                Log.i(TAG, "[stopSearch] Runtime переведен в Idle")
+            when (currentState) {
+                RoomRuntimeState.Searching -> {
+                    roomTransport.stopDiscovery()
+                    meshTransport.stopDiscovery()
+                    roomIdsSeenInDiscoveryCycle = null
+                    _state.value = RoomRuntimeState.Idle
+                    Log.i(TAG, "[stopSearch] Runtime переведен в Idle")
+                }
+                is RoomRuntimeState.Hosting,
+                is RoomRuntimeState.Joining,
+                is RoomRuntimeState.Client,
+                -> {
+                    Log.i(TAG, "[stopSearch] Остановка поиска пропущена: runtime уже держит комнатный lifecycle currentState=${currentState.javaClass.simpleName}")
+                }
+                RoomRuntimeState.Idle,
+                is RoomRuntimeState.Error,
+                -> {
+                    roomIdsSeenInDiscoveryCycle = null
+                    Log.i(TAG, "[stopSearch] Активного поиска нет, transport не трогаем currentState=${currentState.javaClass.simpleName}")
+                }
             }
         }
     }

@@ -1,7 +1,9 @@
 package com.yellastro.btration.data.nearby
 
 import android.util.Log
+import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.nearby.connection.ConnectionsClient
+import com.google.android.gms.nearby.connection.ConnectionsStatusCodes
 import com.google.android.gms.nearby.connection.Payload
 import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
@@ -65,7 +67,13 @@ internal class NearbyPayloadTransport(
                 }
             }
             .addOnFailureListener { cause ->
-                Log.w(TAG, "[sendMessageToEndpoint] Не удалось отправить bytes payload endpointId=$endpointId bytes=${bytes.size} realtime=$isRealtime: ${cause.message}", cause)
+                logBytesSendFailure(
+                    functionName = "sendMessageToEndpoint",
+                    endpointSummary = "endpointId=$endpointId",
+                    bytes = bytes.size,
+                    isRealtime = isRealtime,
+                    cause = cause,
+                )
                 onFailure(cause)
             }
     }
@@ -90,9 +98,42 @@ internal class NearbyPayloadTransport(
                 }
             }
             .addOnFailureListener { cause ->
-                Log.w(TAG, "[sendMessageToEndpoints] Не удалось отправить bytes payload endpointCount=${endpointIds.size} bytes=${bytes.size} realtime=$isRealtime: ${cause.message}", cause)
+                logBytesSendFailure(
+                    functionName = "sendMessageToEndpoints",
+                    endpointSummary = "endpointCount=${endpointIds.size}",
+                    bytes = bytes.size,
+                    isRealtime = isRealtime,
+                    cause = cause,
+                )
                 onFailure(cause)
             }
+    }
+
+    /**
+     * Логирует ошибку bytes-отправки: штатный shutdown heartbeat-а пишет без stack trace, остальные ошибки — полно.
+     */
+    private fun logBytesSendFailure(
+        functionName: String,
+        endpointSummary: String,
+        bytes: Int,
+        isRealtime: Boolean,
+        cause: Throwable,
+    ) {
+        val message = "[$functionName] Не удалось отправить bytes payload $endpointSummary bytes=$bytes realtime=$isRealtime: ${cause.message}"
+        if (isRealtime && bytes == HEARTBEAT_PACKET_BYTES && isEndpointClosedFailure(cause)) {
+            Log.i(TAG, "$message; штатно игнорируем stack trace для закрытого heartbeat link-а")
+            return
+        }
+        Log.w(TAG, message, cause)
+    }
+
+    /**
+     * Возвращает true для Nearby-ошибок, ожидаемых при отправке в уже закрытый endpoint.
+     */
+    private fun isEndpointClosedFailure(cause: Throwable): Boolean {
+        val apiException = cause as? ApiException
+        return apiException?.statusCode == ConnectionsStatusCodes.STATUS_ENDPOINT_UNKNOWN ||
+            cause.message?.contains("SOCKET_CLOSED", ignoreCase = true) == true
     }
 
     /**
@@ -266,6 +307,7 @@ internal class NearbyPayloadTransport(
         private const val TAG = "NearbyPayloadTransport"
         private const val STREAM_READ_LIMIT_BYTES = 320
         private const val REALTIME_LOG_WINDOW_MILLIS = 1_000L
+        private const val HEARTBEAT_PACKET_BYTES = 4
     }
 }
 

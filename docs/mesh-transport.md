@@ -117,6 +117,8 @@ MESHRA advertising, connect и healing discovery явно выбирают `Stra
 
 Бинарный voice DATA принимается локально, не меняет snapshot комнаты, дедупится по `originNodeId + pttSessionId + sequence`, пересылается пригодным соседям этой комнаты кроме предыдущего hop-а и отдается в `RoomRuntime` для playback через `VoiceRuntime`. Link со статусом `LOST` для voice/data flood-а пропускается, чтобы не складывать свежие пакеты в зависшую очередь нижнего Nearby.
 
+Heartbeat ping/pong — realtime bytes payload размером 4 байта. Если при выходе из комнаты или закрытии endpoint-а Nearby возвращает `STATUS_ENDPOINT_UNKNOWN`/`SOCKET_CLOSED`, `MeshTransport` и `NearbyPayloadTransport` пишут короткий shutdown-log без stack trace.
+
 ## Ограничения
 
 - Нет криптографических подписей событий.

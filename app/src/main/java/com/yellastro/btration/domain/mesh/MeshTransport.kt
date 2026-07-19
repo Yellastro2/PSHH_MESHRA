@@ -2,6 +2,8 @@ package com.yellastro.btration.domain.mesh
 
 import android.os.SystemClock
 import android.util.Log
+import com.google.android.gms.common.api.ApiException
+import com.google.android.gms.nearby.connection.ConnectionsStatusCodes
 import com.yellastro.btration.domain.model.ChatMessage
 import com.yellastro.btration.domain.model.Peer
 import com.yellastro.btration.domain.model.PeerId
@@ -577,7 +579,7 @@ class MeshTransport(
                 publishLinkHealth(linkHealthTracker.onPingReceived(linkId, heartbeatNow()))
                 val response = heartbeatCodec.encode(MeshHeartbeatPacket(kind = MeshHeartbeatKind.PONG, sequence = packet.sequence))
                 neighborTransport.sendMessage(linkId, response, isRealtime = true) { cause ->
-                    Log.w(TAG, "[handleHeartbeatPacket] Не удалось отправить mesh heartbeat pong linkId=${linkId.value}: ${cause.message}", cause)
+                    logHeartbeatSendFailure(functionName = "handleHeartbeatPacket", direction = "pong", linkId = linkId, cause = cause)
                 }
             }
             MeshHeartbeatKind.PONG -> {
@@ -630,8 +632,30 @@ class MeshTransport(
         val packet = linkHealthTracker.preparePing(linkId, heartbeatNow()) ?: return
         neighborTransport.sendMessage(linkId, heartbeatCodec.encode(packet), isRealtime = true) { cause ->
             linkHealthTracker.onHeartbeatSendFailed(linkId, heartbeatNow())?.let(::publishLinkHealth)
-            Log.w(TAG, "[sendHeartbeatPing] Не удалось отправить mesh heartbeat ping linkId=${linkId.value}: ${cause.message}", cause)
+            logHeartbeatSendFailure(functionName = "sendHeartbeatPing", direction = "ping", linkId = linkId, cause = cause)
         }
+    }
+
+    /**
+     * Логирует ошибку heartbeat-отправки без stack trace, если link уже штатно закрывается или потерян.
+     */
+    private fun logHeartbeatSendFailure(functionName: String, direction: String, linkId: NeighborLinkId, cause: Throwable) {
+        val message = "[$functionName] Не удалось отправить mesh heartbeat $direction linkId=${linkId.value}: ${cause.message}"
+        if (isHeartbeatShutdownFailure(linkId, cause)) {
+            Log.i(TAG, "$message; штатно игнорируем stack trace для закрытого heartbeat link-а")
+            return
+        }
+        Log.w(TAG, message, cause)
+    }
+
+    /**
+     * Возвращает true для ожидаемых Nearby-ошибок heartbeat-а при выходе из комнаты или закрытии endpoint-а.
+     */
+    private fun isHeartbeatShutdownFailure(linkId: NeighborLinkId, cause: Throwable): Boolean {
+        val apiException = cause as? ApiException
+        return linkId !in activeLinks ||
+            apiException?.statusCode == ConnectionsStatusCodes.STATUS_ENDPOINT_UNKNOWN ||
+            cause.message?.contains("SOCKET_CLOSED", ignoreCase = true) == true
     }
 
     /**
