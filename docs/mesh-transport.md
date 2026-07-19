@@ -95,7 +95,7 @@ MESHRA advertising, connect и healing discovery явно выбирают `Stra
 
 Если выбранный gateway успел протухнуть и Nearby вернул `STATUS_ENDPOINT_UNKNOWN`, `RoomRuntime` запускает clean discovery и повторяет connection при новом `GatewayFound` только для того же временного `mesh_room_<token>_gw_<gateway>` `RoomId`. Это не дает recovery перескочить на другой gateway той же комнаты, например на ignored host.
 
-После создания или входа в MESHRA-комнату mesh discovery остается активным как простой healing-механизм. Runtime не делит link-и на inbound/outbound: flooding использует все активные link-и, а healing добирает любые link-и той же комнаты до `min(участники - 1, 3)` при hard cap `64`. Если участников меньше четырех, узел старается соединиться со всеми известными gateway этой комнаты; если больше — держит минимум три активных/pending link-а. Ошибки отдельных healing connection request-ов логируются, но не роняют активную комнату.
+После создания или входа в MESHRA-комнату mesh discovery включается только как healing-механизм. Runtime не делит link-и на inbound/outbound: flooding использует все пригодные link-и, а healing добирает link-и той же комнаты до `min(участники - 1, 3)` при hard cap `64`. Link со статусом heartbeat `LOST` не считается пригодным и не учитывается как active для healing-счетчика; heartbeat при этом продолжает отправляться, чтобы можно было заметить восстановление. Если участников меньше четырех, узел старается соединиться со всеми известными gateway этой комнаты; если больше — держит минимум три active/pending link-а. Ошибки отдельных healing connection request-ов логируются, но не роняют активную комнату.
 
 Для UI-индикатора прямого соседства `MeshTransport` публикует `directPeerIds: StateFlow<Set<PeerId>>`. Outgoing link привязывается к `PeerId` сразу по `gatewayPeerId` из рекламы, incoming link — после `PEER_HELLO` или первого другого mesh envelope от соседа. UI не получает `endpointId`/`linkId`, только доменный `PeerId`.
 
@@ -109,13 +109,13 @@ MESHRA advertising, connect и healing discovery явно выбирают `Stra
 2. Если `eventId` уже видели, событие игнорируется и дальше не пересылается.
 3. Если событие минимально валидно, оно сохраняется в локальный log.
 4. Snapshot комнаты обновляется инкрементально.
-5. Если `ttl` еще живой, событие пересылается всем активным соседям, кроме link-а, с которого оно пришло.
+5. Если `ttl` еще живой, событие пересылается всем активным соседям без heartbeat-статуса `LOST`, кроме link-а, с которого оно пришло.
 
 `ROOM_SNAPSHOT` принимается локально и не flood-ится дальше. Он нужен для сценария, где новый peer входит через mesh gateway и должен быстро получить состояние комнаты.
 
 `PEER_HELLO` принимается локально, не flood-ится и не меняет snapshot комнаты.
 
-Бинарный voice DATA принимается локально, не меняет snapshot комнаты, дедупится по `originNodeId + pttSessionId + sequence`, пересылается соседям этой комнаты кроме предыдущего hop-а и отдается в `RoomRuntime` для playback через `VoiceRuntime`.
+Бинарный voice DATA принимается локально, не меняет snapshot комнаты, дедупится по `originNodeId + pttSessionId + sequence`, пересылается пригодным соседям этой комнаты кроме предыдущего hop-а и отдается в `RoomRuntime` для playback через `VoiceRuntime`. Link со статусом `LOST` для voice/data flood-а пропускается, чтобы не складывать свежие пакеты в зависшую очередь нижнего Nearby.
 
 ## Ограничения
 

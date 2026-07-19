@@ -5,6 +5,7 @@ import com.google.android.gms.common.api.ApiException
 import com.yellastro.btration.data.nearby.NearbyRequirementException
 import com.yellastro.btration.domain.mesh.MeshRoomAdvertisement
 import com.yellastro.btration.domain.mesh.MeshRoomSnapshot
+import com.yellastro.btration.domain.mesh.MeshLinkStatus
 import com.yellastro.btration.domain.mesh.MeshTransport
 import com.yellastro.btration.domain.mesh.MeshTransportEvent
 import com.yellastro.btration.domain.model.ChatMessage
@@ -660,10 +661,7 @@ class RoomRuntime(
             is MeshTransportEvent.GatewayLost -> handleMeshGatewayLost(event)
             is MeshTransportEvent.LinkConnected -> handleMeshLinkConnected(event)
             is MeshTransportEvent.LinkDisconnected -> handleMeshLinkDisconnected(event)
-            is MeshTransportEvent.LinkHealthChanged -> Log.i(
-                TAG,
-                "[handleMeshTransportEvent] Mesh link health status=${event.health.status} peerId=${event.peerId?.value} linkId=${event.health.linkId.value} rttMillis=${event.health.rttMillis} lossPercent=${event.health.lossPercent} missedInRow=${event.health.missedInRow}",
-            )
+            is MeshTransportEvent.LinkHealthChanged -> handleMeshLinkHealthChanged(event)
             is MeshTransportEvent.EventAccepted -> handleMeshRoomUpdated(event.event.roomId)
             is MeshTransportEvent.SnapshotReceived -> handleMeshSnapshotReceived(event.snapshot)
             is MeshTransportEvent.VoiceFrameReceived -> handleMeshVoiceFrameReceived(event)
@@ -1047,10 +1045,14 @@ class RoomRuntime(
     }
 
     /**
-     * Подтверждает готовность mesh-link-а; вход в комнату завершается после получения snapshot-а.
+     * Подтверждает готовность mesh-link-а и пересчитывает, нужно ли дальше держать healing discovery.
      */
     private fun handleMeshLinkConnected(event: MeshTransportEvent.LinkConnected) {
-        val joiningState = _state.value as? RoomRuntimeState.Joining ?: return
+        val joiningState = _state.value as? RoomRuntimeState.Joining
+        if (joiningState == null) {
+            activeMeshRoomId()?.let { roomId -> startMeshHealingDiscovery(roomId, reason = "link_connected") }
+            return
+        }
         if (joiningState.room.roomTransportMode != RoomTransportMode.MESHRA) {
             return
         }
@@ -1070,6 +1072,25 @@ class RoomRuntime(
         val roomId = activeMeshRoomId() ?: return
         startMeshHealingDiscovery(roomId, reason = "link_disconnected")
         connectToKnownMeshGatewaysForHealing(roomId)
+    }
+
+    /**
+     * Реагирует на heartbeat-статус link-а: LOST запускает healing, CONNECTED пересчитывает нужен ли discovery дальше.
+     */
+    private fun handleMeshLinkHealthChanged(event: MeshTransportEvent.LinkHealthChanged) {
+        Log.i(
+            TAG,
+            "[handleMeshLinkHealthChanged] Mesh link health status=${event.health.status} peerId=${event.peerId?.value} linkId=${event.health.linkId.value} rttMillis=${event.health.rttMillis} lossPercent=${event.health.lossPercent} missedInRow=${event.health.missedInRow}",
+        )
+        val roomId = activeMeshRoomId() ?: return
+        when (event.health.status) {
+            MeshLinkStatus.LOST -> {
+                startMeshHealingDiscovery(roomId, reason = "link_health_lost")
+                connectToKnownMeshGatewaysForHealing(roomId)
+            }
+            MeshLinkStatus.CONNECTED -> startMeshHealingDiscovery(roomId, reason = "link_health_connected")
+            MeshLinkStatus.SUSPECT -> Unit
+        }
     }
 
     /**
@@ -1132,6 +1153,7 @@ class RoomRuntime(
                     directAudioStatus = DirectAudioStatus.Ready,
                 )
                 advertiseMeshSnapshot(roomId, profileRepository.getSelfPeer())
+                startMeshHealingDiscovery(roomId, reason = "host_snapshot_updated")
                 connectToKnownMeshGatewaysForHealing(roomId)
                 Log.i(TAG, "[handleMeshRoomUpdated] Host MESHRA snapshot применен roomId=${roomId.value} memberCount=${snapshot.members.size} messageCount=${snapshot.messages.size}")
             }
@@ -1147,6 +1169,7 @@ class RoomRuntime(
                     directAudioStatus = DirectAudioStatus.Ready,
                 )
                 advertiseMeshSnapshot(roomId, profileRepository.getSelfPeer())
+                startMeshHealingDiscovery(roomId, reason = "client_snapshot_updated")
                 connectToKnownMeshGatewaysForHealing(roomId)
                 Log.i(TAG, "[handleMeshRoomUpdated] Client MESHRA snapshot применен roomId=${roomId.value} memberCount=${snapshot.members.size} messageCount=${snapshot.messages.size}")
             }
@@ -1160,7 +1183,7 @@ class RoomRuntime(
     }
 
     /**
-     * Подключается к найденному gateway той же MESHRA-комнаты, если активных/pending link-ов меньше целевого числа.
+     * Подключается к найденному gateway той же MESHRA-комнаты, либо останавливает discovery при достаточной связности.
      */
     private fun connectToMeshGatewayForHealingIfNeeded(roomInfo: RoomInfo, endpointId: String) {
         val activeMeshState = activeMeshStateInfo() ?: return
@@ -1180,9 +1203,10 @@ class RoomRuntime(
         val targetLinkCount = desiredMeshLinkCount(knownMemberCount)
         val currentLinkOrPendingCount = meshTransport.linkOrPendingCount()
         if (targetLinkCount <= 0 || currentLinkOrPendingCount >= targetLinkCount || currentLinkOrPendingCount >= MESH_MAX_LINKS) {
+            meshTransport.stopDiscovery()
             Log.i(
                 TAG,
-                "[connectToMeshGatewayForHealingIfNeeded] Mesh link не нужен endpointId=$endpointId current=$currentLinkOrPendingCount target=$targetLinkCount knownMembers=$knownMemberCount",
+                "[connectToMeshGatewayForHealingIfNeeded] Mesh link не нужен, discovery остановлен endpointId=$endpointId current=$currentLinkOrPendingCount target=$targetLinkCount knownMembers=$knownMemberCount",
             )
             return
         }
@@ -1194,9 +1218,13 @@ class RoomRuntime(
     }
 
     /**
-     * Пробует добрать mesh link-и из уже известных discovery-кандидатов текущей комнаты.
+     * Пробует добрать mesh link-и из уже известных discovery-кандидатов только при дефиците связности.
      */
     private fun connectToKnownMeshGatewaysForHealing(roomId: RoomId) {
+        val activeMeshState = activeMeshStateInfo() ?: return
+        if (!isSameMeshDiscoveryRoom(activeMeshState.room, roomId) || !needsMeshHealingLinks(activeMeshState, reason = "known_gateways")) {
+            return
+        }
         _availableRooms.value
             .filter { roomInfo -> roomInfo.discoveryEndpointId != null && isSameMeshDiscoveryRoom(roomInfo, roomId) }
             .forEach { roomInfo ->
@@ -1208,7 +1236,7 @@ class RoomRuntime(
     }
 
     /**
-     * Возвращает целевое количество активных mesh link-ов для текущего размера комнаты.
+     * Возвращает целевое количество активных mesh link-ов для текущего размера комнаты, но не больше лимитов healing-а.
      */
     private fun desiredMeshLinkCount(memberCount: Int): Int {
         return (memberCount - 1)
@@ -1218,9 +1246,38 @@ class RoomRuntime(
     }
 
     /**
-     * Запускает discovery активной MESHRA-комнаты для фонового добора соседей.
+     * Проверяет, нужно ли активной MESHRA-комнате добирать link-и через discovery/healing.
+     */
+    private fun needsMeshHealingLinks(activeMeshState: ActiveMeshStateInfo, reason: String): Boolean {
+        val targetLinkCount = desiredMeshLinkCount(activeMeshState.memberCount)
+        val currentLinkOrPendingCount = meshTransport.linkOrPendingCount()
+        val needsHealing = targetLinkCount > 0 &&
+            currentLinkOrPendingCount < targetLinkCount &&
+            currentLinkOrPendingCount < MESH_MAX_LINKS
+        if (!needsHealing) {
+            Log.i(
+                TAG,
+                "[needsMeshHealingLinks] Mesh healing не нужен roomId=${activeMeshState.room.roomId.value} reason=$reason current=$currentLinkOrPendingCount target=$targetLinkCount members=${activeMeshState.memberCount}",
+            )
+        }
+        return needsHealing
+    }
+
+    /**
+     * Запускает discovery активной MESHRA-комнаты только если active/pending link-ов меньше целевого числа.
      */
     private fun startMeshHealingDiscovery(roomId: RoomId, reason: String) {
+        val activeMeshState = activeMeshStateInfo()
+        if (activeMeshState == null || !isSameMeshDiscoveryRoom(activeMeshState.room, roomId)) {
+            Log.i(TAG, "[startMeshHealingDiscovery] Mesh discovery не запущен: активной MESHRA-комнаты нет roomId=${roomId.value} reason=$reason")
+            meshTransport.stopDiscovery()
+            return
+        }
+        if (!needsMeshHealingLinks(activeMeshState, reason = reason)) {
+            meshTransport.stopDiscovery()
+            Log.i(TAG, "[startMeshHealingDiscovery] Mesh discovery остановлен: связность уже достаточна roomId=${roomId.value} reason=$reason")
+            return
+        }
         meshTransport.startDiscovery()
         Log.i(TAG, "[startMeshHealingDiscovery] Mesh discovery оставлен активным для healing roomId=${roomId.value} reason=$reason")
     }

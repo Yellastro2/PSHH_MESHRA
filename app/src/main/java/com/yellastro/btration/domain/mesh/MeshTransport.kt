@@ -169,24 +169,24 @@ class MeshTransport(
     }
 
     /**
-     * Возвращает количество готовых mesh link-ов.
+     * Возвращает количество готовых mesh link-ов, которые не помечены heartbeat-ом как LOST и пригодны для payload-ов.
      */
     fun activeLinkCount(): Int {
-        return activeLinks.size
+        return usablePayloadLinkCount()
     }
 
     /**
-     * Возвращает количество готовых и уже запрошенных mesh link-ов.
+     * Возвращает количество пригодных для payload-ов и уже запрошенных mesh link-ов.
      */
     fun linkOrPendingCount(): Int {
-        return activeLinks.size + pendingGatewayConnections.size
+        return usablePayloadLinkCount() + pendingGatewayConnections.size
     }
 
     /**
-     * Возвращает true, если gateway уже подключен или ожидает завершения connection request.
+     * Возвращает true, если gateway уже подключен пригодным link-ом или ожидает завершения connection request.
      */
     fun hasLinkOrPending(candidateId: NeighborCandidateId): Boolean {
-        return NeighborLinkId(candidateId.value) in activeLinks || candidateId in pendingGatewayConnections
+        return isPayloadLinkUsable(NeighborLinkId(candidateId.value)) || candidateId in pendingGatewayConnections
     }
 
     /**
@@ -398,6 +398,10 @@ class MeshTransport(
         val snapshot = roomSnapshots[roomId]
         if (snapshot == null) {
             Log.w(TAG, "[sendSnapshot] Snapshot комнаты неизвестен roomId=${roomId.value} linkId=${linkId.value}")
+            return
+        }
+        if (!isPayloadLinkUsable(linkId)) {
+            Log.w(TAG, "[sendSnapshot] Snapshot не отправлен в LOST mesh link roomId=${roomId.value} linkId=${linkId.value}")
             return
         }
         bindLinkRoom(linkId, roomId, source = "outgoing_snapshot")
@@ -791,9 +795,10 @@ class MeshTransport(
         if (ttl < 0) {
             return
         }
-        val targetLinks = activeLinks.filterNot { linkId -> linkId == incomingLinkId }
+        val lostTargetCount = activeLinks.count { linkId -> linkId != incomingLinkId && !isPayloadLinkUsable(linkId) }
+        val targetLinks = activeLinks.filter { linkId -> linkId != incomingLinkId && isPayloadLinkUsable(linkId) }
         if (targetLinks.isEmpty()) {
-            Log.i(TAG, "[floodEvent] Некому переслать mesh-событие eventId=${event.eventId.value} ttl=$ttl")
+            Log.i(TAG, "[floodEvent] Некому переслать mesh-событие eventId=${event.eventId.value} ttl=$ttl skippedLostCount=$lostTargetCount")
             return
         }
         targetLinks.forEach { linkId -> bindLinkRoom(linkId, event.roomId, source = "outgoing_event") }
@@ -808,7 +813,7 @@ class MeshTransport(
         neighborTransport.sendMessage(targetLinks, codec.encode(envelope)) { cause ->
             emitEvent(MeshTransportEvent.SendFailed(roomId = event.roomId, eventId = event.eventId, cause = cause))
         }
-        Log.i(TAG, "[floodEvent] Mesh-событие переслано eventId=${event.eventId.value} targetCount=${targetLinks.size} ttl=$ttl")
+        Log.i(TAG, "[floodEvent] Mesh-событие переслано eventId=${event.eventId.value} targetCount=${targetLinks.size} skippedLostCount=$lostTargetCount ttl=$ttl")
     }
 
     /**
@@ -822,10 +827,13 @@ class MeshTransport(
         if (packet.ttl < 0) {
             return
         }
-        val targetLinks = activeLinks.filter { linkId ->
-            linkId != incomingLinkId && linkRoomIds[linkId] == roomId
-        }
+        val candidateLinks = activeLinks.filter { linkId -> linkId != incomingLinkId && linkRoomIds[linkId] == roomId }
+        val targetLinks = candidateLinks.filter(::isPayloadLinkUsable)
+        val lostTargetCount = candidateLinks.size - targetLinks.size
         if (targetLinks.isEmpty()) {
+            if (packet.sequence == FIRST_VOICE_FRAME_SEQUENCE.toInt() || packet.isFinal) {
+                Log.i(TAG, "[floodVoicePacket] Mesh voice frame не переслан: пригодных link-ов нет originNodeId=${packet.originNodeId} sessionId=${packet.pttSessionId} sequence=${packet.sequence} skippedLostCount=$lostTargetCount ttl=${packet.ttl} final=${packet.isFinal}")
+            }
             return
         }
         val bytes = voicePacketCodec.encode(packet)
@@ -833,8 +841,23 @@ class MeshTransport(
             emitEvent(MeshTransportEvent.SendFailed(roomId = roomId, eventId = null, cause = cause, isRealtime = true))
         }
         if (packet.sequence == FIRST_VOICE_FRAME_SEQUENCE.toInt() || packet.isFinal) {
-            Log.i(TAG, "[floodVoicePacket] Компактный mesh voice frame переслан originNodeId=${packet.originNodeId} sessionId=${packet.pttSessionId} sequence=${packet.sequence} targetCount=${targetLinks.size} ttl=${packet.ttl} final=${packet.isFinal} packetBytes=${bytes.size}")
+            Log.i(TAG, "[floodVoicePacket] Компактный mesh voice frame переслан originNodeId=${packet.originNodeId} sessionId=${packet.pttSessionId} sequence=${packet.sequence} targetCount=${targetLinks.size} skippedLostCount=$lostTargetCount ttl=${packet.ttl} final=${packet.isFinal} packetBytes=${bytes.size}")
         }
+    }
+
+    /**
+     * Возвращает количество link-ов, в которые можно отправлять обычные mesh payload-ы без heartbeat LOST.
+     */
+    private fun usablePayloadLinkCount(): Int {
+        return activeLinks.count(::isPayloadLinkUsable)
+    }
+
+    /**
+     * Проверяет, можно ли использовать link для room/event/voice payload-ов; heartbeat продолжает ходить отдельно.
+     */
+    private fun isPayloadLinkUsable(linkId: NeighborLinkId): Boolean {
+        val health = linkHealthTracker.healthFor(linkId)
+        return linkId in activeLinks && health?.status != MeshLinkStatus.LOST
     }
 
     /**
