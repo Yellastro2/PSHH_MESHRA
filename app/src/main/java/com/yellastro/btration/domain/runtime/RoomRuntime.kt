@@ -96,9 +96,14 @@ class RoomRuntime(
     val talkingPeerIds: StateFlow<Set<PeerId>> = _talkingPeerIds.asStateFlow()
 
     /**
-     * PeerId участников, с которыми сейчас есть прямой mesh link; в Nearby Star не используется.
+     * PeerId участников, с которыми сейчас есть прямой mesh link без LOST heartbeat-статуса; в Nearby Star не используется.
      */
     val directMeshPeerIds: StateFlow<Set<PeerId>> = meshTransport.directPeerIds
+
+    /**
+     * Ping/status прямых mesh-соседей, рассчитанные из heartbeat-ов и привязанные к PeerId.
+     */
+    val meshPeerConnectionStates = meshTransport.peerConnectionStates
 
     /**
      * Одноразовые уведомления для snackbar, которые не обязаны менять состояние комнаты.
@@ -279,7 +284,7 @@ class RoomRuntime(
     }
 
     /**
-     * Атомарно останавливает discovery refresh и подключается к комнате в совместимой с ее voice transport topology.
+     * Атомарно останавливает discovery refresh и начинает подключение к найденной комнате по ее RoomId.
      */
     suspend fun joinRoom(roomId: RoomId) {
         discoveryCycleMutex.withLock {
@@ -326,7 +331,7 @@ class RoomRuntime(
         _messages.value = emptyList()
         _state.value = RoomRuntimeState.Joining(room)
         Log.i(TAG, "[joinRoom] Runtime переведен в Joining roomId=${room.roomId.value} endpointId=$endpointId")
-        roomTransport.connectToEndpoint(endpointId, room)
+        roomTransport.connectToEndpoint(endpointId, room.roomTransportMode)
     }
 
     /**
@@ -646,7 +651,7 @@ class RoomRuntime(
     }
 
     /**
-     * Обрабатывает события MESHRA-транспорта и синхронизирует snapshot комнаты с runtime-состоянием.
+     * Обрабатывает события MESHRA-транспорта, включая room snapshot-ы, voice frames и диагностические статусы link-ов.
      */
     private fun handleMeshTransportEvent(event: MeshTransportEvent) {
         Log.i(TAG, "[handleMeshTransportEvent] Получено событие MeshTransportEvent type=${event.javaClass.simpleName} currentState=${_state.value.javaClass.simpleName}")
@@ -655,6 +660,10 @@ class RoomRuntime(
             is MeshTransportEvent.GatewayLost -> handleMeshGatewayLost(event)
             is MeshTransportEvent.LinkConnected -> handleMeshLinkConnected(event)
             is MeshTransportEvent.LinkDisconnected -> handleMeshLinkDisconnected(event)
+            is MeshTransportEvent.LinkHealthChanged -> Log.i(
+                TAG,
+                "[handleMeshTransportEvent] Mesh link health status=${event.health.status} peerId=${event.peerId?.value} linkId=${event.health.linkId.value} rttMillis=${event.health.rttMillis} lossPercent=${event.health.lossPercent} missedInRow=${event.health.missedInRow}",
+            )
             is MeshTransportEvent.EventAccepted -> handleMeshRoomUpdated(event.event.roomId)
             is MeshTransportEvent.SnapshotReceived -> handleMeshSnapshotReceived(event.snapshot)
             is MeshTransportEvent.VoiceFrameReceived -> handleMeshVoiceFrameReceived(event)
@@ -809,11 +818,15 @@ class RoomRuntime(
     }
 
     /**
-     * Рассылает локальную voice transport info через room signaling, когда transport уже готов к подключению соседей.
+     * Рассылает локальную voice transport info только после готовности host infrastructure либо от client к host.
      */
     private fun handleLocalVoiceTransportInfoChanged(info: VoiceTransportControlInfo) {
         when (val currentState = _state.value) {
             is RoomRuntimeState.Hosting -> {
+                if (!currentState.room.isDirectAudioReady) {
+                    Log.i(TAG, "[handleLocalVoiceTransportInfoChanged] Host voice info готова, но media-plane еще не разрешил client handshake")
+                    return
+                }
                 Log.i(TAG, "[handleLocalVoiceTransportInfoChanged] Host рассылает voice info для запуска handshake memberCount=${currentState.members.size}")
                 sendToMembers(
                     currentState.members,
@@ -1270,7 +1283,7 @@ class RoomRuntime(
     }
 
     /**
-     * После свежего обнаружения восстанавливаемой комнаты повторяет connection в исходной media topology один раз.
+     * После свежего обнаружения восстанавливаемой комнаты останавливает recovery discovery и повторяет connection один раз.
      */
     private fun reconnectAfterRecoveryIfNeeded(roomId: RoomId, endpointId: String) {
         val currentState = _state.value as? RoomRuntimeState.Joining ?: return
@@ -1289,7 +1302,7 @@ class RoomRuntime(
             )
         } else {
             Log.i(TAG, "[reconnectAfterRecoveryIfNeeded] Комната найдена заново, повторяем connection roomId=${roomId.value} endpointId=$endpointId")
-            roomTransport.connectToEndpoint(endpointId, currentState.room)
+            roomTransport.connectToEndpoint(endpointId, currentState.room.roomTransportMode)
         }
     }
 
@@ -1393,7 +1406,7 @@ class RoomRuntime(
     }
 
     /**
-     * Выполняет один clean-discovery retry в topology комнаты после 8007/8009/8012 либо завершает Joining ошибкой.
+     * Выполняет один clean-discovery retry после 8007/8009/8012 либо завершает Joining ошибкой после повторного сбоя.
      */
     private fun handleConnectionRecoveryRequired(event: RoomTransportEvent.ConnectionRecoveryRequired) {
         val currentState = _state.value as? RoomRuntimeState.Joining ?: return
@@ -1417,7 +1430,7 @@ class RoomRuntime(
             if (joiningState?.room?.roomId != currentState.room.roomId || recoveringRoomId != currentState.room.roomId) {
                 return@launch
             }
-            roomTransport.startDiscovery(currentState.room)
+            roomTransport.startDiscovery(currentState.room.roomTransportMode)
             Log.i(TAG, "[handleConnectionRecoveryRequired] Clean discovery запущен roomId=${currentState.room.roomId.value}")
             delay(CONNECTION_RECOVERY_DISCOVERY_TIMEOUT_MILLIS)
             if (_state.value is RoomRuntimeState.Joining && recoveringRoomId == currentState.room.roomId && !recoveryReconnectRequested) {
@@ -1462,7 +1475,7 @@ class RoomRuntime(
     }
 
     /**
-     * Переводит client обратно в Joining и ищет advertised-комнату в совместимой с ее voice transport topology.
+     * Переводит client обратно в Joining и запускает clean discovery той же advertised-комнаты после обрыва host-а.
      */
     private fun beginClientReconnectAfterHostDisconnect(currentState: RoomRuntimeState.Client) {
         clearConnectionRecovery()
@@ -1481,7 +1494,7 @@ class RoomRuntime(
         roomTransport.stopAllEndpointsAndClearState(reason = "client_host_disconnect_reconnect")
         connectionRecoveryJob = externalScope.launch {
             Log.i(TAG, "[beginClientReconnectAfterHostDisconnect] Запускаем discovery для переподключения roomId=${reconnectRoom.roomId.value}")
-            roomTransport.startDiscovery(reconnectRoom)
+            roomTransport.startDiscovery(reconnectRoom.roomTransportMode)
             delay(CLIENT_RECONNECT_DISCOVERY_TIMEOUT_MILLIS)
             if (_state.value is RoomRuntimeState.Joining && recoveringRoomId == reconnectRoom.roomId && !recoveryReconnectRequested) {
                 setError("Не удалось переподключиться к комнате")
@@ -1518,7 +1531,7 @@ class RoomRuntime(
     }
 
     /**
-     * На стороне host принимает JOIN_REQUEST по прямому endpoint-у и рассылает реальный RoomInfo участнику.
+     * На стороне host принимает JOIN_REQUEST и отдает voice info только после готовности host media infrastructure.
      */
     private fun handleJoinRequest(event: RoomTransportEvent.PacketReceived) {
         val currentState = _state.value as? RoomRuntimeState.Hosting ?: return
@@ -1562,8 +1575,12 @@ class RoomRuntime(
             ),
             excludedPeerIds = setOf(profileRepository.getOrCreatePeerId(), joiningPeer.peerId),
         )
-        voiceTransport.localControlInfo?.let { info ->
-            sendVoiceTransportInfoTo(joiningPeer.peerId, currentState.room.roomId, info)
+        if (currentState.room.isDirectAudioReady) {
+            voiceTransport.localControlInfo?.let { info ->
+                sendVoiceTransportInfoTo(joiningPeer.peerId, currentState.room.roomId, info)
+            }
+        } else {
+            Log.i(TAG, "[handleJoinRequest] Host media-plane еще не готов, voice info будет отправлена после readiness peerId=${joiningPeer.peerId.value}")
         }
     }
 

@@ -17,7 +17,6 @@ import com.yellastro.btration.domain.transport.NeighborTopology
 import com.yellastro.btration.domain.transport.NeighborTransport
 import com.yellastro.btration.domain.transport.NeighborTransportEvent
 import com.yellastro.btration.domain.transport.PeerLinkResolver
-import com.yellastro.btration.voice.VoiceTransportMode
 import java.io.InputStream
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -26,10 +25,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 
 /**
- * Протокол комнаты поверх topology-aware NeighborTransport: WirePacket, реклама режимов комнаты/голоса и связи PeerId с linkId.
- *
- * Star-комната с raw Wi-Fi Direct voice использует Cluster signaling, чтобы Nearby P2P_STAR не занимал системный
- * Wi-Fi P2P stack до отдельного DNS-SD/group handshake media-plane.
+ * Протокол комнаты поверх topology-aware NeighborTransport: WirePacket, реклама режима комнаты и связи PeerId с linkId.
  */
 class RoomTransport(
     private val neighborTransport: NeighborTransport,
@@ -57,13 +53,13 @@ class RoomTransport(
     }
 
     /**
-     * Запускает чередующийся поиск для лобби либо фиксированный поиск в физической topology конкретной комнаты.
+     * Запускает чередующийся поиск Star/MESHRA для лобби либо фиксированный поиск для восстановления конкретной комнаты.
      */
-    fun startDiscovery(room: RoomInfo? = null) {
-        val discoveryMode = when (room?.toNeighborTopology()) {
+    fun startDiscovery(roomTransportMode: RoomTransportMode? = null) {
+        val discoveryMode = when (roomTransportMode) {
             null -> NeighborDiscoveryMode.ALTERNATING
-            NeighborTopology.STAR -> NeighborDiscoveryMode.STAR_ONLY
-            NeighborTopology.CLUSTER -> NeighborDiscoveryMode.CLUSTER_ONLY
+            RoomTransportMode.NEARBY_STAR -> NeighborDiscoveryMode.STAR_ONLY
+            RoomTransportMode.MESHRA -> NeighborDiscoveryMode.CLUSTER_ONLY
         }
         neighborTransport.startDiscovery(discoveryMode)
     }
@@ -76,13 +72,13 @@ class RoomTransport(
     }
 
     /**
-     * Запускает рекламу комнаты через короткую визитку endpointName и совместимую с voice media-plane topology.
+     * Запускает рекламу комнаты через короткую визитку endpointName и физическую topology режима комнаты.
      */
     fun startAdvertising(room: RoomInfo) {
         stopAllEndpointsAndClearState(reason = "prepare_start_advertising")
         neighborTransport.startAdvertising(
             advertisement = NeighborAdvertisement(NearbyRoomAdvertisement.fromRoom(room).encode()),
-            topology = room.toNeighborTopology(),
+            topology = room.roomTransportMode.toNeighborTopology(),
         )
     }
 
@@ -110,12 +106,12 @@ class RoomTransport(
     }
 
     /**
-     * Запрашивает соединение с endpoint-кандидатом в topology, выбранной по режимам комнаты и голоса из рекламы.
+     * Запрашивает соединение с endpoint-кандидатом в topology, объявленной режимом комнаты.
      */
-    fun connectToEndpoint(endpointId: String, room: RoomInfo) {
+    fun connectToEndpoint(endpointId: String, roomTransportMode: RoomTransportMode = RoomTransportMode.NEARBY_STAR) {
         neighborTransport.connect(
             candidateId = NeighborCandidateId(endpointId),
-            topology = room.toNeighborTopology(),
+            topology = roomTransportMode.toNeighborTopology(),
         )
     }
 
@@ -478,13 +474,12 @@ class RoomTransport(
     }
 
     /**
-     * Выбирает физическую Nearby topology без конфликта raw Wi-Fi Direct media-plane с Nearby P2P_STAR.
+     * Преобразует тип комнаты в физическую topology нижнего NeighborTransport.
      */
-    private fun RoomInfo.toNeighborTopology(): NeighborTopology {
-        return when {
-            roomTransportMode == RoomTransportMode.MESHRA -> NeighborTopology.CLUSTER
-            voiceTransportMode == VoiceTransportMode.WIFI_DIRECT_UDP -> NeighborTopology.CLUSTER
-            else -> NeighborTopology.STAR
+    private fun RoomTransportMode.toNeighborTopology(): NeighborTopology {
+        return when (this) {
+            RoomTransportMode.NEARBY_STAR -> NeighborTopology.STAR
+            RoomTransportMode.MESHRA -> NeighborTopology.CLUSTER
         }
     }
 

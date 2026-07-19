@@ -930,7 +930,9 @@ class RoomFragment : Fragment() {
             val tvName: TextView = view.findViewById(R.id.tv_member_name)
             val tvStatus: TextView = view.findViewById(R.id.tv_member_status)
             val viewTalkIndicator: View = view.findViewById(R.id.view_talking_indicator)
+            val itemUserMeshLayout: View = view.findViewById(R.id.item_user_mesh_layot)
             val viewConnectIndicator: View = view.findViewById(R.id.view_connect_indicator)
+            val tvUserPing: TextView = view.findViewById(R.id.item_user_ping)
             val ivMuted: View = view.findViewById(R.id.iv_muted_icon)
         }
 
@@ -952,7 +954,7 @@ class RoomFragment : Fragment() {
         }
 
         /**
-         * Заполняет имя, роль, voice-индикатор и индикатор прямого mesh-connect-а участника.
+         * Заполняет имя, роль, voice-индикатор, mesh-connect контейнер и ping участника.
          */
         override fun onBindViewHolder(holder: ViewHolder, position: Int) {
             val member = items[position]
@@ -971,6 +973,7 @@ class RoomFragment : Fragment() {
             }
 
             if (member.isConnectIndicatorVisible) {
+                holder.itemUserMeshLayout.visibility = View.VISIBLE
                 holder.viewConnectIndicator.setBackgroundResource(
                     if (member.isDirectlyConnected) {
                         R.drawable.bg_dot_connect
@@ -979,8 +982,9 @@ class RoomFragment : Fragment() {
                     },
                 )
                 holder.viewConnectIndicator.visibility = View.VISIBLE
+                holder.tvUserPing.text = member.meshPingText
             } else {
-                holder.viewConnectIndicator.visibility = View.GONE
+                holder.itemUserMeshLayout.visibility = View.GONE
             }
 
             holder.ivMuted.visibility = View.GONE

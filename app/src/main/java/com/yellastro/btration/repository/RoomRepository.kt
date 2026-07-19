@@ -14,7 +14,7 @@ import kotlinx.coroutines.sync.withLock
 
 /**
  * Фасад комнаты для ViewModel и foreground service: прокидывает discovery-циклы, команды комнаты,
- * чат, общее локальное состояние микрофона и mesh-connect статусы в runtime.
+ * чат, общее локальное состояние микрофона, mesh-connect статусы и ping-состояния в runtime.
  */
 class RoomRepository(
     private val roomRuntime: RoomRuntime,
@@ -45,9 +45,14 @@ class RoomRepository(
     val talkingPeerIds = roomRuntime.talkingPeerIds
 
     /**
-     * PeerId участников, с которыми у текущего устройства есть прямой mesh link.
+     * PeerId участников, с которыми у текущего устройства есть прямой mesh link без LOST heartbeat-статуса.
      */
     val directMeshPeerIds = roomRuntime.directMeshPeerIds
+
+    /**
+     * Ping/status прямых mesh-соседей для UI карточек участников.
+     */
+    val meshPeerConnectionStates = roomRuntime.meshPeerConnectionStates
 
     /**
      * Одноразовые уведомления runtime для snackbar во ViewModel/UI.

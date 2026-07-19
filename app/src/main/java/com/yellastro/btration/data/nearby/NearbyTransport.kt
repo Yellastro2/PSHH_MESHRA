@@ -25,8 +25,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 /**
  * Реализация NeighborTransport поверх Google Nearby Connections с динамическими Star/Cluster topology.
  *
- * Лобби чередует discovery-фазы; room layer выбирает P2P_STAR для обычного Star signaling и P2P_CLUSTER для MESHRA
- * либо Star-комнаты с отдельным raw Wi-Fi Direct media-plane.
+ * Лобби чередует discovery-фазы; Star-комнаты используют P2P_STAR, а MESHRA advertising/connect/healing — P2P_CLUSTER.
  */
 class NearbyTransport(
     context: Context,

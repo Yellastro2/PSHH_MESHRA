@@ -1,5 +1,6 @@
 package com.yellastro.btration.domain.mesh
 
+import android.os.SystemClock
 import android.util.Log
 import com.yellastro.btration.domain.model.ChatMessage
 import com.yellastro.btration.domain.model.Peer
@@ -18,6 +19,8 @@ import com.yellastro.btration.voice.VoiceTransportMode
 import java.util.LinkedHashSet
 import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -27,7 +30,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Mesh-слой поверх Cluster topology NeighborTransport: flood-ит JSON room events и компактные бинарные voice-пакеты, ведет snapshot-ы и соседей.
+ * Mesh-слой поверх Cluster topology NeighborTransport: flood-ит room events/voice и меряет здоровье прямых link-ов heartbeat-ами.
  *
  * Runtime включает этот слой для MESHRA-комнат; Nearby Star продолжает работать через обычный RoomTransport.
  */
@@ -57,6 +60,17 @@ class MeshTransport(
     private val _events = MutableSharedFlow<MeshTransportEvent>(extraBufferCapacity = EVENT_BUFFER_CAPACITY)
     private val _rooms = MutableStateFlow<Map<RoomId, MeshRoomSnapshot>>(emptyMap())
     private val _directPeerIds = MutableStateFlow<Set<PeerId>>(emptySet())
+    private val _linkHealth = MutableStateFlow<Map<NeighborLinkId, MeshLinkHealth>>(emptyMap())
+    private val _peerConnectionStates = MutableStateFlow<Map<PeerId, MeshPeerConnectionState>>(emptyMap())
+    private val heartbeatCodec = MeshHeartbeatCodec()
+    private val linkHealthTracker = MeshLinkHealthTracker(
+        heartbeatTimeoutMillis = HEARTBEAT_TIMEOUT_MILLIS,
+        heartbeatLostMillis = HEARTBEAT_LOST_MILLIS,
+        lossWindowSize = HEARTBEAT_LOSS_WINDOW_SIZE,
+    )
+    private val lastLoggedLinkStatuses = mutableMapOf<NeighborLinkId, MeshLinkStatus>()
+    private val lastLoggedLinkMetricMillis = mutableMapOf<NeighborLinkId, Long>()
+    private var heartbeatJob: Job? = null
 
     /**
      * События mesh-слоя для будущего runtime: принятые room events, snapshot-ы и ошибки.
@@ -69,9 +83,19 @@ class MeshTransport(
     val rooms: StateFlow<Map<RoomId, MeshRoomSnapshot>> = _rooms.asStateFlow()
 
     /**
-     * PeerId соседей, с которыми у локального устройства сейчас есть прямой mesh link.
+     * PeerId соседей, с которыми у локального устройства сейчас есть прямой mesh link без LOST heartbeat-статуса.
      */
     val directPeerIds: StateFlow<Set<PeerId>> = _directPeerIds.asStateFlow()
+
+    /**
+     * Текущее диагностическое состояние прямых mesh link-ов: статус, RTT и потери heartbeat.
+     */
+    val linkHealth: StateFlow<Map<NeighborLinkId, MeshLinkHealth>> = _linkHealth.asStateFlow()
+
+    /**
+     * Текущее состояние прямых mesh-соседей по PeerId: бинарный статус для UI и ping/loss для диагностики.
+     */
+    val peerConnectionStates: StateFlow<Map<PeerId, MeshPeerConnectionState>> = _peerConnectionStates.asStateFlow()
 
     init {
         externalScope.launch {
@@ -177,6 +201,7 @@ class MeshTransport(
         linkRoomIds.clear()
         seenVoiceFrameKeys.clear()
         clearLocalVoiceSession()
+        clearLinkHealth()
         publishDirectPeerIds()
         Log.i(TAG, "[disconnectAll] Все mesh link-и разорваны")
     }
@@ -196,6 +221,7 @@ class MeshTransport(
         clearLocalVoiceSession()
         roomSnapshots.clear()
         roomVoicePeerIndexes.clear()
+        clearLinkHealth()
         synchronized(advertisingLock) {
             advertisedEndpointName = null
         }
@@ -389,7 +415,7 @@ class MeshTransport(
     }
 
     /**
-     * Переводит события нижнего транспорта в mesh-события, не трогая payload-ы других протоколов.
+     * Переводит события нижнего транспорта в mesh-события и кормит heartbeat tracker Nearby lifecycle-статусами.
      */
     private fun handleNeighborEvent(event: NeighborTransportEvent) {
         when (event) {
@@ -428,9 +454,12 @@ class MeshTransport(
                 val candidateId = NeighborCandidateId(event.linkId.value)
                 pendingGatewayConnections.remove(candidateId)
                 activeLinks.add(event.linkId)
+                publishLinkHealth(linkHealthTracker.onLinkConnected(event.linkId, heartbeatNow()))
                 bindLinkPeer(event.linkId, pendingGatewayPeerIds.remove(candidateId), source = "pending_gateway")
                 Log.i(TAG, "[handleNeighborEvent] Mesh link готов linkId=${event.linkId.value} activeLinkCount=${activeLinks.size}")
+                startHeartbeatLoopIfNeeded()
                 sendPeerHello(event.linkId)
+                sendHeartbeatPing(event.linkId)
                 sendKnownSnapshots(event.linkId)
                 emitEvent(MeshTransportEvent.LinkConnected(event.linkId, reused = event.reused))
             }
@@ -439,9 +468,11 @@ class MeshTransport(
                 pendingGatewayConnections.remove(candidateId)
                 pendingGatewayPeerIds.remove(candidateId)
                 activeLinks.remove(event.linkId)
+                publishLinkHealth(linkHealthTracker.onLinkDisconnected(event.linkId, heartbeatNow()))
                 linkPeerIds.remove(event.linkId)
                 linkRoomIds.remove(event.linkId)
                 publishDirectPeerIds()
+                stopHeartbeatLoopIfIdle()
                 Log.i(TAG, "[handleNeighborEvent] Mesh link отключен linkId=${event.linkId.value} activeLinkCount=${activeLinks.size}")
                 emitEvent(MeshTransportEvent.LinkDisconnected(event.linkId))
             }
@@ -490,9 +521,13 @@ class MeshTransport(
     }
 
     /**
-     * Разделяет компактный бинарный голос и JSON control envelope, затем передает payload соответствующему обработчику.
+     * Разделяет heartbeat, компактный бинарный голос и JSON control envelope, затем передает payload соответствующему обработчику.
      */
     private fun handleMessageReceived(linkId: NeighborLinkId, bytes: ByteArray) {
+        if (heartbeatCodec.isHeartbeatPacket(bytes)) {
+            handleHeartbeatPacket(linkId, bytes)
+            return
+        }
         if (voicePacketCodec.isVoicePacket(bytes)) {
             handleVoicePacket(linkId, bytes)
             return
@@ -526,6 +561,112 @@ class MeshTransport(
             return
         }
         Log.i(TAG, "[handlePeerHelloEnvelope] Mesh hello принят linkId=${linkId.value} peerId=${peerId.value}")
+    }
+
+    /**
+     * Принимает четырехбайтовый heartbeat: на ping отвечает pong, по pong обновляет RTT и потери.
+     */
+    private fun handleHeartbeatPacket(linkId: NeighborLinkId, bytes: ByteArray) {
+        val packet = heartbeatCodec.decode(bytes)
+        when (packet.kind) {
+            MeshHeartbeatKind.PING -> {
+                publishLinkHealth(linkHealthTracker.onPingReceived(linkId, heartbeatNow()))
+                val response = heartbeatCodec.encode(MeshHeartbeatPacket(kind = MeshHeartbeatKind.PONG, sequence = packet.sequence))
+                neighborTransport.sendMessage(linkId, response, isRealtime = true) { cause ->
+                    Log.w(TAG, "[handleHeartbeatPacket] Не удалось отправить mesh heartbeat pong linkId=${linkId.value}: ${cause.message}", cause)
+                }
+            }
+            MeshHeartbeatKind.PONG -> {
+                linkHealthTracker.onPongReceived(linkId, packet.sequence, heartbeatNow())?.let(::publishLinkHealth)
+            }
+        }
+    }
+
+    /**
+     * Запускает общий heartbeat loop, если появился хотя бы один активный mesh link.
+     */
+    private fun startHeartbeatLoopIfNeeded() {
+        if (heartbeatJob?.isActive == true) {
+            return
+        }
+        heartbeatJob = externalScope.launch {
+            Log.i(TAG, "[startHeartbeatLoopIfNeeded] Mesh heartbeat loop запущен")
+            while (true) {
+                delay(HEARTBEAT_INTERVAL_MILLIS)
+                tickHeartbeat()
+            }
+        }
+    }
+
+    /**
+     * Останавливает heartbeat loop, когда активных mesh link-ов больше нет.
+     */
+    private fun stopHeartbeatLoopIfIdle() {
+        if (activeLinks.isNotEmpty()) {
+            return
+        }
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+        Log.i(TAG, "[stopHeartbeatLoopIfIdle] Mesh heartbeat loop остановлен")
+    }
+
+    /**
+     * Отправляет очередной heartbeat по всем активным link-ам и закрывает просроченные замеры.
+     */
+    private fun tickHeartbeat() {
+        val nowMillis = heartbeatNow()
+        linkHealthTracker.collectTimedOut(nowMillis).forEach(::publishLinkHealth)
+        activeLinks.toList().forEach(::sendHeartbeatPing)
+    }
+
+    /**
+     * Отправляет один четырехбайтовый ping в link и учитывает ошибку отправки как потерю.
+     */
+    private fun sendHeartbeatPing(linkId: NeighborLinkId) {
+        val packet = linkHealthTracker.preparePing(linkId, heartbeatNow()) ?: return
+        neighborTransport.sendMessage(linkId, heartbeatCodec.encode(packet), isRealtime = true) { cause ->
+            linkHealthTracker.onHeartbeatSendFailed(linkId, heartbeatNow())?.let(::publishLinkHealth)
+            Log.w(TAG, "[sendHeartbeatPing] Не удалось отправить mesh heartbeat ping linkId=${linkId.value}: ${cause.message}", cause)
+        }
+    }
+
+    /**
+     * Публикует новый health snapshot link-а в StateFlow, статус логирует по смене, а RTT/loss — редко.
+     */
+    private fun publishLinkHealth(health: MeshLinkHealth) {
+        _linkHealth.value = linkHealthTracker.snapshot().associateBy { linkHealth -> linkHealth.linkId }
+        publishDirectPeerIds()
+        val peerId = linkPeerIds[health.linkId]
+        val previousStatus = lastLoggedLinkStatuses.put(health.linkId, health.status)
+        if (previousStatus != health.status) {
+            emitEvent(MeshTransportEvent.LinkHealthChanged(health = health, peerId = peerId))
+            Log.i(
+                TAG,
+                "[publishLinkHealth] Mesh link health изменился linkId=${health.linkId.value} peerId=${peerId?.value} status=${health.status} rttMillis=${health.rttMillis} lossPercent=${health.lossPercent} missedInRow=${health.missedInRow}",
+            )
+        }
+        val nowMillis = heartbeatNow()
+        val lastMetricMillis = lastLoggedLinkMetricMillis[health.linkId] ?: 0L
+        if (health.rttMillis != null && (lastMetricMillis == 0L || nowMillis - lastMetricMillis >= HEARTBEAT_METRIC_LOG_INTERVAL_MILLIS)) {
+            lastLoggedLinkMetricMillis[health.linkId] = nowMillis
+            Log.i(
+                TAG,
+                "[publishLinkHealth] Mesh heartbeat метрика linkId=${health.linkId.value} peerId=${peerId?.value} status=${health.status} rttMillis=${health.rttMillis} lossPercent=${health.lossPercent} missedInRow=${health.missedInRow} sent=${health.sentCount} pong=${health.receivedPongCount}",
+            )
+        }
+    }
+
+    /**
+     * Полностью очищает health tracker и выключает heartbeat loop при сбросе mesh-сессии.
+     */
+    private fun clearLinkHealth() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+        linkHealthTracker.clear()
+        lastLoggedLinkStatuses.clear()
+        lastLoggedLinkMetricMillis.clear()
+        _linkHealth.value = emptyMap()
+        _peerConnectionStates.value = emptyMap()
     }
 
     /**
@@ -801,6 +942,7 @@ class MeshTransport(
             return
         }
         publishDirectPeerIds()
+        linkHealthTracker.healthFor(linkId)?.let(::publishLinkHealth)
         Log.i(TAG, "[bindLinkPeer] Mesh link привязан к peerId linkId=${linkId.value} peerId=${peerId.value} source=$source")
     }
 
@@ -822,10 +964,51 @@ class MeshTransport(
     }
 
     /**
-     * Публикует immutable-набор PeerId, с которыми сейчас есть прямой mesh link.
+     * Публикует PeerId и ping-состояния прямых mesh-соседей, исключая LOST из старого direct-набора.
      */
     private fun publishDirectPeerIds() {
-        _directPeerIds.value = linkPeerIds.values.toSet()
+        val states = linkPeerIds.mapNotNull { (linkId, peerId) ->
+            val health = linkHealthTracker.healthFor(linkId) ?: return@mapNotNull null
+            MeshPeerConnectionState(
+                peerId = peerId,
+                status = health.status,
+                rttMillis = health.rttMillis,
+                lossPercent = health.lossPercent,
+                missedInRow = health.missedInRow,
+            )
+        }
+            .groupBy { state -> state.peerId }
+            .mapValues { (_, peerStates) ->
+                peerStates.minWith(Comparator { left, right -> comparePeerConnectionState(left, right) })
+            }
+        _peerConnectionStates.value = states
+        _directPeerIds.value = states
+            .filterValues { state -> state.status != MeshLinkStatus.LOST }
+            .keys
+    }
+
+    /**
+     * Сравнивает несколько link-ов одного peer-а и выбирает самый полезный для UI ping/status.
+     */
+    private fun comparePeerConnectionState(left: MeshPeerConnectionState, right: MeshPeerConnectionState): Int {
+        val statusCompare = left.status.uiRank().compareTo(right.status.uiRank())
+        if (statusCompare != 0) {
+            return statusCompare
+        }
+        val leftRtt = left.rttMillis ?: Long.MAX_VALUE
+        val rightRtt = right.rttMillis ?: Long.MAX_VALUE
+        return leftRtt.compareTo(rightRtt)
+    }
+
+    /**
+     * Возвращает приоритет статуса для выбора лучшего link-а к одному peer-у.
+     */
+    private fun MeshLinkStatus.uiRank(): Int {
+        return when (this) {
+            MeshLinkStatus.CONNECTED -> 0
+            MeshLinkStatus.SUSPECT -> 1
+            MeshLinkStatus.LOST -> 2
+        }
     }
 
     /**
@@ -945,10 +1128,22 @@ class MeshTransport(
         return System.currentTimeMillis()
     }
 
+    /**
+     * Возвращает монотонное время для RTT и timeout-ов heartbeat, не зависящее от перевода часов.
+     */
+    private fun heartbeatNow(): Long {
+        return SystemClock.elapsedRealtime()
+    }
+
     private companion object {
         private const val TAG = "MeshTransport"
         private const val DEFAULT_TTL = 16
         private const val VOICE_TTL = 8
+        private const val HEARTBEAT_INTERVAL_MILLIS = 1_000L
+        private const val HEARTBEAT_TIMEOUT_MILLIS = 2_500L
+        private const val HEARTBEAT_LOST_MILLIS = 10_000L
+        private const val HEARTBEAT_LOSS_WINDOW_SIZE = 16
+        private const val HEARTBEAT_METRIC_LOG_INTERVAL_MILLIS = 10_000L
         private const val MAX_SEEN_VOICE_FRAME_KEYS = 4_096
         private const val EVENT_BUFFER_CAPACITY = 64
         private const val FIRST_VOICE_FRAME_SEQUENCE = 0L
@@ -973,6 +1168,14 @@ sealed class MeshTransportEvent {
      * Соседский mesh link отключился.
      */
     data class LinkDisconnected(val linkId: NeighborLinkId) : MeshTransportEvent()
+
+    /**
+     * Диагностический статус прямого mesh link-а изменился; актуальные RTT/loss лежат в health.
+     */
+    data class LinkHealthChanged(
+        val health: MeshLinkHealth,
+        val peerId: PeerId?,
+    ) : MeshTransportEvent()
 
     /**
      * Discovery нашел соседний gateway в mesh-комнату.

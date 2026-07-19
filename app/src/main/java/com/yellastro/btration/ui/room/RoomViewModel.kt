@@ -6,6 +6,7 @@ import com.yellastro.btration.R
 import com.yellastro.btration.domain.model.ChatMessage
 import com.yellastro.btration.domain.model.Peer
 import com.yellastro.btration.domain.model.PeerId
+import com.yellastro.btration.domain.mesh.MeshPeerConnectionState
 import com.yellastro.btration.domain.model.RoomTransportMode
 import com.yellastro.btration.domain.runtime.DirectAudioStatus
 import com.yellastro.btration.domain.runtime.RoomRuntimeState
@@ -23,8 +24,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /**
- * ViewModel комнаты: собирает runtime, общее repository-состояние микрофона, voice-настройки,
- * mesh-connect статусы, участников, чат и команды UI.
+ * ViewModel комнаты: собирает runtime, микрофон, voice-настройки, mesh-connect/ping статусы, участников, чат и команды UI.
  */
 class RoomViewModel(
     private val roomRepository: RoomRepository,
@@ -33,29 +33,41 @@ class RoomViewModel(
     private val inputText = MutableStateFlow("")
     private val participantColorByPeerId = mutableMapOf<PeerId, Int>()
 
+    private val meshConnectionInputs = combine(
+        roomRepository.directMeshPeerIds,
+        roomRepository.meshPeerConnectionStates,
+    ) { directMeshPeerIds: Set<PeerId>,
+        meshPeerConnectionStates: Map<PeerId, MeshPeerConnectionState> ->
+        MeshConnectionInputs(
+            directMeshPeerIds = directMeshPeerIds,
+            meshPeerConnectionStates = meshPeerConnectionStates,
+        )
+    }
+
     private val roomUiInputs = combine(
         roomRepository.runtimeState,
         roomRepository.messages,
         roomRepository.talkingPeerIds,
-        roomRepository.directMeshPeerIds,
+        meshConnectionInputs,
         inputText,
     ) { runtimeState: RoomRuntimeState,
         messages: List<ChatMessage>,
         talkingPeerIds: Set<PeerId>,
-        directMeshPeerIds: Set<PeerId>,
+        meshConnectionInputs: MeshConnectionInputs,
         input: String ->
         RoomUiInputs(
             runtimeState = runtimeState,
             messages = messages,
             talkingPeerIds = talkingPeerIds,
-            directMeshPeerIds = directMeshPeerIds,
+            directMeshPeerIds = meshConnectionInputs.directMeshPeerIds,
+            meshPeerConnectionStates = meshConnectionInputs.meshPeerConnectionStates,
             input = input,
         )
     }
 
     /**
      * UI-состояние комнаты, собранное из runtime, voice-настроек, сообщений,
-     * локальной передачи/закрепления, talking/direct-connect состояний и ввода.
+     * локальной передачи/закрепления, talking/direct-connect/ping состояний и ввода.
      */
     val uiState: StateFlow<RoomUiState> = combine(
         roomUiInputs,
@@ -71,6 +83,7 @@ class RoomViewModel(
             messages = inputs.messages,
             talkingPeerIds = inputs.talkingPeerIds,
             directMeshPeerIds = inputs.directMeshPeerIds,
+            meshPeerConnectionStates = inputs.meshPeerConnectionStates,
             input = inputs.input,
             talking = talking,
             isMicrophoneLocked = isMicrophoneLocked,
@@ -84,6 +97,7 @@ class RoomViewModel(
             messages = roomRepository.messages.value,
             talkingPeerIds = roomRepository.talkingPeerIds.value,
             directMeshPeerIds = roomRepository.directMeshPeerIds.value,
+            meshPeerConnectionStates = roomRepository.meshPeerConnectionStates.value,
             input = inputText.value,
             talking = roomRepository.isTalking.value,
             isMicrophoneLocked = roomRepository.isMicrophoneLocked.value,
@@ -168,14 +182,14 @@ class RoomViewModel(
     }
 
     /**
-     * Преобразует runtime и общее состояние микрофона в UI-состояние
-     * с явным типом комнаты и статусом прямого аудиоканала.
+     * Преобразует runtime, микрофон и mesh ping/connect потоки в UI-состояние комнаты.
      */
     private fun mapUiState(
         runtimeState: RoomRuntimeState,
         messages: List<ChatMessage>,
         talkingPeerIds: Set<PeerId>,
         directMeshPeerIds: Set<PeerId>,
+        meshPeerConnectionStates: Map<PeerId, MeshPeerConnectionState>,
         input: String,
         talking: Boolean,
         isMicrophoneLocked: Boolean,
@@ -207,7 +221,7 @@ class RoomViewModel(
                     roomName = runtimeState.room.name,
                     isHost = true,
                     isMeshRoom = isMeshRoom,
-                    members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, directMeshPeerIds, participantColors, talking, isMeshRoom) },
+                    members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, directMeshPeerIds, meshPeerConnectionStates, participantColors, talking, isMeshRoom) },
                     messages = messages.map { mapMessage(it, selfPeerId, participantColors.values.toSet()) },
                     inputText = input,
                     canSend = canSend,
@@ -231,7 +245,7 @@ class RoomViewModel(
                     roomName = runtimeState.room.name,
                     isHost = false,
                     isMeshRoom = isMeshRoom,
-                    members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, directMeshPeerIds, participantColors, talking, isMeshRoom) },
+                    members = runtimeState.members.map { mapMember(it, selfPeerId, talkingPeerIds, directMeshPeerIds, meshPeerConnectionStates, participantColors, talking, isMeshRoom) },
                     messages = messages.map { mapMessage(it, selfPeerId, participantColors.values.toSet()) },
                     inputText = input,
                     canSend = canSend,
@@ -341,13 +355,14 @@ class RoomViewModel(
     }
 
     /**
-     * Преобразует участника в UI-модель с локальной ролью, цветом, mesh-connect и voice stream состояниями.
+     * Преобразует участника в UI-модель с локальной ролью, цветом, mesh-connect, ping и voice stream состояниями.
      */
     private fun mapMember(
         peer: Peer,
         selfPeerId: PeerId,
         talkingPeerIds: Set<PeerId>,
         directMeshPeerIds: Set<PeerId>,
+        meshPeerConnectionStates: Map<PeerId, MeshPeerConnectionState>,
         participantColors: Map<PeerId, Int>,
         selfTalking: Boolean,
         isMeshRoom: Boolean,
@@ -359,8 +374,24 @@ class RoomViewModel(
             participantColorResId = participantColors[peer.peerId],
             isConnectIndicatorVisible = isMeshRoom,
             isDirectlyConnected = peer.peerId in directMeshPeerIds || (peer.peerId == selfPeerId && directMeshPeerIds.isNotEmpty()),
+            meshPingText = meshPingTextFor(peer.peerId, selfPeerId, meshPeerConnectionStates),
             isTalking = peer.peerId in talkingPeerIds || (peer.peerId == selfPeerId && selfTalking),
         )
+    }
+
+    /**
+     * Возвращает короткий ping-текст для mesh-карточки участника; self ping не показывается.
+     */
+    private fun meshPingTextFor(
+        peerId: PeerId,
+        selfPeerId: PeerId,
+        meshPeerConnectionStates: Map<PeerId, MeshPeerConnectionState>,
+    ): String {
+        if (peerId == selfPeerId) {
+            return ""
+        }
+        val rttMillis = meshPeerConnectionStates[peerId]?.rttMillis ?: return ""
+        return rttMillis.coerceAtMost(MAX_VISIBLE_PING_MILLIS).toString()
     }
 
     /**
@@ -442,11 +473,20 @@ class RoomViewModel(
     /**
      * Промежуточный снимок runtime/UI-входов, чтобы не зависеть от перегрузок combine на много потоков.
      */
+    private data class MeshConnectionInputs(
+        val directMeshPeerIds: Set<PeerId>,
+        val meshPeerConnectionStates: Map<PeerId, MeshPeerConnectionState>,
+    )
+
+    /**
+     * Промежуточный снимок runtime/UI-входов с уже объединенными mesh connect и ping состояниями.
+     */
     private data class RoomUiInputs(
         val runtimeState: RoomRuntimeState,
         val messages: List<ChatMessage>,
         val talkingPeerIds: Set<PeerId>,
         val directMeshPeerIds: Set<PeerId>,
+        val meshPeerConnectionStates: Map<PeerId, MeshPeerConnectionState>,
         val input: String,
     )
 
@@ -455,6 +495,7 @@ class RoomViewModel(
         private const val TIME_PATTERN = "HH:mm"
         private const val DIRECT_AUDIO_UNAVAILABLE_MESSAGE = "Прямой аудиоканал не установлен"
         private const val MESH_VOICE_TRANSPORT_NAME = "MESH"
+        private const val MAX_VISIBLE_PING_MILLIS = 9_999L
         private val PARTICIPANT_COLOR_RES_IDS = listOf(
             R.color.participant_color_03,
             R.color.participant_color_04,

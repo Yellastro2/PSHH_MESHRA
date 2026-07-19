@@ -43,7 +43,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Wi-Fi Direct voice transport с Network-bound UDP-сокетом, HELLO/ACK, резервным UDP-punch через Nearby и Opus frames.
+ * Wi-Fi Direct voice transport с host group readiness, Network-bound UDP-сокетом, HELLO/ACK,
+ * резервным UDP-punch через Nearby и Opus frames.
  */
 class WifiDirectVoiceTransport(
     context: Context,
@@ -591,7 +592,7 @@ class WifiDirectVoiceTransport(
     }
 
     /**
-     * Запрашивает создание Wi-Fi Direct group после cleanup.
+     * Запрашивает создание host group и сообщает runtime, когда клиентам уже можно запускать DNS-SD/connect.
      */
     @SuppressLint("MissingPermission")
     private fun createGroupAfterCleanup() {
@@ -602,7 +603,8 @@ class WifiDirectVoiceTransport(
                  * Фиксирует создание group; готовность direct-аудио подтвердит только UDP HELLO от peer.
                  */
                 override fun onSuccess() {
-                    Log.i(TAG, "[createGroupAfterCleanup] Wi-Fi Direct group создана, ожидаем UDP handshake")
+                    Log.i(TAG, "[createGroupAfterCleanup] Wi-Fi Direct group создана, клиентам можно запускать DNS-SD handshake")
+                    emitEvent(VoiceTransportEvent.DirectAudioReady)
                 }
 
                 /**

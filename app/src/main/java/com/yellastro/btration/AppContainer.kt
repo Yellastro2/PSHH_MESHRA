@@ -11,6 +11,7 @@ import com.yellastro.btration.data.nearby.NearbyRoomAdvertisement
 import com.yellastro.btration.data.nearby.NearbyTransport
 import com.yellastro.btration.data.wire.WireCodec
 import com.yellastro.btration.domain.mesh.MeshCodec
+import com.yellastro.btration.domain.mesh.MeshHeartbeatCodec
 import com.yellastro.btration.domain.mesh.MeshRoomAdvertisement
 import com.yellastro.btration.domain.mesh.MeshTransport
 import com.yellastro.btration.domain.mesh.MeshVoicePacketCodec
@@ -42,7 +43,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.serialization.json.Json
 
 /**
- * Ручной composition root приложения: собирает prefs, динамический Star/Cluster Nearby transport, voice-кодеки, runtime и repository.
+ * Ручной composition root приложения: собирает prefs, Nearby transport, room/mesh/voice кодеки, runtime и repository.
  */
 class AppContainer(context: Context) {
     private val applicationContext = context.applicationContext
@@ -53,6 +54,7 @@ class AppContainer(context: Context) {
     }
     private val wireCodec = WireCodec(json)
     private val meshCodec = MeshCodec(json)
+    private val meshHeartbeatCodec = MeshHeartbeatCodec()
     private val meshVoicePacketCodec = MeshVoicePacketCodec()
     private val idGenerator = IdGenerator()
     private val prefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -76,6 +78,7 @@ class AppContainer(context: Context) {
         shouldIgnoreMessage = { bytes ->
             VoiceFrameCodec.isVoiceFrame(bytes) ||
                 meshCodec.isMeshEnvelope(bytes) ||
+                meshHeartbeatCodec.isHeartbeatPacket(bytes) ||
                 meshVoicePacketCodec.isVoicePacket(bytes)
         },
         shouldAcceptConnection = ::shouldAcceptNeighborConnection,

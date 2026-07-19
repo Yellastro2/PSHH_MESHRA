@@ -28,17 +28,19 @@
 ```text
 RoomTransport.events + MeshTransport.events + VoiceTransport.events
   -> RoomRuntime
-  -> state / availableRooms / messages / talkingPeerIds / directMeshPeerIds
+  -> state / availableRooms / messages / talkingPeerIds / directMeshPeerIds / meshPeerConnectionStates
 ```
 
 `RoomRuntime` получает `CoroutineScope` снаружи, например из application-level контейнера, и в `init` подписывается на события room signaling из `RoomTransport.events` и media-события `VoiceTransport.events`.
 
 `RoomTransport` держит Nearby Star room-level протокол поверх `NeighborTransport`: декодирует/кодирует `WirePacket`, разбирает короткую визитку комнаты, ведет связь `PeerId <-> linkId` и прячет детали конкретного нижнего транспорта от `RoomRuntime`.
+Так как `RoomTransport` и `MeshTransport` слушают один общий `NeighborTransport`, `AppContainer.shouldIgnoreMessage` обязан отфильтровывать не-room payload-ы до JSON decode: `BTVO`, `BTME1`, MESHRA voice `MV` и MESHRA heartbeat `H`.
 
-Нижний `NearbyTransport` динамически выбирает физическую topology: общее лобби попеременно сканирует `P2P_STAR` и `P2P_CLUSTER`; Star-комната с `NEARBY_BYTES` использует Star, а MESHRA и Star-комната с отдельным `WIFI_DIRECT_UDP` — Cluster. Последний вариант не дает Nearby `P2P_STAR` занять Wi-Fi P2P stack перед raw Wi-Fi Direct DNS-SD/group handshake. При выборе карточки полные `RoomTransportMode + VoiceTransportMode`, уже полученные из рекламы, определяют connect topology; если карточка была найдена в прошлой фазе, transport сначала повторно обнаруживает endpoint в требуемой topology.
+Нижний `NearbyTransport` динамически выбирает физическую topology: общее лобби попеременно сканирует `P2P_STAR` и `P2P_CLUSTER`, реклама/подключение `NEARBY_STAR` фиксируется на Star, а MESHRA gateway/healing — на Cluster. При выборе карточки `RoomTransportMode`, уже полученный из рекламы, передается в connect; если карточка была найдена в прошлой фазе, transport сначала повторно обнаруживает endpoint в требуемой topology.
 
-`MeshTransport` держит MESHRA room-level протокол поверх того же `NeighborTransport`: принимает gateway-рекламу, JSON snapshot-ы/durable room events и отдельные компактные бинарные voice frames, дедупит их и flood-ит соседям.
+`MeshTransport` держит MESHRA room-level протокол поверх того же `NeighborTransport`: принимает gateway-рекламу, JSON snapshot-ы/durable room events, отдельные компактные бинарные voice frames и четырехбайтовые heartbeat `PING/PONG`, дедупит voice/events и flood-ит соседям.
 Для live-UI он также держит `directPeerIds` — набор `PeerId`, с которыми есть прямой mesh link. Эта информация строится из gateway-рекламы и служебного `PEER_HELLO`, а не из `endpointId` в UI.
+Для диагностики он дополнительно публикует `linkHealth: StateFlow<Map<NeighborLinkId, MeshLinkHealth>>`: Nearby lifecycle дает факт `LinkConnected/LinkDisconnected`, а app-level heartbeat считает `rttMillis`, `lossPercent`, `missedInRow` и статус `CONNECTED/SUSPECT/LOST`. После привязки link-а к `PeerId` это сворачивается в `meshPeerConnectionStates`; старый `directMeshPeerIds` теперь исключает `LOST`, поэтому UI connect-dot гаснет и при Nearby disconnect, и при heartbeat LOST.
 
 ## StateFlow
 
@@ -46,7 +48,8 @@ RoomTransport.events + MeshTransport.events + VoiceTransport.events
 - `availableRooms: StateFlow<List<RoomInfo>>` — комнаты из discovery.
 - `messages: StateFlow<List<ChatMessage>>` — чат текущей комнаты.
 - `talkingPeerIds: StateFlow<Set<PeerId>>` — участники, чьи voice frames сейчас передаются или локально доигрываются.
-- `directMeshPeerIds: StateFlow<Set<PeerId>>` — участники, с которыми есть прямой mesh link; ViewModel использует это для connect-dot на карточке участника.
+- `directMeshPeerIds: StateFlow<Set<PeerId>>` — участники, с которыми есть прямой mesh link без `LOST` heartbeat-статуса; ViewModel использует это для connect-dot на карточке участника.
+- `meshPeerConnectionStates: StateFlow<Map<PeerId, MeshPeerConnectionState>>` — ping/status прямых mesh-соседей; ViewModel выводит `rttMillis` в `item_user_ping`, но не показывает промежуточные `SUSPECT`-состояния отдельным UI-цветом.
 
 ## Host MVP
 
@@ -118,6 +121,7 @@ Client:
 - При `VoiceTransportEvent.FrameReceived` runtime добавляет `originPeerId` отправителя в `talkingPeerIds`, передает Opus frame в `VoiceRuntime.playIncomingFrame(...)` и снимает индикатор через callback после final-frame/EOF.
 - Для UDP media-plane есть fallback: каждый non-final voice frame продлевает таймер говорящего, а если final-frame потерялся, runtime гасит индикатор и закрывает входящую frame-сессию по таймауту тишины.
 - Для MESHRA media-plane `VoiceRuntime` кодирует Opus frames через callback, а `RoomRuntime` публикует их в `MeshTransport.publishVoiceFrame(...)`. `MeshTransport` упаковывает их в бинарный заголовок `MV` размером 9 байт; входящие `MeshTransportEvent.VoiceFrameReceived` проигрываются через `VoiceRuntime` без старого host relay, потому что relay уже сделан mesh flooding-ом.
+- MESHRA link health измеряется отдельными heartbeat-пакетами размером 4 байта: `magic=0x48`, `kind/flags`, `sequence UInt16`. `PING` отправляется примерно раз в секунду по каждому активному прямому link-у, `PONG` возвращает тот же sequence, а RTT считается локально по таблице отправленных sequence. После 10 секунд без живого heartbeat link получает `LOST`; peer пропадает из `directMeshPeerIds`, но принудительный disconnect/reconnect пока не запускается: healing по-прежнему стартует от настоящего Nearby `LinkDisconnected`.
 - `resetSession()`, `setError()`, disconnect и `MEMBER_LEFT` очищают соответствующие talking-состояния.
 
 ## PacketId / TTL
@@ -134,4 +138,5 @@ Client:
 
 - В MESHRA есть flooding/relay для text events и ephemeral voice frames; отдельной политики маршрутизации и приоритетов пока нет.
 - MESHRA сейчас покрывает вступление, выход/разрыв, текстовый чат и Opus voice frames через ephemeral mesh payload.
+- MESHRA уже измеряет здоровье прямых link-ов через Nearby lifecycle и собственные heartbeat; `LOST` гасит UI connect-dot через `directMeshPeerIds`, но пока не используется для принудительного reconnect или запрета отправки live voice.
 - Nearby Star voice использует `VoiceTransport`; MESHRA voice идет через `MeshTransport` как ephemeral payload. Дефолтный режим в настройках — `WIFI_DIRECT_UDP`, при этом реальный delegate создается только после применения режима конкретной комнаты.

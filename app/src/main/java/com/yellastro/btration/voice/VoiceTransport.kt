@@ -74,8 +74,8 @@ sealed class VoiceTransportEvent {
     ) : VoiceTransportEvent()
 
     /**
-     * Локальный media-plane готов принимать direct-аудио для текущей роли.
-     */
+        * Host infrastructure готова к client discovery либо client подтвердил прямой media endpoint.
+        */
     object DirectAudioReady : VoiceTransportEvent()
 
     /**

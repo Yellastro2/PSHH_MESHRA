@@ -32,7 +32,7 @@ data class RoomUiState(
 )
 
 /**
- * UI-модель участника комнаты с participant-цветом, voice-активностью и прямым mesh-connect статусом.
+ * UI-модель участника комнаты с participant-цветом, voice-активностью, mesh-connect статусом и ping-текстом.
  */
 data class MemberUi(
     val peerId: PeerId,
@@ -41,6 +41,7 @@ data class MemberUi(
     @ColorRes val participantColorResId: Int? = null,
     val isConnectIndicatorVisible: Boolean = false,
     val isDirectlyConnected: Boolean = false,
+    val meshPingText: String = "",
     val isTalking: Boolean = false,
 )
 

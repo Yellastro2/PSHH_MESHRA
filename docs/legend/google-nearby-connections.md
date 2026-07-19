@@ -4,13 +4,12 @@
 
 - Android API: Google Play services Nearby Connections.
 - Зависимость MVP: `com.google.android.gms:play-services-nearby:19.3.0`.
-- Физическая strategy выбирается по сочетанию room/voice transport: `NEARBY_STAR + NEARBY_BYTES -> Strategy.P2P_STAR`; `MESHRA` и `NEARBY_STAR + WIFI_DIRECT_UDP -> Strategy.P2P_CLUSTER`.
+- Физическая strategy выбирается по типу комнаты: `NEARBY_STAR -> Strategy.P2P_STAR`, `MESHRA -> Strategy.P2P_CLUSTER`.
 - `serviceId` должен быть стабильной строкой приложения. Сейчас публичный фасад `NearbyTransport` передаёт в `NearbyConnectionLayer`: `com.yellastro.btration.nearby.ROOM_V1`.
 - Для MESHRA нижняя Nearby-стратегия должна позволять устройству быть одновременно участником уже установленного link-а и gateway для нового peer-а. В тесте 2026-07-13 `P2P_STAR` давал `STATUS_ENDPOINT_IO_ERROR` при входе C через gateway B, когда B уже состоял в комнате A, поэтому MESHRA advertising/connect/healing используют `P2P_CLUSTER`.
-- Для Star-комнаты с `NearbyVoiceTransport` advertising и connect используют физический `P2P_STAR`, а `BTVO` идет по уже установленному room-link-у.
-- Для Star-комнаты с отдельным raw Wi-Fi Direct voice signaling остается на `P2P_CLUSTER`. В тесте 2026-07-19 после перевода такого signaling на `P2P_STAR` текст/JOIN работали, но `WifiP2pManager.discoverServices()` не получил ни одного DNS-SD callback, connect/group/UDP handshake не начинались, а Google Nearby логировал ошибки своего `WIFI_HOTSPOT`. Рабочий вывод проекта: не совмещать активный Nearby `P2P_STAR` link и отдельную raw Wi-Fi Direct group на тех же устройствах; вероятная причина — конкуренция двух владельцев за системный Wi-Fi P2P stack.
+- Для обычной Star-комнаты advertising и connect используют физический `P2P_STAR`. Это подтверждено рабочим Direct voice commit `25683d76446f9189b0957475f42851221aed0713`, где `NearbyTransport` имел default `Strategy.P2P_STAR` одновременно с `WifiDirectVoiceTransport`.
 - Одновременный discovery с двумя Strategy не используется. Общее лобби запускает четырехсекундные фазы `P2P_STAR -> P2P_CLUSTER -> ...` с коротким cooldown между ними. Искусственные `EndpointLost` при смене фаз подавляются; список комнат сверяется общим десятисекундным discovery-циклом runtime.
-- Найденный endpoint запоминается вместе с topology текущей фазы. При выборе комнаты сочетание `RoomTransportMode + VoiceTransportMode` из рекламы определяет требуемую topology: при совпадении connect идет сразу, при несовпадении transport фиксирует нужную фазу, повторно обнаруживает тот же endpoint и только затем вызывает `requestConnection`. Ожидание ограничено timeout-ом 12 секунд.
+- Найденный endpoint запоминается вместе с topology текущей фазы. При выборе комнаты `RoomTransportMode` из рекламы определяет требуемую topology: при совпадении connect идет сразу, при несовпадении transport фиксирует нужную фазу, повторно обнаруживает тот же endpoint и только затем вызывает `requestConnection`. Ожидание ограничено timeout-ом 12 секунд.
 
 ## Практический контракт проекта
 
@@ -29,6 +28,7 @@
 - `NearbyVoiceTransport` сидит рядом с `RoomTransport` поверх того же `NeighborTransport`: он читает только BYTES с сигнатурой `BTVO`, а все room/control сообщения игнорирует.
 - Ошибка отправки BYTES/STREAM возвращается callback-ом конкретному вызывающему слою, а не широковещательным event-ом: иначе voice send failure мог бы случайно превратиться в room packet failure.
 - Частые voice BYTES отправляются через `NeighborTransport.sendMessage(..., isRealtime=true)`: `NearbyPayloadTransport` не пишет `Log.i` на каждый успешный frame, а агрегирует успешные realtime-отправки примерно раз в секунду. Ошибки отправки realtime payload-а логируются сразу.
+- Nearby lifecycle callbacks считаются только нижним статусом физического endpoint-а. Для MESHRA этого мало: endpoint может числиться connected, пока Google Play services держит внутреннюю очередь payload-ов. Поэтому `MeshTransport` отдельно шлет четырехбайтовые heartbeat `PING/PONG` поверх BYTES и считает RTT/потери на app-level.
 - `endpointId -> PeerId` описывает только прямого физического Nearby-соседа. Автор `CHAT_MESSAGE` или другого relayed-пакета не должен перезаписывать эту связь.
 - `RoomTransport` автоматически принимает Nearby connection, а бизнес-решение входа в комнату остаётся выше, в `RoomRuntime`, через `JOIN_ACCEPTED` / `JOIN_REJECTED`.
 - Для будущего mesh/relay в `WirePacket` уже есть поля `packetId` и `ttl`, но Nearby-слой пока не делает dedup и relay.
