@@ -66,11 +66,16 @@ class RoomConnectionService : Service() {
     }
 
     /**
-     * Обрабатывает команды запуска/остановки, отключения runtime и микрофона,
-     * после чего запускает наблюдение за общим состоянием repository.
+     * Обрабатывает команды запуска/остановки, отключения runtime и микрофона без sticky-восстановления пустой runtime-сессии.
      */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(TAG, "[onStartCommand] Получена команда action=${intent?.action} startId=$startId")
+        if (intent == null) {
+            Log.w(TAG, "[onStartCommand] Service перезапущен системой без команды, останавливаемся чтобы не держать пустую комнату")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         if (intent?.action == ACTION_DISCONNECT) {
             Log.i(TAG, "[onStartCommand] Отключаем runtime по ACTION_DISCONNECT")
             handleDisconnectAction()
@@ -90,7 +95,7 @@ class RoomConnectionService : Service() {
 
         startStateCollection()
         startMessageNotificationCollection()
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     /**

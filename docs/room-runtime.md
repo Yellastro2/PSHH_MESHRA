@@ -108,9 +108,9 @@ Client:
 - `STATUS_ENDPOINT_UNKNOWN` считается recoverable stale endpoint: runtime удаляет комнату из `availableRooms`, запускает clean discovery и при повторном `EndpointFound` автоматически повторяет connection.
 - Для MESHRA такой же recovery идет через `MeshTransport.GatewayFound`: runtime повторяет connection только к тому же временному `RoomId` выбранного gateway, чтобы ignore одного gateway/host-а не превратился в автоматическое подключение через него.
 - Для активной MESHRA-комнаты `stopSearch()` не выключает mesh discovery вслепую: runtime держит healing discovery только пока пригодные active/pending link-и меньше `min(участники - 1, 3)` и не выше `64`. Если связность уже достаточна, например 2 участника и 1 active link без `LOST`, discovery останавливается.
-- Ошибка discovery во время активной MESHRA-комнаты считается ошибкой healing-а и не переводит комнату в `Error`; активные link-и и уже полученный snapshot должны жить дальше.
+- Ошибка discovery во время активной MESHRA-комнаты считается ошибкой healing-а и не переводит комнату в `Error`; активные link-и и уже полученный snapshot должны жить дальше. После такой ошибки runtime планирует повторный запуск healing discovery через 15 секунд, а `NearbyTransport` сбрасывает zombie discovery-фазу, чтобы следующий `startDiscovery(CLUSTER_ONLY)` реально дошел до Google Nearby.
 - Если client внезапно теряет host-а не через `ROOM_CLOSED`, runtime не сбрасывает комнату в `Idle`, а переходит в `Joining` по сохраненной advertised-комнате и пробует переподключиться.
-- Если нижний Nearby API сразу после runtime-permission grant возвращает transient `MISSING_PERMISSION` при discovery/advertising, `NearbyTransport` тихо делает короткий retry и через `RoomTransport` отдает ошибку в `RoomRuntime` только после исчерпания попыток.
+- Если нижний Nearby API сразу после runtime-permission grant возвращает transient `MISSING_PERMISSION` при discovery/advertising, `NearbyTransport` тихо делает короткий retry и через `RoomTransport` отдает ошибку в `RoomRuntime` только после исчерпания попыток. Для активной MESHRA-комнаты такая ошибка превращается в delayed healing retry, а для обычного поиска/входа остается пользовательской ошибкой.
 
 ## PTT-индикация
 

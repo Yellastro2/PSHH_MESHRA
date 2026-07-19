@@ -70,6 +70,7 @@ class RoomRuntime(
     private var roomIdsSeenInDiscoveryCycle: MutableSet<RoomId>? = null
     private val discoveryCycleMutex = Mutex()
     private var connectionRecoveryJob: Job? = null
+    private var meshHealingDiscoveryRetryJob: Job? = null
     private var recoveringRoomId: RoomId? = null
     private var recoveryReconnectRequested = false
     private var connectionRecoveryAttemptCount = 0
@@ -622,6 +623,7 @@ class RoomRuntime(
             is RoomTransportEvent.DiscoveryFailed -> {
                 if (isActiveMeshState(_state.value)) {
                     Log.w(TAG, "[handleRoomTransportEvent] Ошибка healing discovery в активной MESHRA-комнате не роняет комнату: ${event.cause.message}", event.cause)
+                    scheduleMeshHealingDiscoveryRetry(event.cause)
                     return
                 }
                 val message = nearbyFailureMessage("начать поиск комнат", event.cause)
@@ -1270,16 +1272,55 @@ class RoomRuntime(
         val activeMeshState = activeMeshStateInfo()
         if (activeMeshState == null || !isSameMeshDiscoveryRoom(activeMeshState.room, roomId)) {
             Log.i(TAG, "[startMeshHealingDiscovery] Mesh discovery не запущен: активной MESHRA-комнаты нет roomId=${roomId.value} reason=$reason")
+            cancelMeshHealingDiscoveryRetry()
             meshTransport.stopDiscovery()
             return
         }
         if (!needsMeshHealingLinks(activeMeshState, reason = reason)) {
+            cancelMeshHealingDiscoveryRetry()
             meshTransport.stopDiscovery()
             Log.i(TAG, "[startMeshHealingDiscovery] Mesh discovery остановлен: связность уже достаточна roomId=${roomId.value} reason=$reason")
             return
         }
+        cancelMeshHealingDiscoveryRetry()
         meshTransport.startDiscovery()
         Log.i(TAG, "[startMeshHealingDiscovery] Mesh discovery оставлен активным для healing roomId=${roomId.value} reason=$reason")
+    }
+
+    /**
+     * Планирует повторный запуск MESHRA healing discovery после ошибки нижнего Nearby discovery.
+     */
+    private fun scheduleMeshHealingDiscoveryRetry(cause: Throwable) {
+        val roomId = activeMeshRoomId()
+        if (roomId == null) {
+            Log.i(TAG, "[scheduleMeshHealingDiscoveryRetry] Retry healing discovery не нужен: активной MESHRA-комнаты нет cause=${cause.message}")
+            cancelMeshHealingDiscoveryRetry()
+            return
+        }
+        if (meshHealingDiscoveryRetryJob?.isActive == true) {
+            Log.i(TAG, "[scheduleMeshHealingDiscoveryRetry] Retry healing discovery уже запланирован roomId=${roomId.value} cause=${cause.message}")
+            return
+        }
+        meshHealingDiscoveryRetryJob = externalScope.launch {
+            Log.i(TAG, "[scheduleMeshHealingDiscoveryRetry] Ждем перед повторным healing discovery roomId=${roomId.value} delayMs=$MESH_HEALING_DISCOVERY_RETRY_MILLIS cause=${cause.message}")
+            delay(MESH_HEALING_DISCOVERY_RETRY_MILLIS)
+            meshHealingDiscoveryRetryJob = null
+            val activeRoomId = activeMeshRoomId()
+            if (activeRoomId == null || activeRoomId != roomId) {
+                Log.i(TAG, "[scheduleMeshHealingDiscoveryRetry] Retry healing discovery отменен: активная MESHRA-комната изменилась oldRoomId=${roomId.value} activeRoomId=${activeRoomId?.value}")
+                return@launch
+            }
+            startMeshHealingDiscovery(roomId, reason = "discovery_failed_retry")
+            connectToKnownMeshGatewaysForHealing(roomId)
+        }
+    }
+
+    /**
+     * Отменяет отложенный retry MESHRA healing discovery.
+     */
+    private fun cancelMeshHealingDiscoveryRetry() {
+        meshHealingDiscoveryRetryJob?.cancel()
+        meshHealingDiscoveryRetryJob = null
     }
 
     /**
@@ -2163,6 +2204,7 @@ class RoomRuntime(
     private fun resetSession() {
         Log.i(TAG, "[resetSession] Сбрасываем текущую сессию currentState=${_state.value.javaClass.simpleName}")
         clearConnectionRecovery()
+        cancelMeshHealingDiscoveryRetry()
         _state.value = RoomRuntimeState.Idle
         voiceRuntime.stopAll()
         voiceTransport.stopSession()
@@ -2188,6 +2230,7 @@ class RoomRuntime(
     private fun setError(message: String, action: RoomRuntimeErrorAction? = null) {
         Log.w(TAG, "[setError] Runtime перешел в Error message=$message action=$action")
         clearConnectionRecovery()
+        cancelMeshHealingDiscoveryRetry()
         _state.value = RoomRuntimeState.Error(
             message = message.ifBlank { "Неизвестная ошибка" },
             action = action,
@@ -2283,6 +2326,7 @@ class RoomRuntime(
         private const val CLIENT_RECONNECT_DISCOVERY_TIMEOUT_MILLIS = 20_000L
         private const val NOTICE_BUFFER_CAPACITY = 8
         private const val TALKING_PEER_TIMEOUT_MILLIS = 1_500L
+        private const val MESH_HEALING_DISCOVERY_RETRY_MILLIS = 15_000L
         private const val MESH_MIN_LINKS = 3
         private const val MESH_MAX_LINKS = 64
         private const val DIRECT_AUDIO_UNAVAILABLE_MESSAGE = "Прямой аудиоканал не установлен"

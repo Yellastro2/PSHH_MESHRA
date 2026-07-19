@@ -425,7 +425,7 @@ class NearbyTransport(
             }
             is NearbyConnectionLayerEvent.EndpointFound -> handleEndpointFound(event)
             is NearbyConnectionLayerEvent.EndpointLost -> handleEndpointLost(event)
-            is NearbyConnectionLayerEvent.DiscoveryFailed -> emitEvent(NeighborTransportEvent.DiscoveryFailed(event.cause))
+            is NearbyConnectionLayerEvent.DiscoveryFailed -> handleDiscoveryFailed(event)
             is NearbyConnectionLayerEvent.AdvertisingFailed -> emitEvent(NeighborTransportEvent.AdvertisingFailed(event.cause))
             is NearbyConnectionLayerEvent.ConnectionReused -> {
                 connectedCandidateIds.add(event.endpointId)
@@ -498,6 +498,19 @@ class NearbyTransport(
         }
         candidateTopologies.remove(event.endpointId)
         emitEvent(NeighborTransportEvent.CandidateLost(NeighborCandidateId(event.endpointId)))
+    }
+
+    /**
+     * Сбрасывает локальную discovery-фазу после ошибки Google Nearby, чтобы следующий startDiscovery не считал ее живой.
+     */
+    private fun handleDiscoveryFailed(event: NearbyConnectionLayerEvent.DiscoveryFailed) {
+        synchronized(discoveryLock) {
+            cancelDiscoveryRunnablesLocked()
+            activeDiscoveryCandidateIds.clear()
+            activeDiscoveryTopology = null
+        }
+        Log.w(TAG, "[handleDiscoveryFailed] Discovery-фаза помечена неактивной после ошибки Nearby: ${event.cause.message}", event.cause)
+        emitEvent(NeighborTransportEvent.DiscoveryFailed(event.cause))
     }
 
     /**
