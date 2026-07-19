@@ -69,6 +69,7 @@ Wi-Fi Direct transport занимается только голосом:
 ## Ограничения
 
 - Wi-Fi Direct поведение сильно зависит от прошивки и Google/Android Wi-Fi stack.
+- Star-комната с `WIFI_DIRECT_UDP` публикует и подключает Nearby signaling через физический `P2P_CLUSTER`, хотя room-level схема остается Star. В тесте 2026-07-19 активный Nearby `P2P_STAR` link блокировал отдельный raw Wi-Fi Direct путь на стадии DNS-SD: `discoverServices()` принимался, но callbacks и последующий `connect()` не приходили.
 - Host при `createRoom()` читает тип комнаты и voice-настройку из prefs, кладет выбранные `roomTransportMode` и `voiceTransportMode` в `RoomInfo` и запускает комнату с этим media-plane. Client после `JOIN_ACCEPTED` смотрит `RoomInfo.roomTransportMode` для выбора room transport комнаты, а затем `RoomInfo.voiceTransportMode` host-а и перед `startSession()` переключает свой локальный voice transport на тот же режим.
 - Если устройство не заявляет `PackageManager.FEATURE_WIFI_DIRECT` или не отдает `WifiP2pManager`, `AppContainer` включает `UnavailableVoiceTransport`, а UI показывает snackbar `Wi-Fi Direct не поддерживается на этом устройстве`.
 - Если client не видит DNS-SD service host-а, он не получит `srcDevice.deviceAddress` и не сможет подключиться.

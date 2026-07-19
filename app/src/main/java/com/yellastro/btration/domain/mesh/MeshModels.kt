@@ -63,40 +63,20 @@ data class MeshRoomSnapshot(
 )
 
 /**
- * Идентификатор ephemeral voice frame-а в mesh flood, чтобы один и тот же audio payload не проигрывался и не пересылался повторно.
- */
-@JvmInline
-@Serializable
-value class MeshVoiceFrameId(val value: String)
-
-/**
- * Ephemeral Opus voice frame для MESHRA: не попадает в event-log и нужен только для realtime flooding-а.
- */
-@Serializable
-data class MeshVoiceFrame(
-    val frameId: MeshVoiceFrameId,
-    val originPeerId: PeerId,
-    val sequence: Long,
-    val encodedBytes: ByteArray,
-    val isFinal: Boolean,
-)
-
-/**
- * Тип payload-а внутри mesh envelope: durable room-события, snapshot комнаты или служебный hello соседнего peer-а.
+ * Тип управляющего payload-а внутри JSON mesh envelope: durable room-событие, snapshot или hello соседнего peer-а.
  */
 @Serializable
 enum class MeshPayloadKind {
     ROOM_EVENT,
     ROOM_SNAPSHOT,
     PEER_HELLO,
-    VOICE_FRAME,
 }
 
 /**
  * Транспортная обертка mesh-слоя без собственного envelopeId.
  *
- * Room-события дедупятся по eventId, snapshot не flood-ится, PEER_HELLO используется для live-мапы linkId -> PeerId,
- * а VOICE_FRAME дедупится по собственному frameId и не сохраняется в snapshot.
+ * Room-события дедупятся по eventId, snapshot не flood-ится, а PEER_HELLO используется для live-мапы linkId -> PeerId.
+ * Ephemeral голос передается отдельно через компактный бинарный MeshVoicePacket и в этот JSON envelope не входит.
  */
 @Serializable
 data class MeshEnvelope(
@@ -106,6 +86,5 @@ data class MeshEnvelope(
     val payloadKind: MeshPayloadKind,
     val event: MeshRoomEvent? = null,
     val snapshot: MeshRoomSnapshot? = null,
-    val voiceFrame: MeshVoiceFrame? = null,
     val sentAtMillis: Long,
 )

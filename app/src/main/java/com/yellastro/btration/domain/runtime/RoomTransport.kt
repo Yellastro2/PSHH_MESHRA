@@ -6,14 +6,18 @@ import com.yellastro.btration.data.wire.WireCodec
 import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.RoomId
 import com.yellastro.btration.domain.model.RoomInfo
+import com.yellastro.btration.domain.model.RoomTransportMode
 import com.yellastro.btration.domain.model.WirePacket
 import com.yellastro.btration.domain.model.WirePacketType
 import com.yellastro.btration.domain.transport.NeighborAdvertisement
 import com.yellastro.btration.domain.transport.NeighborCandidateId
+import com.yellastro.btration.domain.transport.NeighborDiscoveryMode
 import com.yellastro.btration.domain.transport.NeighborLinkId
+import com.yellastro.btration.domain.transport.NeighborTopology
 import com.yellastro.btration.domain.transport.NeighborTransport
 import com.yellastro.btration.domain.transport.NeighborTransportEvent
 import com.yellastro.btration.domain.transport.PeerLinkResolver
+import com.yellastro.btration.voice.VoiceTransportMode
 import java.io.InputStream
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -22,7 +26,10 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 
 /**
- * Протокол комнаты поверх соседского транспорта: WirePacket, реклама комнаты и связи PeerId с linkId.
+ * Протокол комнаты поверх topology-aware NeighborTransport: WirePacket, реклама режимов комнаты/голоса и связи PeerId с linkId.
+ *
+ * Star-комната с raw Wi-Fi Direct voice использует Cluster signaling, чтобы Nearby P2P_STAR не занимал системный
+ * Wi-Fi P2P stack до отдельного DNS-SD/group handshake media-plane.
  */
 class RoomTransport(
     private val neighborTransport: NeighborTransport,
@@ -50,10 +57,15 @@ class RoomTransport(
     }
 
     /**
-     * Запускает поиск комнат через соседский транспорт.
+     * Запускает чередующийся поиск для лобби либо фиксированный поиск в физической topology конкретной комнаты.
      */
-    fun startDiscovery() {
-        neighborTransport.startDiscovery()
+    fun startDiscovery(room: RoomInfo? = null) {
+        val discoveryMode = when (room?.toNeighborTopology()) {
+            null -> NeighborDiscoveryMode.ALTERNATING
+            NeighborTopology.STAR -> NeighborDiscoveryMode.STAR_ONLY
+            NeighborTopology.CLUSTER -> NeighborDiscoveryMode.CLUSTER_ONLY
+        }
+        neighborTransport.startDiscovery(discoveryMode)
     }
 
     /**
@@ -64,11 +76,14 @@ class RoomTransport(
     }
 
     /**
-     * Запускает рекламу комнаты через короткую визитку endpointName.
+     * Запускает рекламу комнаты через короткую визитку endpointName и совместимую с voice media-plane topology.
      */
     fun startAdvertising(room: RoomInfo) {
         stopAllEndpointsAndClearState(reason = "prepare_start_advertising")
-        neighborTransport.startAdvertising(NeighborAdvertisement(NearbyRoomAdvertisement.fromRoom(room).encode()))
+        neighborTransport.startAdvertising(
+            advertisement = NeighborAdvertisement(NearbyRoomAdvertisement.fromRoom(room).encode()),
+            topology = room.toNeighborTopology(),
+        )
     }
 
     /**
@@ -95,10 +110,13 @@ class RoomTransport(
     }
 
     /**
-     * Запрашивает соединение с endpoint-кандидатом.
+     * Запрашивает соединение с endpoint-кандидатом в topology, выбранной по режимам комнаты и голоса из рекламы.
      */
-    fun connectToEndpoint(endpointId: String) {
-        neighborTransport.connect(NeighborCandidateId(endpointId))
+    fun connectToEndpoint(endpointId: String, room: RoomInfo) {
+        neighborTransport.connect(
+            candidateId = NeighborCandidateId(endpointId),
+            topology = room.toNeighborTopology(),
+        )
     }
 
     /**
@@ -456,6 +474,17 @@ class RoomTransport(
     private fun emitEvent(event: RoomTransportEvent) {
         if (!_events.tryEmit(event)) {
             Log.w(TAG, "[emitEvent] Не удалось опубликовать RoomTransportEvent type=${event.javaClass.simpleName}")
+        }
+    }
+
+    /**
+     * Выбирает физическую Nearby topology без конфликта raw Wi-Fi Direct media-plane с Nearby P2P_STAR.
+     */
+    private fun RoomInfo.toNeighborTopology(): NeighborTopology {
+        return when {
+            roomTransportMode == RoomTransportMode.MESHRA -> NeighborTopology.CLUSTER
+            voiceTransportMode == VoiceTransportMode.WIFI_DIRECT_UDP -> NeighborTopology.CLUSTER
+            else -> NeighborTopology.STAR
         }
     }
 

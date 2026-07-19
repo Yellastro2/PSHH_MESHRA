@@ -43,7 +43,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
- * Рабочая машина комнаты: ведет discovery, Nearby Star/MESHRA room transport, direct mesh-connect статусы, выбор voice transport, чат, PTT и статус media-plane.
+ * Рабочая машина комнаты: ведет чередующийся lobby discovery, topology-aware Star/MESHRA connect, mesh-статусы, чат, PTT и media-plane.
  */
 class RoomRuntime(
     private val profileRepository: ProfileRepository,
@@ -279,7 +279,7 @@ class RoomRuntime(
     }
 
     /**
-     * Атомарно останавливает discovery refresh и начинает подключение к найденной комнате по ее RoomId.
+     * Атомарно останавливает discovery refresh и подключается к комнате в совместимой с ее voice transport topology.
      */
     suspend fun joinRoom(roomId: RoomId) {
         discoveryCycleMutex.withLock {
@@ -322,12 +322,11 @@ class RoomRuntime(
         }
 
         clearConnectionRecovery()
-        roomTransport.stopDiscovery()
         roomIdsSeenInDiscoveryCycle = null
         _messages.value = emptyList()
         _state.value = RoomRuntimeState.Joining(room)
         Log.i(TAG, "[joinRoom] Runtime переведен в Joining roomId=${room.roomId.value} endpointId=$endpointId")
-        roomTransport.connectToEndpoint(endpointId)
+        roomTransport.connectToEndpoint(endpointId, room)
     }
 
     /**
@@ -335,8 +334,6 @@ class RoomRuntime(
      */
     private fun joinMeshRoom(room: RoomInfo, endpointId: String) {
         clearConnectionRecovery()
-        roomTransport.stopDiscovery()
-        meshTransport.stopDiscovery()
         roomIdsSeenInDiscoveryCycle = null
         _messages.value = emptyList()
         _state.value = RoomRuntimeState.Joining(
@@ -1273,7 +1270,7 @@ class RoomRuntime(
     }
 
     /**
-     * После свежего обнаружения восстанавливаемой комнаты останавливает recovery discovery и повторяет connection один раз.
+     * После свежего обнаружения восстанавливаемой комнаты повторяет connection в исходной media topology один раз.
      */
     private fun reconnectAfterRecoveryIfNeeded(roomId: RoomId, endpointId: String) {
         val currentState = _state.value as? RoomRuntimeState.Joining ?: return
@@ -1283,7 +1280,6 @@ class RoomRuntime(
         recoveryReconnectRequested = true
         connectionRecoveryJob?.cancel()
         connectionRecoveryJob = null
-        roomTransport.stopDiscovery()
         if (currentState.room.roomTransportMode == RoomTransportMode.MESHRA) {
             val gatewayPeerId = (_availableRooms.value.firstOrNull { roomInfo -> roomInfo.roomId == roomId }?.gateway ?: currentState.room.gateway ?: currentState.room.host).peerId
             Log.i(TAG, "[reconnectAfterRecoveryIfNeeded] Mesh gateway найден заново, повторяем connection roomId=${roomId.value} endpointId=$endpointId")
@@ -1293,7 +1289,7 @@ class RoomRuntime(
             )
         } else {
             Log.i(TAG, "[reconnectAfterRecoveryIfNeeded] Комната найдена заново, повторяем connection roomId=${roomId.value} endpointId=$endpointId")
-            roomTransport.connectToEndpoint(endpointId)
+            roomTransport.connectToEndpoint(endpointId, currentState.room)
         }
     }
 
@@ -1397,7 +1393,7 @@ class RoomRuntime(
     }
 
     /**
-     * Выполняет один clean-discovery retry после 8007/8009/8012 либо завершает Joining ошибкой после повторного сбоя.
+     * Выполняет один clean-discovery retry в topology комнаты после 8007/8009/8012 либо завершает Joining ошибкой.
      */
     private fun handleConnectionRecoveryRequired(event: RoomTransportEvent.ConnectionRecoveryRequired) {
         val currentState = _state.value as? RoomRuntimeState.Joining ?: return
@@ -1421,7 +1417,7 @@ class RoomRuntime(
             if (joiningState?.room?.roomId != currentState.room.roomId || recoveringRoomId != currentState.room.roomId) {
                 return@launch
             }
-            roomTransport.startDiscovery()
+            roomTransport.startDiscovery(currentState.room)
             Log.i(TAG, "[handleConnectionRecoveryRequired] Clean discovery запущен roomId=${currentState.room.roomId.value}")
             delay(CONNECTION_RECOVERY_DISCOVERY_TIMEOUT_MILLIS)
             if (_state.value is RoomRuntimeState.Joining && recoveringRoomId == currentState.room.roomId && !recoveryReconnectRequested) {
@@ -1466,7 +1462,7 @@ class RoomRuntime(
     }
 
     /**
-     * Переводит client обратно в Joining и запускает clean discovery той же advertised-комнаты после обрыва host-а.
+     * Переводит client обратно в Joining и ищет advertised-комнату в совместимой с ее voice transport topology.
      */
     private fun beginClientReconnectAfterHostDisconnect(currentState: RoomRuntimeState.Client) {
         clearConnectionRecovery()
@@ -1485,7 +1481,7 @@ class RoomRuntime(
         roomTransport.stopAllEndpointsAndClearState(reason = "client_host_disconnect_reconnect")
         connectionRecoveryJob = externalScope.launch {
             Log.i(TAG, "[beginClientReconnectAfterHostDisconnect] Запускаем discovery для переподключения roomId=${reconnectRoom.roomId.value}")
-            roomTransport.startDiscovery()
+            roomTransport.startDiscovery(reconnectRoom)
             delay(CLIENT_RECONNECT_DISCOVERY_TIMEOUT_MILLIS)
             if (_state.value is RoomRuntimeState.Joining && recoveringRoomId == reconnectRoom.roomId && !recoveryReconnectRequested) {
                 setError("Не удалось переподключиться к комнате")

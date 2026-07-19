@@ -26,12 +26,11 @@ import com.yellastro.btration.domain.transport.NeighborAdvertisement
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Управляет Nearby discovery, advertising и lifecycle соединений без декодирования payload-ов приложения.
+ * Управляет Nearby discovery/advertising с переданной на каждый запуск Strategy и lifecycle соединений без декодирования payload-ов.
  */
 internal class NearbyConnectionLayer(
     private val context: Context,
     private val connectionsClient: ConnectionsClient,
-    private val strategy: Strategy,
     private val serviceId: String,
     private val payloadCallback: PayloadCallback,
     private val emitEvent: (NearbyConnectionLayerEvent) -> Unit,
@@ -103,17 +102,25 @@ internal class NearbyConnectionLayer(
     }
 
     /**
-     * Запускает поиск Nearby endpoint-ов с текущим serviceId.
+     * Запускает поиск Nearby endpoint-ов с явно выбранной стратегией текущей discovery-фазы.
      */
-    fun startDiscovery() {
+    fun startDiscovery(strategy: Strategy) {
         cancelDiscoveryPermissionRetry()
-        startDiscoveryInternal(permissionRetryAttempt = 0)
+        startDiscoveryInternal(
+            strategy = strategy,
+            permissionRetryAttempt = 0,
+            alreadyDiscoveringRetryAttempt = 0,
+        )
     }
 
     /**
      * Запускает discovery и тихо ретраит краткий permission-race внутри Nearby API.
      */
-    private fun startDiscoveryInternal(permissionRetryAttempt: Int) {
+    private fun startDiscoveryInternal(
+        strategy: Strategy,
+        permissionRetryAttempt: Int,
+        alreadyDiscoveringRetryAttempt: Int,
+    ) {
         Log.i(TAG, "[startDiscovery] Запускаем discovery serviceId=$serviceId strategy=$strategy")
         val missingPermissions = missingPermissionsForDiscovery()
         if (missingPermissions.isNotEmpty()) {
@@ -143,8 +150,16 @@ internal class NearbyConnectionLayer(
             }
             .addOnFailureListener { cause ->
                 if (cause is ApiException && cause.statusCode == ConnectionsStatusCodes.STATUS_ALREADY_DISCOVERING) {
-                    cancelDiscoveryPermissionRetry()
-                    Log.i(TAG, "[startDiscovery] Nearby discovery уже запущен, повторный старт пропущен")
+                    if (alreadyDiscoveringRetryAttempt < MAX_ALREADY_DISCOVERING_RETRIES) {
+                        scheduleDiscoveryStrategyRestart(
+                            strategy = strategy,
+                            permissionRetryAttempt = permissionRetryAttempt,
+                            nextAttempt = alreadyDiscoveringRetryAttempt + 1,
+                        )
+                        return@addOnFailureListener
+                    }
+                    Log.w(TAG, "[startDiscovery] Не удалось сменить Nearby discovery strategy после повторных stop/start strategy=$strategy")
+                    emitEvent(NearbyConnectionLayerEvent.DiscoveryFailed(cause))
                     return@addOnFailureListener
                 }
                 if (shouldRetryTransientPermissionFailure(
@@ -153,7 +168,7 @@ internal class NearbyConnectionLayer(
                         missingPermissionsProvider = ::missingPermissionsForDiscovery,
                     )
                 ) {
-                    scheduleDiscoveryPermissionRetry(permissionRetryAttempt + 1, cause)
+                    scheduleDiscoveryPermissionRetry(strategy, permissionRetryAttempt + 1, cause)
                     return@addOnFailureListener
                 }
                 Log.w(TAG, "[startDiscovery] Nearby не запустил discovery: ${cause.message}", cause)
@@ -171,17 +186,21 @@ internal class NearbyConnectionLayer(
     }
 
     /**
-     * Запускает advertising с уже подготовленной endpointName-визиткой.
+     * Запускает advertising с подготовленной endpointName-визиткой и стратегией топологии комнаты.
      */
-    fun startAdvertising(advertisement: NeighborAdvertisement) {
+    fun startAdvertising(advertisement: NeighborAdvertisement, strategy: Strategy) {
         cancelAdvertisingPermissionRetry()
-        startAdvertisingInternal(advertisement, permissionRetryAttempt = 0)
+        startAdvertisingInternal(advertisement, strategy, permissionRetryAttempt = 0)
     }
 
     /**
      * Запускает advertising и тихо ретраит краткий permission-race внутри Nearby API.
      */
-    private fun startAdvertisingInternal(advertisement: NeighborAdvertisement, permissionRetryAttempt: Int) {
+    private fun startAdvertisingInternal(
+        advertisement: NeighborAdvertisement,
+        strategy: Strategy,
+        permissionRetryAttempt: Int,
+    ) {
         Log.i(
             TAG,
             "[startAdvertising] Запускаем advertising endpointNameChars=${advertisement.endpointName.length} serviceId=$serviceId strategy=$strategy",
@@ -224,7 +243,7 @@ internal class NearbyConnectionLayer(
                         missingPermissionsProvider = ::missingPermissionsForAdvertising,
                     )
                 ) {
-                    scheduleAdvertisingPermissionRetry(advertisement, permissionRetryAttempt + 1, cause)
+                    scheduleAdvertisingPermissionRetry(advertisement, strategy, permissionRetryAttempt + 1, cause)
                     return@addOnFailureListener
                 }
                 Log.w(TAG, "[startAdvertising] Nearby не запустил advertising: ${cause.message}", cause)
@@ -365,7 +384,7 @@ internal class NearbyConnectionLayer(
     /**
      * Планирует повторный discovery после краткой задержки, не отправляя ошибку в UI до исчерпания попыток.
      */
-    private fun scheduleDiscoveryPermissionRetry(nextAttempt: Int, cause: Throwable) {
+    private fun scheduleDiscoveryPermissionRetry(strategy: Strategy, nextAttempt: Int, cause: Throwable) {
         cancelDiscoveryPermissionRetry()
         val delayMillis = TRANSIENT_PERMISSION_RETRY_DELAYS_MILLIS[nextAttempt - 1]
         Log.w(
@@ -374,16 +393,48 @@ internal class NearbyConnectionLayer(
         )
         val retryRunnable = Runnable {
             discoveryRetryRunnable = null
-            startDiscoveryInternal(permissionRetryAttempt = nextAttempt)
+            startDiscoveryInternal(
+                strategy = strategy,
+                permissionRetryAttempt = nextAttempt,
+                alreadyDiscoveringRetryAttempt = 0,
+            )
         }
         discoveryRetryRunnable = retryRunnable
         retryHandler.postDelayed(retryRunnable, delayMillis)
     }
 
     /**
+     * Повторяет stop/start, если предыдущая Strategy еще не успела остановиться перед новой discovery-фазой.
+     */
+    private fun scheduleDiscoveryStrategyRestart(
+        strategy: Strategy,
+        permissionRetryAttempt: Int,
+        nextAttempt: Int,
+    ) {
+        cancelDiscoveryPermissionRetry()
+        connectionsClient.stopDiscovery()
+        Log.w(TAG, "[scheduleDiscoveryStrategyRestart] Предыдущий discovery еще активен, повторяем смену strategy=$strategy attempt=$nextAttempt")
+        val retryRunnable = Runnable {
+            discoveryRetryRunnable = null
+            startDiscoveryInternal(
+                strategy = strategy,
+                permissionRetryAttempt = permissionRetryAttempt,
+                alreadyDiscoveringRetryAttempt = nextAttempt,
+            )
+        }
+        discoveryRetryRunnable = retryRunnable
+        retryHandler.postDelayed(retryRunnable, DISCOVERY_STRATEGY_RESTART_DELAY_MILLIS)
+    }
+
+    /**
      * Планирует повторный advertising после краткой задержки, не отправляя ошибку в UI до исчерпания попыток.
      */
-    private fun scheduleAdvertisingPermissionRetry(advertisement: NeighborAdvertisement, nextAttempt: Int, cause: Throwable) {
+    private fun scheduleAdvertisingPermissionRetry(
+        advertisement: NeighborAdvertisement,
+        strategy: Strategy,
+        nextAttempt: Int,
+        cause: Throwable,
+    ) {
         cancelAdvertisingPermissionRetry()
         val delayMillis = TRANSIENT_PERMISSION_RETRY_DELAYS_MILLIS[nextAttempt - 1]
         Log.w(
@@ -392,7 +443,7 @@ internal class NearbyConnectionLayer(
         )
         val retryRunnable = Runnable {
             advertisingRetryRunnable = null
-            startAdvertisingInternal(advertisement, permissionRetryAttempt = nextAttempt)
+            startAdvertisingInternal(advertisement, strategy, permissionRetryAttempt = nextAttempt)
         }
         advertisingRetryRunnable = retryRunnable
         retryHandler.postDelayed(retryRunnable, delayMillis)
@@ -505,6 +556,8 @@ internal class NearbyConnectionLayer(
         private const val TAG = "NearbyConnectionLayer"
         private const val TRANSIENT_MISSING_PERMISSION_STATUS_CODE = 8034
         private const val TRANSIENT_MISSING_PERMISSION_MARKER = "MISSING_PERMISSION"
+        private const val MAX_ALREADY_DISCOVERING_RETRIES = 2
+        private const val DISCOVERY_STRATEGY_RESTART_DELAY_MILLIS = 350L
         private val TRANSIENT_PERMISSION_RETRY_DELAYS_MILLIS = longArrayOf(400L, 900L, 1_600L)
         private val RECOVERABLE_CONNECTION_STATUS_CODES = setOf(
             ConnectionsStatusCodes.STATUS_RADIO_ERROR,

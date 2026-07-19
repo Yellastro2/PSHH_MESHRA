@@ -4,7 +4,7 @@ import java.io.InputStream
 import kotlinx.coroutines.flow.SharedFlow
 
 /**
- * Общий контракт соседского транспорта: discovery, advertising, connection lifecycle и передача байтов.
+ * Общий контракт соседского транспорта: topology-aware discovery/advertising/connect, lifecycle и передача байтов.
  */
 interface NeighborTransport {
     /**
@@ -13,9 +13,9 @@ interface NeighborTransport {
     val neighborEvents: SharedFlow<NeighborTransportEvent>
 
     /**
-     * Запускает поиск соседских кандидатов.
+     * Запускает поиск кандидатов в одном topology-режиме либо попеременно в Star и Cluster для общего лобби.
      */
-    fun startDiscovery()
+    fun startDiscovery(mode: NeighborDiscoveryMode = NeighborDiscoveryMode.ALTERNATING)
 
     /**
      * Останавливает поиск соседских кандидатов.
@@ -23,9 +23,9 @@ interface NeighborTransport {
     fun stopDiscovery()
 
     /**
-     * Запускает публикацию локального устройства с уже подготовленной транспортной визиткой.
+     * Запускает публикацию локального устройства с визиткой и topology-режимом комнаты.
      */
-    fun startAdvertising(advertisement: NeighborAdvertisement)
+    fun startAdvertising(advertisement: NeighborAdvertisement, topology: NeighborTopology)
 
     /**
      * Останавливает публикацию локального устройства.
@@ -33,9 +33,9 @@ interface NeighborTransport {
     fun stopAdvertising()
 
     /**
-     * Запрашивает соединение с найденным кандидатом.
+     * Запрашивает соединение с кандидатом через topology, заявленную режимом комнаты.
      */
-    fun connect(candidateId: NeighborCandidateId)
+    fun connect(candidateId: NeighborCandidateId, topology: NeighborTopology)
 
     /**
      * Принимает входящее соединение.
@@ -90,6 +90,23 @@ interface NeighborTransport {
      * Отправляет поток байт в несколько линков и возвращает ошибку только владельцу этой отправки.
      */
     fun sendStream(linkIds: Collection<NeighborLinkId>, inputStream: InputStream, onFailure: (Throwable) -> Unit = {})
+}
+
+/**
+ * Физическая Nearby topology, которую доменный слой выбирает независимо от Google SDK-классов.
+ */
+enum class NeighborTopology {
+    STAR,
+    CLUSTER,
+}
+
+/**
+ * Режим discovery: фиксированная topology для подключения/healing либо чередование обеих topology в лобби.
+ */
+enum class NeighborDiscoveryMode {
+    STAR_ONLY,
+    CLUSTER_ONLY,
+    ALTERNATING,
 }
 
 /**

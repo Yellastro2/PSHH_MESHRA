@@ -35,7 +35,9 @@ RoomTransport.events + MeshTransport.events + VoiceTransport.events
 
 `RoomTransport` держит Nearby Star room-level протокол поверх `NeighborTransport`: декодирует/кодирует `WirePacket`, разбирает короткую визитку комнаты, ведет связь `PeerId <-> linkId` и прячет детали конкретного нижнего транспорта от `RoomRuntime`.
 
-`MeshTransport` держит MESHRA room-level протокол поверх того же `NeighborTransport`: принимает gateway-рекламу, snapshot-ы, durable room events и ephemeral voice frames, дедупит их и flood-ит соседям.
+Нижний `NearbyTransport` динамически выбирает физическую topology: общее лобби попеременно сканирует `P2P_STAR` и `P2P_CLUSTER`; Star-комната с `NEARBY_BYTES` использует Star, а MESHRA и Star-комната с отдельным `WIFI_DIRECT_UDP` — Cluster. Последний вариант не дает Nearby `P2P_STAR` занять Wi-Fi P2P stack перед raw Wi-Fi Direct DNS-SD/group handshake. При выборе карточки полные `RoomTransportMode + VoiceTransportMode`, уже полученные из рекламы, определяют connect topology; если карточка была найдена в прошлой фазе, transport сначала повторно обнаруживает endpoint в требуемой topology.
+
+`MeshTransport` держит MESHRA room-level протокол поверх того же `NeighborTransport`: принимает gateway-рекламу, JSON snapshot-ы/durable room events и отдельные компактные бинарные voice frames, дедупит их и flood-ит соседям.
 Для live-UI он также держит `directPeerIds` — набор `PeerId`, с которыми есть прямой mesh link. Эта информация строится из gateway-рекламы и служебного `PEER_HELLO`, а не из `endpointId` в UI.
 
 ## StateFlow
@@ -115,7 +117,7 @@ Client:
 - `RoomRuntime.stopTalking()` убирает локальный `PeerId` из `talkingPeerIds`.
 - При `VoiceTransportEvent.FrameReceived` runtime добавляет `originPeerId` отправителя в `talkingPeerIds`, передает Opus frame в `VoiceRuntime.playIncomingFrame(...)` и снимает индикатор через callback после final-frame/EOF.
 - Для UDP media-plane есть fallback: каждый non-final voice frame продлевает таймер говорящего, а если final-frame потерялся, runtime гасит индикатор и закрывает входящую frame-сессию по таймауту тишины.
-- Для MESHRA media-plane `VoiceRuntime` кодирует Opus frames через callback, а `RoomRuntime` публикует их в `MeshTransport.publishVoiceFrame(...)`. Входящие `MeshTransportEvent.VoiceFrameReceived` проигрываются через `VoiceRuntime` без старого host relay, потому что relay уже сделан mesh flooding-ом.
+- Для MESHRA media-plane `VoiceRuntime` кодирует Opus frames через callback, а `RoomRuntime` публикует их в `MeshTransport.publishVoiceFrame(...)`. `MeshTransport` упаковывает их в бинарный заголовок `MV` размером 9 байт; входящие `MeshTransportEvent.VoiceFrameReceived` проигрываются через `VoiceRuntime` без старого host relay, потому что relay уже сделан mesh flooding-ом.
 - `resetSession()`, `setError()`, disconnect и `MEMBER_LEFT` очищают соответствующие talking-состояния.
 
 ## PacketId / TTL

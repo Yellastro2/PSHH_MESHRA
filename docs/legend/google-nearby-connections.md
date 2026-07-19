@@ -4,9 +4,13 @@
 
 - Android API: Google Play services Nearby Connections.
 - Зависимость MVP: `com.google.android.gms:play-services-nearby:19.3.0`.
-- Текущая стратегия MVP: `Strategy.P2P_CLUSTER`.
+- Физическая strategy выбирается по сочетанию room/voice transport: `NEARBY_STAR + NEARBY_BYTES -> Strategy.P2P_STAR`; `MESHRA` и `NEARBY_STAR + WIFI_DIRECT_UDP -> Strategy.P2P_CLUSTER`.
 - `serviceId` должен быть стабильной строкой приложения. Сейчас публичный фасад `NearbyTransport` передаёт в `NearbyConnectionLayer`: `com.yellastro.btration.nearby.ROOM_V1`.
-- Для MESHRA нижняя Nearby-стратегия должна позволять устройству быть одновременно участником уже установленного link-а и gateway для нового peer-а. В тесте 2026-07-13 `P2P_STAR` давал `STATUS_ENDPOINT_IO_ERROR` при входе C через gateway B, когда B уже состоял в комнате A. Поэтому application-level `NearbyTransport` в `AppContainer` запускается с `Strategy.P2P_CLUSTER`; обычный Nearby Star при этом остается star на уровне `RoomRuntime`/`RoomTransport`, а не на уровне физической Nearby-топологии.
+- Для MESHRA нижняя Nearby-стратегия должна позволять устройству быть одновременно участником уже установленного link-а и gateway для нового peer-а. В тесте 2026-07-13 `P2P_STAR` давал `STATUS_ENDPOINT_IO_ERROR` при входе C через gateway B, когда B уже состоял в комнате A, поэтому MESHRA advertising/connect/healing используют `P2P_CLUSTER`.
+- Для Star-комнаты с `NearbyVoiceTransport` advertising и connect используют физический `P2P_STAR`, а `BTVO` идет по уже установленному room-link-у.
+- Для Star-комнаты с отдельным raw Wi-Fi Direct voice signaling остается на `P2P_CLUSTER`. В тесте 2026-07-19 после перевода такого signaling на `P2P_STAR` текст/JOIN работали, но `WifiP2pManager.discoverServices()` не получил ни одного DNS-SD callback, connect/group/UDP handshake не начинались, а Google Nearby логировал ошибки своего `WIFI_HOTSPOT`. Рабочий вывод проекта: не совмещать активный Nearby `P2P_STAR` link и отдельную raw Wi-Fi Direct group на тех же устройствах; вероятная причина — конкуренция двух владельцев за системный Wi-Fi P2P stack.
+- Одновременный discovery с двумя Strategy не используется. Общее лобби запускает четырехсекундные фазы `P2P_STAR -> P2P_CLUSTER -> ...` с коротким cooldown между ними. Искусственные `EndpointLost` при смене фаз подавляются; список комнат сверяется общим десятисекундным discovery-циклом runtime.
+- Найденный endpoint запоминается вместе с topology текущей фазы. При выборе комнаты сочетание `RoomTransportMode + VoiceTransportMode` из рекламы определяет требуемую topology: при совпадении connect идет сразу, при несовпадении transport фиксирует нужную фазу, повторно обнаруживает тот же endpoint и только затем вызывает `requestConnection`. Ожидание ограничено timeout-ом 12 секунд.
 
 ## Практический контракт проекта
 
@@ -17,10 +21,10 @@
 - Старый формат `BTR3` продолжает декодироваться как legacy-визитка без token voice transport; для него используется default `WIFI_DIRECT_UDP`.
 - До `JOIN_ACCEPTED` listener использует временные `RoomId`/`PeerId` из визитки. После подключения host присылает настоящий `RoomInfo`, и runtime заменяет временные идентификаторы реальными.
 - Nearby endpointId не считается доменным идентификатором участника. Связь `endpointId/linkId -> PeerId/RoomId` ведет `RoomTransport`, потому что это уже room-level знание, а не обязанность нижнего Nearby wrapper-а.
-- Для физических nearby-линков введён общий интерфейс `NeighborTransport`: discovery, advertising, connect/accept/reject/disconnect, BYTES-сообщения и STREAM-потоки описаны без привязки к Nearby SDK и без знания формата контента.
+- Для физических nearby-линков введён общий интерфейс `NeighborTransport`: discovery, topology advertising/connect, accept/reject/disconnect, BYTES-сообщения и STREAM-потоки описаны без привязки к Nearby SDK и без знания формата контента.
 - Код Nearby разделён на фасад `NearbyTransport`, lifecycle-слой `NearbyConnectionLayer` и payload-слой `NearbyPayloadTransport`. `NearbyConnectionLayer` отвечает за discovery, advertising, request/accept/reject/disconnect callbacks и transient permission retry. `NearbyPayloadTransport` отвечает только за отправку и прием непрозрачных BYTES/STREAM по endpointId. `NearbyTransport` реализует `NeighborTransport` и не знает о `WirePacket`, `RoomInfo`, `PeerId` или voice frame.
 - `RoomTransport` сидит поверх `NeighborTransport`: кодирует/декодирует `WirePacket`, готовит/читает `NearbyRoomAdvertisement`, автоматически принимает нижнее connection request и публикует `RoomTransportEvent` для `RoomRuntime`.
-- `MeshTransport` тоже сидит поверх того же `NeighborTransport`, но читает только payload-ы с сигнатурой `BTME1\n` и рекламу `BTM4`. В `AppContainer` прямой accept у `MeshTransport` выключен, чтобы не принимать один Nearby request двумя слоями; общий accept выполняет `RoomTransport`.
+- `MeshTransport` тоже сидит поверх того же `NeighborTransport`: управляющие JSON payload-ы имеют сигнатуру `BTME1\n`, компактные бинарные MESHRA voice DATA-пакеты — двухбайтовую сигнатуру `MV`, а gateway-реклама — `BTM4`. В `AppContainer` прямой accept у `MeshTransport` выключен, чтобы не принимать один Nearby request двумя слоями; общий accept выполняет `RoomTransport`.
 - Ignore-list для MESHRA применяется к gateway из `BTM4`, а не к known host комнаты. `RoomTransport` получает predicate `shouldAcceptConnection(...)` и отклоняет входящий request, если endpointName распознается как реклама ignored gateway.
 - `NearbyVoiceTransport` сидит рядом с `RoomTransport` поверх того же `NeighborTransport`: он читает только BYTES с сигнатурой `BTVO`, а все room/control сообщения игнорирует.
 - Ошибка отправки BYTES/STREAM возвращается callback-ом конкретному вызывающему слою, а не широковещательным event-ом: иначе voice send failure мог бы случайно превратиться в room packet failure.
@@ -29,7 +33,7 @@
 - `RoomTransport` автоматически принимает Nearby connection, а бизнес-решение входа в комнату остаётся выше, в `RoomRuntime`, через `JOIN_ACCEPTED` / `JOIN_REJECTED`.
 - Для будущего mesh/relay в `WirePacket` уже есть поля `packetId` и `ttl`, но Nearby-слой пока не делает dedup и relay.
 - При старте приложения, перед новой рекламой и при сбросе runtime вызывается полный cleanup Nearby: `stopDiscovery()`, `stopAdvertising()`, `stopAllEndpoints()` и очистка локального registry.
-- `STATUS_ALREADY_DISCOVERING` при повторном `startDiscovery()` считается идемпотентным успехом. Для MESHRA healing discovery может стартовать повторно после нескольких link disconnect-ов, и такой повтор не должен превращаться в fatal `DiscoveryFailed`.
+- Повторный запрос уже активного discovery-режима отсекается идемпотентно в `NearbyTransport`. Если `STATUS_ALREADY_DISCOVERING` приходит после намеренного переключения Strategy, `NearbyConnectionLayer` считает это stop/start race, повторяет остановку и до двух раз перезапускает требуемую Strategy; молча считать старую фазу новой нельзя.
 
 ## BYTES payload для MVP-голоса
 

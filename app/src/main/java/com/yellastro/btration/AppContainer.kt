@@ -7,13 +7,13 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.google.android.gms.nearby.Nearby
-import com.google.android.gms.nearby.connection.Strategy
 import com.yellastro.btration.data.nearby.NearbyRoomAdvertisement
 import com.yellastro.btration.data.nearby.NearbyTransport
 import com.yellastro.btration.data.wire.WireCodec
 import com.yellastro.btration.domain.mesh.MeshCodec
 import com.yellastro.btration.domain.mesh.MeshRoomAdvertisement
 import com.yellastro.btration.domain.mesh.MeshTransport
+import com.yellastro.btration.domain.mesh.MeshVoicePacketCodec
 import com.yellastro.btration.domain.runtime.RoomTransport
 import com.yellastro.btration.domain.runtime.RoomRuntime
 import com.yellastro.btration.domain.util.IdGenerator
@@ -42,7 +42,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.serialization.json.Json
 
 /**
- * Ручной composition root приложения: собирает prefs, star/mesh/voice transports, runtime, repository и ViewModel factories.
+ * Ручной composition root приложения: собирает prefs, динамический Star/Cluster Nearby transport, voice-кодеки, runtime и repository.
  */
 class AppContainer(context: Context) {
     private val applicationContext = context.applicationContext
@@ -53,6 +53,7 @@ class AppContainer(context: Context) {
     }
     private val wireCodec = WireCodec(json)
     private val meshCodec = MeshCodec(json)
+    private val meshVoicePacketCodec = MeshVoicePacketCodec()
     private val idGenerator = IdGenerator()
     private val prefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     /**
@@ -67,19 +68,23 @@ class AppContainer(context: Context) {
     private val nearbyTransport = NearbyTransport(
         context = applicationContext,
         connectionsClient = Nearby.getConnectionsClient(applicationContext),
-        strategy = Strategy.P2P_CLUSTER,
     )
     private val roomTransport = RoomTransport(
         neighborTransport = nearbyTransport,
         wireCodec = wireCodec,
         externalScope = applicationScope,
-        shouldIgnoreMessage = { bytes -> VoiceFrameCodec.isVoiceFrame(bytes) || meshCodec.isMeshEnvelope(bytes) },
+        shouldIgnoreMessage = { bytes ->
+            VoiceFrameCodec.isVoiceFrame(bytes) ||
+                meshCodec.isMeshEnvelope(bytes) ||
+                meshVoicePacketCodec.isVoicePacket(bytes)
+        },
         shouldAcceptConnection = ::shouldAcceptNeighborConnection,
     )
     private val meshTransport = MeshTransport(
         selfPeerId = profileRepository.getOrCreatePeerId(),
         neighborTransport = nearbyTransport,
         codec = meshCodec,
+        voicePacketCodec = meshVoicePacketCodec,
         externalScope = applicationScope,
         acceptIncomingConnections = false,
     )
