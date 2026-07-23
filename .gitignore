@@ -23,3 +23,4 @@ ui/release
 .gradle-user-home
 *.log
 .gocache
+/COMPOSE_LEARNING_PLAN.local.md

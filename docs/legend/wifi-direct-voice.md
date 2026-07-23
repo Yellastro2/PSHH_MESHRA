@@ -30,7 +30,7 @@ Wi-Fi Direct transport занимается только голосом:
 
 1. Host создает комнату и вызывает `VoiceTransport.startSession(HOST)`.
 2. `WifiDirectVoiceTransport` запрашивает `createGroup()`, но еще не считает direct-аудио готовым.
-3. Host отправляет `VOICE_TRANSPORT_INFO` через Nearby, чтобы клиент мог начать Wi-Fi Direct handshake.
+3. Host отправляет `VOICE_TRANSPORT_INFO` через Nearby сразу после появления local control info, чтобы клиент мог начать Wi-Fi Direct handshake; `isDirectAudioReady` для этого не нужен.
 4. Host публикует Wi-Fi Direct DNS-SD service `btratio_voice` с TXT record:
    - `app=btratio`;
    - `v=1`;
@@ -70,7 +70,7 @@ Wi-Fi Direct transport занимается только голосом:
 
 - Wi-Fi Direct поведение сильно зависит от прошивки и Google/Android Wi-Fi stack.
 - Рабочий commit `25683d76446f9189b0957475f42851221aed0713` использовал физический Nearby `P2P_STAR` одновременно с `WIFI_DIRECT_UDP`; переводить Direct-комнаты на `P2P_CLUSTER` без отдельного тестового основания нельзя.
-- Host отправляет `VOICE_TRANSPORT_INFO` клиентам только после успешного `createGroup()`. Этот readiness-барьер нужен, чтобы client не запускал одноразовый DNS-SD поиск до готовности host group/service; фактическая возможность отправлять голос конкретному peer по-прежнему подтверждается отдельно через UDP `HELLO/HELLO_ACK`.
+- Host отправляет `VOICE_TRANSPORT_INFO` клиентам без ожидания `RoomInfo.isDirectAudioReady`. Старое ограничение с ожиданием `createGroup()`/`isDirectAudioReady` устарело: оно может оставить client без данных для DNS-SD/connect, а фактическая возможность отправлять голос конкретному peer по-прежнему подтверждается отдельно через UDP `HELLO/HELLO_ACK`.
 - Host при `createRoom()` читает тип комнаты и voice-настройку из prefs, кладет выбранные `roomTransportMode` и `voiceTransportMode` в `RoomInfo` и запускает комнату с этим media-plane. Client после `JOIN_ACCEPTED` смотрит `RoomInfo.roomTransportMode` для выбора room transport комнаты, а затем `RoomInfo.voiceTransportMode` host-а и перед `startSession()` переключает свой локальный voice transport на тот же режим.
 - Если устройство не заявляет `PackageManager.FEATURE_WIFI_DIRECT` или не отдает `WifiP2pManager`, `AppContainer` включает `UnavailableVoiceTransport`, а UI показывает snackbar `Wi-Fi Direct не поддерживается на этом устройстве`.
 - Если client не видит DNS-SD service host-а, он не получит `srcDevice.deviceAddress` и не сможет подключиться.

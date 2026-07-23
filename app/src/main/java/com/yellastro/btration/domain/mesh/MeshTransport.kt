@@ -32,7 +32,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Mesh-слой поверх Cluster topology NeighborTransport: flood-ит room events/voice и меряет здоровье прямых link-ов heartbeat-ами.
+ * Mesh-слой поверх Cluster topology NeighborTransport: flood-ит room events/voice и меряет здоровье только тех
+ * прямых link-ов, которые явно подтверждены как MESHRA-соединения.
  *
  * Runtime включает этот слой для MESHRA-комнат; Nearby Star продолжает работать через обычный RoomTransport.
  */
@@ -50,6 +51,7 @@ class MeshTransport(
     private val pendingGatewayPeerIds = mutableMapOf<NeighborCandidateId, PeerId>()
     private val linkPeerIds = mutableMapOf<NeighborLinkId, PeerId>()
     private val linkRoomIds = mutableMapOf<NeighborLinkId, RoomId>()
+    private val ignoredNonMeshPayloadLinks = mutableSetOf<NeighborLinkId>()
     private val seenEventIds = mutableSetOf<MeshRoomEventId>()
     private val seenVoiceFrameKeys = LinkedHashSet<Long>()
     private val roomSnapshots = mutableMapOf<RoomId, MeshRoomSnapshot>()
@@ -201,6 +203,7 @@ class MeshTransport(
         pendingGatewayPeerIds.clear()
         linkPeerIds.clear()
         linkRoomIds.clear()
+        ignoredNonMeshPayloadLinks.clear()
         seenVoiceFrameKeys.clear()
         clearLocalVoiceSession()
         clearLinkHealth()
@@ -218,6 +221,7 @@ class MeshTransport(
         pendingGatewayPeerIds.clear()
         linkPeerIds.clear()
         linkRoomIds.clear()
+        ignoredNonMeshPayloadLinks.clear()
         seenEventIds.clear()
         seenVoiceFrameKeys.clear()
         clearLocalVoiceSession()
@@ -458,22 +462,28 @@ class MeshTransport(
             }
             is NeighborTransportEvent.LinkConnected -> {
                 val candidateId = NeighborCandidateId(event.linkId.value)
-                pendingGatewayConnections.remove(candidateId)
-                activeLinks.add(event.linkId)
-                publishLinkHealth(linkHealthTracker.onLinkConnected(event.linkId, heartbeatNow()))
-                bindLinkPeer(event.linkId, pendingGatewayPeerIds.remove(candidateId), source = "pending_gateway")
-                Log.i(TAG, "[handleNeighborEvent] Mesh link готов linkId=${event.linkId.value} activeLinkCount=${activeLinks.size}")
-                startHeartbeatLoopIfNeeded()
-                sendPeerHello(event.linkId)
-                sendHeartbeatPing(event.linkId)
-                sendKnownSnapshots(event.linkId)
-                emitEvent(MeshTransportEvent.LinkConnected(event.linkId, reused = event.reused))
+                val wasPendingMeshGateway = pendingGatewayConnections.remove(candidateId)
+                val gatewayPeerId = pendingGatewayPeerIds.remove(candidateId)
+                if (!wasPendingMeshGateway) {
+                    Log.i(TAG, "[handleNeighborEvent] Nearby link не активирован как mesh без pending gateway linkId=${event.linkId.value}")
+                    return
+                }
+                activateMeshLink(
+                    linkId = event.linkId,
+                    peerId = gatewayPeerId,
+                    source = "pending_gateway",
+                    reused = event.reused,
+                )
             }
             is NeighborTransportEvent.LinkDisconnected -> {
                 val candidateId = NeighborCandidateId(event.linkId.value)
                 pendingGatewayConnections.remove(candidateId)
                 pendingGatewayPeerIds.remove(candidateId)
-                activeLinks.remove(event.linkId)
+                ignoredNonMeshPayloadLinks.remove(event.linkId)
+                if (!activeLinks.remove(event.linkId)) {
+                    Log.i(TAG, "[handleNeighborEvent] Отключен неактивный для mesh Nearby link linkId=${event.linkId.value}")
+                    return
+                }
                 publishLinkHealth(linkHealthTracker.onLinkDisconnected(event.linkId, heartbeatNow()))
                 linkPeerIds.remove(event.linkId)
                 linkRoomIds.remove(event.linkId)
@@ -485,6 +495,30 @@ class MeshTransport(
             is NeighborTransportEvent.MessageReceived -> handleMessageReceived(event.linkId, event.bytes)
             else -> Unit
         }
+    }
+
+    /**
+     * Активирует подтвержденный mesh link, включает heartbeat и отправляет первичные mesh payload-ы соседу.
+     */
+    private fun activateMeshLink(
+        linkId: NeighborLinkId,
+        peerId: PeerId?,
+        source: String,
+        reused: Boolean = false,
+    ) {
+        val wasAdded = activeLinks.add(linkId)
+        ignoredNonMeshPayloadLinks.remove(linkId)
+        bindLinkPeer(linkId, peerId, source = source)
+        if (!wasAdded) {
+            return
+        }
+        publishLinkHealth(linkHealthTracker.onLinkConnected(linkId, heartbeatNow()))
+        Log.i(TAG, "[activateMeshLink] Mesh link активирован linkId=${linkId.value} activeLinkCount=${activeLinks.size} source=$source")
+        startHeartbeatLoopIfNeeded()
+        sendPeerHello(linkId)
+        sendHeartbeatPing(linkId)
+        sendKnownSnapshots(linkId)
+        emitEvent(MeshTransportEvent.LinkConnected(linkId, reused = reused))
     }
 
     /**
@@ -531,10 +565,22 @@ class MeshTransport(
      */
     private fun handleMessageReceived(linkId: NeighborLinkId, bytes: ByteArray) {
         if (heartbeatCodec.isHeartbeatPacket(bytes)) {
+            if (linkId !in activeLinks) {
+                if (ignoredNonMeshPayloadLinks.add(linkId)) {
+                    Log.i(TAG, "[handleMessageReceived] Mesh heartbeat проигнорирован на неактивном mesh link linkId=${linkId.value}")
+                }
+                return
+            }
             handleHeartbeatPacket(linkId, bytes)
             return
         }
         if (voicePacketCodec.isVoicePacket(bytes)) {
+            if (linkId !in activeLinks) {
+                if (ignoredNonMeshPayloadLinks.add(linkId)) {
+                    Log.i(TAG, "[handleMessageReceived] Mesh voice проигнорирован на неактивном mesh link linkId=${linkId.value}")
+                }
+                return
+            }
             handleVoicePacket(linkId, bytes)
             return
         }
@@ -549,6 +595,11 @@ class MeshTransport(
             .getOrNull()
             ?: return
 
+        activateMeshLink(
+            linkId = linkId,
+            peerId = envelope.previousHopPeerId,
+            source = "incoming_${envelope.payloadKind.name}",
+        )
         bindLinkPeer(linkId, envelope.previousHopPeerId, source = envelope.payloadKind.name)
         when (envelope.payloadKind) {
             MeshPayloadKind.ROOM_EVENT -> handleRoomEventEnvelope(linkId, envelope)

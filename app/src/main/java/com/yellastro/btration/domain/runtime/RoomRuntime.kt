@@ -828,15 +828,11 @@ class RoomRuntime(
     }
 
     /**
-     * Рассылает локальную voice transport info только после готовности host infrastructure либо от client к host.
+     * Рассылает локальную voice transport info сразу, чтобы host и client могли запустить Wi-Fi Direct handshake.
      */
     private fun handleLocalVoiceTransportInfoChanged(info: VoiceTransportControlInfo) {
         when (val currentState = _state.value) {
             is RoomRuntimeState.Hosting -> {
-                if (!currentState.room.isDirectAudioReady) {
-                    Log.i(TAG, "[handleLocalVoiceTransportInfoChanged] Host voice info готова, но media-plane еще не разрешил client handshake")
-                    return
-                }
                 Log.i(TAG, "[handleLocalVoiceTransportInfoChanged] Host рассылает voice info для запуска handshake memberCount=${currentState.members.size}")
                 sendToMembers(
                     currentState.members,
@@ -1639,7 +1635,7 @@ class RoomRuntime(
     }
 
     /**
-     * На стороне host принимает JOIN_REQUEST и отдает voice info только после готовности host media infrastructure.
+     * На стороне host принимает JOIN_REQUEST и отдает актуальную voice info для запуска media-plane handshake.
      */
     private fun handleJoinRequest(event: RoomTransportEvent.PacketReceived) {
         val currentState = _state.value as? RoomRuntimeState.Hosting ?: return
@@ -1683,12 +1679,8 @@ class RoomRuntime(
             ),
             excludedPeerIds = setOf(profileRepository.getOrCreatePeerId(), joiningPeer.peerId),
         )
-        if (currentState.room.isDirectAudioReady) {
-            voiceTransport.localControlInfo?.let { info ->
-                sendVoiceTransportInfoTo(joiningPeer.peerId, currentState.room.roomId, info)
-            }
-        } else {
-            Log.i(TAG, "[handleJoinRequest] Host media-plane еще не готов, voice info будет отправлена после readiness peerId=${joiningPeer.peerId.value}")
+        voiceTransport.localControlInfo?.let { info ->
+            sendVoiceTransportInfoTo(joiningPeer.peerId, currentState.room.roomId, info)
         }
     }
 

@@ -225,7 +225,7 @@ internal class NearbyPayloadTransport(
 
         Log.i(
             TAG,
-            "[recordRealtimeBytesSent] Realtime voice bytes переданы Nearby payloadCount=$realtimePayloadCount endpointDeliveries=$realtimeEndpointDeliveryCount bytes=$realtimeByteCount windowMs=$windowMillis",
+            "[recordRealtimeBytesSent] Realtime BYTES переданы Nearby payloadCount=$realtimePayloadCount endpointDeliveries=$realtimeEndpointDeliveryCount bytes=$realtimeByteCount windowMs=$windowMillis",
         )
         realtimeLogWindowStartedAtMillis = 0L
         realtimePayloadCount = 0
