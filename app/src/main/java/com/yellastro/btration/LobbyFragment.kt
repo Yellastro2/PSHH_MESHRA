@@ -31,11 +31,12 @@ import com.yellastro.btration.domain.runtime.RoomRuntimeErrorAction
 import com.yellastro.btration.ui.lobby.LobbyUiState
 import com.yellastro.btration.ui.lobby.LobbyViewModel
 import com.yellastro.btration.ui.lobby.RoomItemUi
+import com.yellastro.btration.voice.VoiceFrameDuration
 import com.yellastro.btration.voice.VoiceTransportPreference
 import kotlinx.coroutines.launch
 
 /**
- * Экран лобби с inline-редактором имени и циклическим Nearby-поиском в resumed-состоянии.
+ * Экран лобби с редактором имени, discovery и диалогом transport/voice-профиля новой комнаты.
  */
 class LobbyFragment : Fragment() {
     private val viewModel: LobbyViewModel by viewModels {
@@ -125,10 +126,19 @@ class LobbyFragment : Fragment() {
             val voiceTransportPreference = VoiceTransportPreference.fromPrefValue(
                 bundle.getString(CreateRoomDialogFragment.RESULT_VOICE_TRANSPORT_PREF),
             )
+            val voiceFrameDuration = VoiceFrameDuration.fromPrefValue(
+                value = bundle.getString(CreateRoomDialogFragment.RESULT_VOICE_FRAME_DURATION),
+                default = viewModel.voiceFrameDurationForDialog(roomTransportMode),
+            )
             if (newRoomName.isBlank()) {
                 return@setFragmentResultListener
             }
-            viewModel.onCreateRoomClicked(newRoomName, roomTransportMode, voiceTransportPreference)
+            viewModel.onCreateRoomClicked(
+                name = newRoomName,
+                roomTransportMode = roomTransportMode,
+                voiceTransportPreference = voiceTransportPreference,
+                voiceFrameDuration = voiceFrameDuration,
+            )
         }
 
         btnCreateRoom.setOnClickListener {
@@ -136,6 +146,8 @@ class LobbyFragment : Fragment() {
                 initialRoomName = viewModel.lastRoomNameForDialog(),
                 initialRoomTransportMode = viewModel.roomTransportModeForDialog(),
                 initialVoiceTransportPreference = viewModel.voiceTransportPreferenceForDialog(),
+                initialNearbyStarFrameDuration = viewModel.voiceFrameDurationForDialog(RoomTransportMode.NEARBY_STAR),
+                initialMeshraFrameDuration = viewModel.voiceFrameDurationForDialog(RoomTransportMode.MESHRA),
             )
             dialog.show(childFragmentManager, "CreateRoomDialog")
         }

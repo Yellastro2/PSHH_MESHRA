@@ -7,7 +7,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 
 /**
- * VoiceTransport-заглушка для устройств, где выбранный media-plane не поддерживается системно.
+ * VoiceTransport-заглушка для неподдержанного media-plane с no-op индексом участников.
  */
 class UnavailableVoiceTransport(
     private val unavailableMessage: String,
@@ -40,6 +40,11 @@ class UnavailableVoiceTransport(
      * Служебная информация других транспортов игнорируется, потому что локальный transport недоступен.
      */
     override fun handleControlInfo(fromPeerId: PeerId, info: VoiceTransportControlInfo) = Unit
+
+    /**
+     * Игнорирует участников комнаты, потому что недоступный transport не декодирует compact voice.
+     */
+    override fun updateRoomPeers(peerIds: Set<PeerId>) = Unit
 
     /**
      * Недоступный transport никогда не готов передавать voice frames.

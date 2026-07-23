@@ -13,24 +13,28 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.fragment.app.DialogFragment
 import com.yellastro.btration.domain.model.RoomTransportMode
+import com.yellastro.btration.voice.VoiceFrameDuration
 import com.yellastro.btration.voice.VoiceTransportPreference
 
 /**
- * Диалог создания комнаты с предзаполнением последнего имени, выбором типа комнаты, voice transport,
- * блокировкой Wi-Fi Direct для MESHRA и возвратом результата.
+ * Диалог создания комнаты с выбором transport-ов и отдельной длительностью voice frame для Star/MESHRA.
  */
 class CreateRoomDialogFragment : DialogFragment() {
 
     private lateinit var etRoomName: EditText
     private lateinit var spRoomTransport: Spinner
     private lateinit var spVoiceTransport: Spinner
+    private lateinit var spVoiceFrameDuration: Spinner
     private lateinit var btnCancel: Button
     private lateinit var btnCreate: Button
     private lateinit var tvError: TextView
     private lateinit var voiceTransportAdapter: ArrayAdapter<String>
     private val roomTransportModes = RoomTransportMode.values()
     private val voiceTransportModes = VoiceTransportPreference.values()
+    private val voiceFrameDurations = VoiceFrameDuration.values()
+    private val frameDurationsByRoomMode = mutableMapOf<RoomTransportMode, VoiceFrameDuration>()
     private var lastSelectableVoiceTransportPosition = 0
+    private var activeFrameDurationRoomMode: RoomTransportMode? = null
 
     /**
      * Настраивает стиль диалога до создания окна.
@@ -52,7 +56,7 @@ class CreateRoomDialogFragment : DialogFragment() {
     }
 
     /**
-     * Настраивает ввод имени комнаты, валидацию и отправку результата.
+     * Настраивает ввод, transport/profile selectors, валидацию и отправку результата.
      */
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
@@ -60,13 +64,18 @@ class CreateRoomDialogFragment : DialogFragment() {
         etRoomName = view.findViewById(R.id.et_room_name)
         spRoomTransport = view.findViewById(R.id.sp_room_transport)
         spVoiceTransport = view.findViewById(R.id.sp_voice_transport)
+        spVoiceFrameDuration = view.findViewById(R.id.sp_voice_frame_duration)
         btnCancel = view.findViewById(R.id.btn_cancel)
         btnCreate = view.findViewById(R.id.btn_create)
         tvError = view.findViewById(R.id.tv_error)
+        frameDurationsByRoomMode[RoomTransportMode.NEARBY_STAR] = initialNearbyStarFrameDuration()
+        frameDurationsByRoomMode[RoomTransportMode.MESHRA] = initialMeshraFrameDuration()
         applyInitialRoomName()
         setupRoomTransportSpinner()
         setupVoiceTransportSpinner()
+        setupVoiceFrameDurationSpinner()
         syncVoiceTransportWithRoomMode(showToast = false)
+        syncVoiceFrameDurationWithRoomMode()
 
         btnCancel.setOnClickListener {
             dismiss()
@@ -87,6 +96,7 @@ class CreateRoomDialogFragment : DialogFragment() {
                         putString(RESULT_ROOM_NAME, name)
                         putString(RESULT_ROOM_TRANSPORT_MODE, selectedRoomTransportMode().prefValue)
                         putString(RESULT_VOICE_TRANSPORT_PREF, selectedVoiceTransportPreference().prefValue)
+                        putString(RESULT_VOICE_FRAME_DURATION, selectedVoiceFrameDuration().prefValue)
                     },
                 )
                 dismiss()
@@ -115,11 +125,14 @@ class CreateRoomDialogFragment : DialogFragment() {
         spRoomTransport.setSelection(roomTransportModes.indexOf(initialMode).coerceAtLeast(0))
         spRoomTransport.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             /**
-             * Синхронизирует доступность voice transport-а с выбранным типом комнаты.
+             * Синхронизирует voice transport и сохраненную для типа комнаты длительность фрейма.
              */
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 if (::voiceTransportAdapter.isInitialized) {
                     syncVoiceTransportWithRoomMode(showToast = true)
+                }
+                if (::spVoiceFrameDuration.isInitialized && spVoiceFrameDuration.adapter != null) {
+                    syncVoiceFrameDurationWithRoomMode()
                 }
             }
 
@@ -155,6 +168,34 @@ class CreateRoomDialogFragment : DialogFragment() {
 
             /**
              * Ничего не делает, потому что spinner всегда держит выбранный transport.
+             */
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+    }
+
+    /**
+     * Настраивает выбор длительности Opus-фрейма и запоминает его для текущего типа комнаты.
+     */
+    private fun setupVoiceFrameDurationSpinner() {
+        spVoiceFrameDuration.adapter = createWhiteTextAdapter(
+            voiceFrameDurations.map { duration -> duration.fullName },
+        )
+        activeFrameDurationRoomMode = selectedRoomTransportMode()
+        val initialDuration = frameDurationsByRoomMode.getValue(selectedRoomTransportMode())
+        spVoiceFrameDuration.setSelection(voiceFrameDurations.indexOf(initialDuration).coerceAtLeast(0))
+        spVoiceFrameDuration.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            /**
+             * Сохраняет выбор в локальном состоянии диалога для текущего типа комнаты.
+             */
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val roomMode = activeFrameDurationRoomMode ?: selectedRoomTransportMode()
+                voiceFrameDurations.getOrNull(position)?.let { duration ->
+                    frameDurationsByRoomMode[roomMode] = duration
+                }
+            }
+
+            /**
+             * Ничего не делает, потому что spinner всегда имеет выбранную длительность.
              */
             override fun onNothingSelected(parent: AdapterView<*>?) = Unit
         }
@@ -250,6 +291,25 @@ class CreateRoomDialogFragment : DialogFragment() {
     }
 
     /**
+     * Запоминает длительность предыдущего типа комнаты и показывает отдельный выбор нового типа.
+     */
+    private fun syncVoiceFrameDurationWithRoomMode() {
+        val nextRoomMode = selectedRoomTransportMode()
+        activeFrameDurationRoomMode?.let { previousRoomMode ->
+            val selectedPosition = spVoiceFrameDuration.selectedItemPosition
+            voiceFrameDurations.getOrNull(selectedPosition)?.let { duration ->
+                frameDurationsByRoomMode[previousRoomMode] = duration
+            }
+        }
+        activeFrameDurationRoomMode = nextRoomMode
+        val nextDuration = frameDurationsByRoomMode.getValue(nextRoomMode)
+        val nextPosition = voiceFrameDurations.indexOf(nextDuration).coerceAtLeast(0)
+        if (spVoiceFrameDuration.selectedItemPosition != nextPosition) {
+            spVoiceFrameDuration.setSelection(nextPosition)
+        }
+    }
+
+    /**
      * Проверяет, можно ли выбрать voice transport при текущем типе комнаты.
      */
     private fun isVoiceTransportAllowedForRoom(
@@ -307,6 +367,26 @@ class CreateRoomDialogFragment : DialogFragment() {
     }
 
     /**
+     * Читает сохраненную длительность voice frame для Nearby Star из аргументов диалога.
+     */
+    private fun initialNearbyStarFrameDuration(): VoiceFrameDuration {
+        return VoiceFrameDuration.fromPrefValue(
+            value = arguments?.getString(ARG_INITIAL_NEARBY_STAR_FRAME_DURATION),
+            default = VoiceFrameDuration.MS_10,
+        )
+    }
+
+    /**
+     * Читает сохраненную длительность voice frame для MESHRA из аргументов диалога.
+     */
+    private fun initialMeshraFrameDuration(): VoiceFrameDuration {
+        return VoiceFrameDuration.fromPrefValue(
+            value = arguments?.getString(ARG_INITIAL_MESHRA_FRAME_DURATION),
+            default = VoiceFrameDuration.MS_20,
+        )
+    }
+
+    /**
      * Возвращает выбранный поддержанный voice transport для результата создания комнаты.
      */
     private fun selectedVoiceTransportPreference(): VoiceTransportPreference {
@@ -318,6 +398,16 @@ class CreateRoomDialogFragment : DialogFragment() {
         } else {
             voiceTransportModes[fallbackVoiceTransportPosition()]
         }
+    }
+
+    /**
+     * Возвращает выбранную длительность voice frame и сохраняет ее для текущего типа комнаты.
+     */
+    private fun selectedVoiceFrameDuration(): VoiceFrameDuration {
+        val duration = voiceFrameDurations.getOrNull(spVoiceFrameDuration.selectedItemPosition)
+            ?: frameDurationsByRoomMode.getValue(selectedRoomTransportMode())
+        frameDurationsByRoomMode[selectedRoomTransportMode()] = duration
+        return duration
     }
 
     /**
@@ -347,20 +437,26 @@ class CreateRoomDialogFragment : DialogFragment() {
         private const val ARG_INITIAL_ROOM_NAME = "initial_room_name"
         private const val ARG_INITIAL_ROOM_TRANSPORT_MODE = "initial_room_transport_mode"
         private const val ARG_INITIAL_VOICE_TRANSPORT_PREF = "initial_voice_transport_pref"
+        private const val ARG_INITIAL_NEARBY_STAR_FRAME_DURATION = "initial_nearby_star_frame_duration"
+        private const val ARG_INITIAL_MESHRA_FRAME_DURATION = "initial_meshra_frame_duration"
 
         /**
-         * Создает диалог с начальным названием комнаты, типом комнаты и сохраненным voice transport.
+         * Создает диалог с transport-настройками и отдельными сохраненными frame duration для Star/MESHRA.
          */
         fun newInstance(
             initialRoomName: String,
             initialRoomTransportMode: RoomTransportMode,
             initialVoiceTransportPreference: VoiceTransportPreference,
+            initialNearbyStarFrameDuration: VoiceFrameDuration,
+            initialMeshraFrameDuration: VoiceFrameDuration,
         ): CreateRoomDialogFragment {
             return CreateRoomDialogFragment().apply {
                 arguments = Bundle().apply {
                     putString(ARG_INITIAL_ROOM_NAME, initialRoomName)
                     putString(ARG_INITIAL_ROOM_TRANSPORT_MODE, initialRoomTransportMode.prefValue)
                     putString(ARG_INITIAL_VOICE_TRANSPORT_PREF, initialVoiceTransportPreference.prefValue)
+                    putString(ARG_INITIAL_NEARBY_STAR_FRAME_DURATION, initialNearbyStarFrameDuration.prefValue)
+                    putString(ARG_INITIAL_MESHRA_FRAME_DURATION, initialMeshraFrameDuration.prefValue)
                 }
             }
         }
@@ -384,5 +480,10 @@ class CreateRoomDialogFragment : DialogFragment() {
          * Ключ выбранного voice transport внутри результата.
          */
         const val RESULT_VOICE_TRANSPORT_PREF = "voice_transport_pref"
+
+        /**
+         * Ключ выбранной длительности voice frame внутри результата.
+         */
+        const val RESULT_VOICE_FRAME_DURATION = "voice_frame_duration"
     }
 }

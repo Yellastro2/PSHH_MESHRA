@@ -13,15 +13,18 @@ import eu.buney.kopus.setVBR
 import java.io.Closeable
 
 /**
- * Кодирует PCM16 mono 16 kHz в Opus-пакеты для Nearby BYTES voice frames и декодирует их обратно перед AudioTrack.
+ * Кодирует PCM16 mono 16 kHz в Opus-пакеты выбранной комнатой длительности.
  */
-class OpusVoiceEncoder : Closeable {
+class OpusVoiceEncoder(
+    private val profile: VoiceAudioProfile,
+) : Closeable {
     private val encoder = OpusEncoder(
         sampleRate = PcmVoiceConfig.SAMPLE_RATE_HZ,
         channels = PcmVoiceConfig.CHANNEL_COUNT,
         application = OpusApplication.Voip,
     ).also(::configureEncoder)
-    private val pcmShorts = ShortArray(PcmVoiceConfig.FRAME_SAMPLES * PcmVoiceConfig.CHANNEL_COUNT)
+    private val frameSamples = PcmVoiceConfig.frameSamples(profile)
+    private val pcmShorts = ShortArray(frameSamples * PcmVoiceConfig.CHANNEL_COUNT)
     private val encodedBuffer = ByteArray(MAX_OPUS_PACKET_BYTES)
 
     /**
@@ -41,7 +44,7 @@ class OpusVoiceEncoder : Closeable {
         val encodedBytes = encoder.encode(
             inPcm = pcmShorts,
             inPcmOffset = 0,
-            frameSize = PcmVoiceConfig.FRAME_SAMPLES,
+            frameSize = frameSamples,
             outData = encodedBuffer,
             outDataOffset = 0,
             maxDataBytes = encodedBuffer.size,
@@ -60,7 +63,7 @@ class OpusVoiceEncoder : Closeable {
     }
 
     /**
-     * Настраивает Opus под речь и небольшую нагрузку на Nearby relay.
+     * Настраивает Opus под речь и логирует выбранную комнатой длительность фрейма.
      */
     private fun configureEncoder(encoder: OpusEncoder) {
         logCtlResult("setBitrate", encoder.setBitrate(BITRATE_BITS_PER_SECOND))
@@ -69,20 +72,21 @@ class OpusVoiceEncoder : Closeable {
         logCtlResult("setVBR", encoder.setVBR(true))
         Log.i(
             TAG,
-            "[configureEncoder] Opus encoder настроен sampleRate=${PcmVoiceConfig.SAMPLE_RATE_HZ} frameMs=${PcmVoiceConfig.FRAME_MILLIS} bitrate=$BITRATE_BITS_PER_SECOND",
+            "[configureEncoder] Opus encoder настроен sampleRate=${PcmVoiceConfig.SAMPLE_RATE_HZ} frameMs=${profile.frameDuration.millis} bitrate=$BITRATE_BITS_PER_SECOND",
         )
     }
 }
 
 /**
- * Декодирует входящие Opus-пакеты одного участника в PCM16 bytes для существующего PcmVoicePlayer.
+ * Декодирует Opus любой поддержанной длительности до 60 мс, не завися от локального encoder-профиля.
  */
 class OpusVoiceDecoder : Closeable {
     private val decoder = OpusDecoder(
         sampleRate = PcmVoiceConfig.SAMPLE_RATE_HZ,
         channels = PcmVoiceConfig.CHANNEL_COUNT,
     )
-    private val pcmShorts = ShortArray(PcmVoiceConfig.FRAME_SAMPLES * PcmVoiceConfig.CHANNEL_COUNT)
+    private val maxFrameSamples = PcmVoiceConfig.maxDecodeFrameSamples()
+    private val pcmShorts = ShortArray(maxFrameSamples * PcmVoiceConfig.CHANNEL_COUNT)
 
     /**
      * Декодирует один Opus packet в PCM16 little-endian bytes.
@@ -94,7 +98,7 @@ class OpusVoiceDecoder : Closeable {
             len = encodedBytes.size,
             outPcm = pcmShorts,
             outPcmOffset = 0,
-            frameSize = PcmVoiceConfig.FRAME_SAMPLES,
+            frameSize = maxFrameSamples,
             decodeFec = false,
         )
         require(decodedSamples > 0) {

@@ -13,14 +13,16 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 
 /**
- * Реализация VoiceTransport поверх NeighborTransport BYTES payload: кодирует и декодирует только BTVO voice frames.
+ * VoiceTransport поверх NeighborTransport BYTES: передает Star voice в общем компактном девятибайтовом формате.
  */
 class NearbyVoiceTransport(
     private val neighborTransport: NeighborTransport,
     private val peerLinkResolver: PeerLinkResolver,
+    private val voicePacketCodec: CompactVoicePacketCodec,
     externalScope: CoroutineScope,
 ) : VoiceTransport {
     private val _events = MutableSharedFlow<VoiceTransportEvent>(extraBufferCapacity = EVENT_BUFFER_CAPACITY)
+    private val peerIndex = CompactVoicePeerIndex()
 
     /**
      * Нормализованные voice-события для VoiceRuntime.
@@ -40,7 +42,7 @@ class NearbyVoiceTransport(
     }
 
     /**
-     * Отправляет voice frame выбранным peerId через linkId, которые ведет RoomTransport.
+     * Кодирует compact Star voice frame и отправляет его через linkId, которые ведет RoomTransport.
      */
     override fun sendFrameToPeers(peerIds: Set<PeerId>, frame: VoiceFrame) {
         val linkIds = peerIds.mapNotNull(peerLinkResolver::linkIdForPeer)
@@ -54,7 +56,29 @@ class NearbyVoiceTransport(
             )
             return
         }
-        neighborTransport.sendMessage(linkIds, VoiceFrameCodec.encode(frame), isRealtime = true) { cause ->
+        val originNodeId = peerIndex.nodeIdFor(frame.originPeerId)
+        if (originNodeId == null) {
+            val cause = IllegalStateException("Origin voice node id неизвестен или имеет коллизию")
+            Log.e(TAG, "[sendFrameToPeers] Compact origin не разрешен originPeerId=${frame.originPeerId.value}")
+            emitEvent(VoiceTransportEvent.FrameSendFailed(peerIds = peerIds, cause = cause))
+            return
+        }
+        val bytes = runCatching {
+            voicePacketCodec.encode(
+                CompactVoicePacket(
+                    originNodeId = originNodeId,
+                    pttSessionId = frame.sessionId,
+                    sequence = frame.sequence.toInt(),
+                    encodedBytes = frame.encodedBytes,
+                    isFinal = frame.isFinal,
+                    ttl = STAR_VOICE_TTL,
+                ),
+            )
+        }.onFailure { cause ->
+            Log.w(TAG, "[sendFrameToPeers] Не удалось закодировать compact Star voice frame sequence=${frame.sequence}: ${cause.message}", cause)
+            emitEvent(VoiceTransportEvent.FrameSendFailed(peerIds = peerIds, cause = cause))
+        }.getOrNull() ?: return
+        neighborTransport.sendMessage(linkIds, bytes, isRealtime = true) { cause ->
             emitEvent(
                 VoiceTransportEvent.FrameSendFailed(
                     peerIds = peerIds,
@@ -87,6 +111,18 @@ class NearbyVoiceTransport(
     }
 
     /**
+     * Перестраивает compact node id index из полного списка участников Star-комнаты.
+     */
+    override fun updateRoomPeers(peerIds: Set<PeerId>) {
+        val collisions = peerIndex.replacePeers(peerIds)
+        if (collisions.isNotEmpty()) {
+            Log.e(TAG, "[updateRoomPeers] Обнаружены коллизии compact voice node id nodeIds=$collisions peerCount=${peerIds.size}")
+        } else {
+            Log.i(TAG, "[updateRoomPeers] Compact voice peer index обновлен peerCount=${peerIds.size}")
+        }
+    }
+
+    /**
      * Проверяет, есть ли linkId для каждого peerId.
      */
     override fun isReadyForPeers(peerIds: Set<PeerId>): Boolean {
@@ -104,18 +140,30 @@ class NearbyVoiceTransport(
     }
 
     /**
-     * Декодирует BTVO bytes и пропускает все остальные сообщения соседского транспорта.
+     * Декодирует только compact Star bytes и восстанавливает полный originPeerId из индекса комнаты.
      */
     private fun handleMessageReceived(event: NeighborTransportEvent.MessageReceived) {
-        if (!VoiceFrameCodec.isVoiceFrame(event.bytes)) {
+        if (!voicePacketCodec.isVoicePacket(event.bytes)) {
             return
         }
-        val frame = runCatching { VoiceFrameCodec.decode(event.bytes) }
+        val packet = runCatching { voicePacketCodec.decode(event.bytes) }
             .onFailure { cause ->
-                Log.w(TAG, "[handleMessageReceived] Не удалось декодировать voice frame linkId=${event.linkId.value} bytes=${event.bytes.size}: ${cause.message}", cause)
+                Log.w(TAG, "[handleMessageReceived] Не удалось декодировать compact Star voice frame linkId=${event.linkId.value} bytes=${event.bytes.size}: ${cause.message}", cause)
             }
             .getOrNull()
             ?: return
+        val originPeerId = peerIndex.peerIdFor(packet.originNodeId)
+        if (originPeerId == null) {
+            Log.w(TAG, "[handleMessageReceived] Compact Star voice origin неизвестен или имеет коллизию nodeId=${packet.originNodeId} linkId=${event.linkId.value}")
+            return
+        }
+        val frame = VoiceFrame(
+            originPeerId = originPeerId,
+            sessionId = packet.pttSessionId,
+            sequence = packet.sequence.toLong(),
+            encodedBytes = packet.encodedBytes,
+            isFinal = packet.isFinal,
+        )
         emitEvent(
             VoiceTransportEvent.FrameReceived(
                 transportPeerId = peerLinkResolver.peerIdForLink(event.linkId),
@@ -137,5 +185,6 @@ class NearbyVoiceTransport(
     private companion object {
         private const val TAG = "NearbyVoiceTransport"
         private const val EVENT_BUFFER_CAPACITY = 64
+        private const val STAR_VOICE_TTL = 0
     }
 }

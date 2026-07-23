@@ -10,6 +10,7 @@ import java.io.Closeable
 import java.io.InputStream
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -17,7 +18,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Проигрывает входящие PCM16 голосовые streams через AudioTrack в media-routing короткими порциями для громкой связи.
+ * Проигрывает PCM16 голос через low-latency AudioTrack порциями и буферами текущего room voice-профиля.
  */
 class PcmVoicePlayer(
     private val externalScope: CoroutineScope,
@@ -25,17 +26,23 @@ class PcmVoicePlayer(
     private val activePlayers = ConcurrentHashMap<PeerId, ActivePlayer>()
 
     /**
-     * Запускает воспроизведение входящего stream от указанного участника и вызывает callback после закрытия player-а.
+     * Запускает воспроизведение участника с room-profile и не дает завершению старого player-а удалить новый.
      */
-    fun play(peerId: PeerId, inputStream: InputStream, onFinished: (PeerId) -> Unit) {
+    fun play(
+        peerId: PeerId,
+        inputStream: InputStream,
+        profile: VoiceAudioProfile,
+        onFinished: (PeerId) -> Unit,
+    ) {
         stop(peerId)
         val minBufferSize = AudioTrack.getMinBufferSize(
             PcmVoiceConfig.SAMPLE_RATE_HZ,
             AudioFormat.CHANNEL_OUT_MONO,
             PcmVoiceConfig.AUDIO_FORMAT,
         )
-        val playChunkBytes = PcmVoiceConfig.FRAME_BYTES * PLAY_CHUNK_FRAME_COUNT
-        val playBufferSize = maxOf(minBufferSize, PcmVoiceConfig.FRAME_BYTES * PLAY_BUFFER_FRAME_COUNT)
+        val frameBytes = PcmVoiceConfig.frameBytes(profile)
+        val playChunkBytes = frameBytes * PLAY_CHUNK_FRAME_COUNT
+        val playBufferSize = maxOf(minBufferSize, frameBytes * PLAY_BUFFER_FRAME_COUNT)
         val audioTrackBuilder = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -57,7 +64,8 @@ class PcmVoicePlayer(
         }
         val audioTrack = audioTrackBuilder.build()
 
-        val job = externalScope.launch(Dispatchers.IO) {
+        lateinit var activePlayer: ActivePlayer
+        val job = externalScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
             val buffer = ByteArray(playChunkBytes)
             val playStartedAtMillis = System.currentTimeMillis()
             var firstReadLogged = false
@@ -66,7 +74,7 @@ class PcmVoicePlayer(
             var writtenFrames = 0L
             runCatching {
                 audioTrack.play()
-                Log.i(TAG, "[play] Воспроизведение голосового stream запущено usage=MEDIA peerId=${peerId.value} bufferBytes=$playBufferSize readChunkBytes=$playChunkBytes")
+                Log.i(TAG, "[play] Воспроизведение голосового stream запущено usage=MEDIA peerId=${peerId.value} frameMs=${profile.frameDuration.millis} bufferBytes=$playBufferSize readChunkBytes=$playChunkBytes")
                 while (isActive) {
                     val readBytes = inputStream.read(buffer)
                     if (readBytes < 0) {
@@ -104,11 +112,13 @@ class PcmVoicePlayer(
             }
             releaseAudioTrack(audioTrack)
             runCatching { inputStream.close() }
-            activePlayers.remove(peerId)
+            activePlayers.remove(peerId, activePlayer)
             Log.i(TAG, "[play] Воспроизведение голосового stream остановлено peerId=${peerId.value}")
             onFinished(peerId)
         }
-        activePlayers[peerId] = ActivePlayer(inputStream, audioTrack, job)
+        activePlayer = ActivePlayer(inputStream, audioTrack, job)
+        activePlayers[peerId] = activePlayer
+        job.start()
     }
 
     /**

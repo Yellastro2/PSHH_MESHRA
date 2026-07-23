@@ -16,6 +16,10 @@ import com.yellastro.btration.domain.transport.NeighborLinkId
 import com.yellastro.btration.domain.transport.NeighborTopology
 import com.yellastro.btration.domain.transport.NeighborTransport
 import com.yellastro.btration.domain.transport.NeighborTransportEvent
+import com.yellastro.btration.voice.CompactVoiceNodeId
+import com.yellastro.btration.voice.CompactVoicePacket
+import com.yellastro.btration.voice.CompactVoicePacketCodec
+import com.yellastro.btration.voice.VoiceAudioProfile
 import com.yellastro.btration.voice.VoiceFrame
 import com.yellastro.btration.voice.VoiceTransportMode
 import java.util.LinkedHashSet
@@ -32,8 +36,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Mesh-слой поверх Cluster topology NeighborTransport: flood-ит room events/voice и меряет здоровье только тех
- * прямых link-ов, которые явно подтверждены как MESHRA-соединения.
+ * Mesh-слой поверх Cluster topology: flood-ит room/voice meta и меряет здоровье только явно подтвержденных MESHRA-link-ов.
  *
  * Runtime включает этот слой для MESHRA-комнат; Nearby Star продолжает работать через обычный RoomTransport.
  */
@@ -41,7 +44,7 @@ class MeshTransport(
     private val selfPeerId: PeerId,
     private val neighborTransport: NeighborTransport,
     private val codec: MeshCodec,
-    private val voicePacketCodec: MeshVoicePacketCodec,
+    private val voicePacketCodec: CompactVoicePacketCodec,
     private val externalScope: CoroutineScope,
     private val maxTtl: Int = DEFAULT_TTL,
     private val acceptIncomingConnections: Boolean = true,
@@ -57,10 +60,7 @@ class MeshTransport(
     private val roomSnapshots = mutableMapOf<RoomId, MeshRoomSnapshot>()
     private val roomVoicePeerIndexes = mutableMapOf<RoomId, Map<Int, PeerId?>>()
     private val advertisingLock = Any()
-    private val voiceSessionLock = Any()
     private var advertisedEndpointName: String? = null
-    private var nextLocalVoiceSessionId = 0
-    private var activeLocalVoiceSessionId: Int? = null
     private val _events = MutableSharedFlow<MeshTransportEvent>(extraBufferCapacity = EVENT_BUFFER_CAPACITY)
     private val _rooms = MutableStateFlow<Map<RoomId, MeshRoomSnapshot>>(emptyMap())
     private val _directPeerIds = MutableStateFlow<Set<PeerId>>(emptySet())
@@ -205,7 +205,6 @@ class MeshTransport(
         linkRoomIds.clear()
         ignoredNonMeshPayloadLinks.clear()
         seenVoiceFrameKeys.clear()
-        clearLocalVoiceSession()
         clearLinkHealth()
         publishDirectPeerIds()
         Log.i(TAG, "[disconnectAll] Все mesh link-и разорваны")
@@ -224,7 +223,6 @@ class MeshTransport(
         ignoredNonMeshPayloadLinks.clear()
         seenEventIds.clear()
         seenVoiceFrameKeys.clear()
-        clearLocalVoiceSession()
         roomSnapshots.clear()
         roomVoicePeerIndexes.clear()
         clearLinkHealth()
@@ -246,6 +244,7 @@ class MeshTransport(
         member: Peer,
         roomTransportMode: RoomTransportMode = RoomTransportMode.MESHRA,
         voiceTransportMode: VoiceTransportMode = VoiceTransportMode.WIFI_DIRECT_UDP,
+        voiceAudioProfile: VoiceAudioProfile = VoiceAudioProfile(),
         isDirectAudioReady: Boolean = false,
     ) {
         publishEvent(
@@ -256,6 +255,7 @@ class MeshTransport(
                 knownHost = knownHost,
                 roomTransportMode = roomTransportMode,
                 voiceTransportMode = voiceTransportMode,
+                voiceAudioProfile = voiceAudioProfile,
                 isDirectAudioReady = isDirectAudioReady,
                 authorPeerId = selfPeerId,
                 type = MeshRoomEventType.MEMBER_JOINED,
@@ -275,6 +275,7 @@ class MeshTransport(
         member: Peer,
         roomTransportMode: RoomTransportMode = RoomTransportMode.MESHRA,
         voiceTransportMode: VoiceTransportMode = VoiceTransportMode.WIFI_DIRECT_UDP,
+        voiceAudioProfile: VoiceAudioProfile = VoiceAudioProfile(),
         isDirectAudioReady: Boolean = false,
     ) {
         publishEvent(
@@ -285,6 +286,7 @@ class MeshTransport(
                 knownHost = knownHost,
                 roomTransportMode = roomTransportMode,
                 voiceTransportMode = voiceTransportMode,
+                voiceAudioProfile = voiceAudioProfile,
                 isDirectAudioReady = isDirectAudioReady,
                 authorPeerId = selfPeerId,
                 type = MeshRoomEventType.MEMBER_LEFT,
@@ -304,6 +306,7 @@ class MeshTransport(
         peer: Peer,
         roomTransportMode: RoomTransportMode = RoomTransportMode.MESHRA,
         voiceTransportMode: VoiceTransportMode = VoiceTransportMode.WIFI_DIRECT_UDP,
+        voiceAudioProfile: VoiceAudioProfile = VoiceAudioProfile(),
         isDirectAudioReady: Boolean = false,
     ) {
         publishEvent(
@@ -314,6 +317,7 @@ class MeshTransport(
                 knownHost = knownHost,
                 roomTransportMode = roomTransportMode,
                 voiceTransportMode = voiceTransportMode,
+                voiceAudioProfile = voiceAudioProfile,
                 isDirectAudioReady = isDirectAudioReady,
                 authorPeerId = selfPeerId,
                 type = MeshRoomEventType.PEER_DISCONNECTED,
@@ -333,6 +337,7 @@ class MeshTransport(
         message: ChatMessage,
         roomTransportMode: RoomTransportMode = RoomTransportMode.MESHRA,
         voiceTransportMode: VoiceTransportMode = VoiceTransportMode.WIFI_DIRECT_UDP,
+        voiceAudioProfile: VoiceAudioProfile = VoiceAudioProfile(),
         isDirectAudioReady: Boolean = false,
     ) {
         publishEvent(
@@ -343,6 +348,7 @@ class MeshTransport(
                 knownHost = knownHost,
                 roomTransportMode = roomTransportMode,
                 voiceTransportMode = voiceTransportMode,
+                voiceAudioProfile = voiceAudioProfile,
                 isDirectAudioReady = isDirectAudioReady,
                 authorPeerId = selfPeerId,
                 type = MeshRoomEventType.CHAT_MESSAGE,
@@ -361,16 +367,15 @@ class MeshTransport(
             Log.w(TAG, "[publishVoiceFrame] Voice frame отброшен: sequence не помещается в UInt16 roomId=${roomId.value} sequence=${frame.sequence}")
             return
         }
-        val originNodeId = MeshVoiceNodeId.fromPeerIdValue(frame.originPeerId.value)
+        val originNodeId = CompactVoiceNodeId.fromPeerIdValue(frame.originPeerId.value)
         val resolvedOriginPeerId = resolveOriginPeerId(roomId, originNodeId)
         if (resolvedOriginPeerId != frame.originPeerId) {
             Log.e(TAG, "[publishVoiceFrame] Voice frame отброшен: короткий origin node id не разрешился однозначно roomId=${roomId.value} originPeerId=${frame.originPeerId.value} originNodeId=$originNodeId")
             return
         }
-        val sessionId = localVoiceSessionId(frame)
-        val packet = MeshVoicePacket(
+        val packet = CompactVoicePacket(
             originNodeId = originNodeId,
-            pttSessionId = sessionId,
+            pttSessionId = frame.sessionId,
             sequence = sequence,
             encodedBytes = frame.encodedBytes,
             isFinal = frame.isFinal,
@@ -383,7 +388,7 @@ class MeshTransport(
             incomingLinkId = null,
         )
         if (frame.sequence == FIRST_VOICE_FRAME_SEQUENCE || frame.isFinal) {
-            Log.i(TAG, "[publishVoiceFrame] Компактный mesh voice frame опубликован roomId=${roomId.value} originNodeId=${packet.originNodeId} sessionId=${packet.pttSessionId} sequence=${packet.sequence} final=${packet.isFinal} packetBytes=${packet.encodedBytes.size + MeshVoicePacketCodec.HEADER_SIZE}")
+            Log.i(TAG, "[publishVoiceFrame] Компактный mesh voice frame опубликован roomId=${roomId.value} originNodeId=${packet.originNodeId} sessionId=${packet.pttSessionId} sequence=${packet.sequence} final=${packet.isFinal} packetBytes=${packet.encodedBytes.size + CompactVoicePacketCodec.HEADER_SIZE}")
         }
     }
 
@@ -818,6 +823,7 @@ class MeshTransport(
                 roomId = roomId,
                 frame = VoiceFrame(
                     originPeerId = originPeerId,
+                    sessionId = packet.pttSessionId,
                     sequence = packet.sequence.toLong(),
                     encodedBytes = packet.encodedBytes,
                     isFinal = packet.isFinal,
@@ -896,7 +902,7 @@ class MeshTransport(
      */
     private fun floodVoicePacket(
         roomId: RoomId,
-        packet: MeshVoicePacket,
+        packet: CompactVoicePacket,
         incomingLinkId: NeighborLinkId?,
     ) {
         if (packet.ttl < 0) {
@@ -945,6 +951,7 @@ class MeshTransport(
             knownHost = event.knownHost,
             roomTransportMode = event.roomTransportMode,
             voiceTransportMode = event.voiceTransportMode,
+            voiceAudioProfile = event.voiceAudioProfile,
             isDirectAudioReady = event.isDirectAudioReady,
             members = listOf(event.knownHost),
             updatedAtMillis = event.createdAtMillis,
@@ -959,6 +966,7 @@ class MeshTransport(
             knownHost = event.knownHost,
             roomTransportMode = event.roomTransportMode,
             voiceTransportMode = event.voiceTransportMode,
+            voiceAudioProfile = event.voiceAudioProfile,
             isDirectAudioReady = event.isDirectAudioReady,
             members = nextMembers,
             messages = nextMessages,
@@ -1112,7 +1120,7 @@ class MeshTransport(
     /**
      * Запоминает составной ключ origin/session/sequence в ограниченном LRU-подобном cache и возвращает false для дублей.
      */
-    private fun rememberVoiceFrame(packet: MeshVoicePacket): Boolean {
+    private fun rememberVoiceFrame(packet: CompactVoicePacket): Boolean {
         val frameKey = voiceFrameKey(packet)
         if (!seenVoiceFrameKeys.add(frameKey)) {
             return false
@@ -1127,7 +1135,7 @@ class MeshTransport(
     /**
      * Упаковывает три UInt16 поля voice-пакета в один Long без дополнительных объектов на каждый frame.
      */
-    private fun voiceFrameKey(packet: MeshVoicePacket): Long {
+    private fun voiceFrameKey(packet: CompactVoicePacket): Long {
         return (packet.originNodeId.toLong() shl ORIGIN_KEY_SHIFT) or
             (packet.pttSessionId.toLong() shl SESSION_KEY_SHIFT) or
             packet.sequence.toLong()
@@ -1165,7 +1173,7 @@ class MeshTransport(
         }
         val index = mutableMapOf<Int, PeerId?>()
         peerIds.forEach { peerId ->
-            val nodeId = MeshVoiceNodeId.fromPeerIdValue(peerId.value)
+            val nodeId = CompactVoiceNodeId.fromPeerIdValue(peerId.value)
             val previousPeerId = index[nodeId]
             if (nodeId !in index) {
                 index[nodeId] = peerId
@@ -1175,32 +1183,6 @@ class MeshTransport(
             }
         }
         roomVoicePeerIndexes[roomId] = index
-    }
-
-    /**
-     * Назначает один UInt16 session id всем frame-ам текущего PTT и освобождает его после final frame-а.
-     */
-    private fun localVoiceSessionId(frame: VoiceFrame): Int {
-        return synchronized(voiceSessionLock) {
-            if (frame.sequence == FIRST_VOICE_FRAME_SEQUENCE || activeLocalVoiceSessionId == null) {
-                activeLocalVoiceSessionId = nextLocalVoiceSessionId
-                nextLocalVoiceSessionId = (nextLocalVoiceSessionId + 1) and UNSIGNED_SHORT_MASK
-            }
-            val sessionId = requireNotNull(activeLocalVoiceSessionId)
-            if (frame.isFinal) {
-                activeLocalVoiceSessionId = null
-            }
-            sessionId
-        }
-    }
-
-    /**
-     * Сбрасывает локальную PTT-сессию при остановке transport-а, не откатывая счетчик session id.
-     */
-    private fun clearLocalVoiceSession() {
-        synchronized(voiceSessionLock) {
-            activeLocalVoiceSessionId = null
-        }
     }
 
     /**

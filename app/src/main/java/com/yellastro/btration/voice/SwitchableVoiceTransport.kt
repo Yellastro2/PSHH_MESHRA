@@ -10,7 +10,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 
 /**
- * VoiceTransport-обертка, которая выбирает реальный media-plane перед стартом комнаты по meta host-а.
+ * VoiceTransport-обертка, которая выбирает media-plane по meta host-а и переносит в delegate индекс участников.
  *
  * Делегат создается лениво: пока режим комнаты не применен и media-plane не стартует,
  * Wi-Fi Direct/Nearby реализация не должна регистрировать свои callbacks и трогать систему.
@@ -25,6 +25,7 @@ class SwitchableVoiceTransport(
 
     private var currentMode = initialMode
     private var currentDelegate: VoiceTransport? = null
+    private var currentRoomPeerIds: Set<PeerId> = emptySet()
 
     /**
      * События только от текущего выбранного voice transport delegate.
@@ -38,7 +39,7 @@ class SwitchableVoiceTransport(
         get() = currentDelegate?.localControlInfo
 
     /**
-     * Выбирает реальный voice transport для следующей media-plane сессии без раннего создания delegate.
+     * Выбирает voice transport и передает актуальный peer-index уже созданному delegate без раннего создания нового.
      */
     fun setMode(mode: VoiceTransportMode, reason: String) {
         if (mode == currentMode) {
@@ -48,6 +49,7 @@ class SwitchableVoiceTransport(
         currentDelegate?.stopSession()
         currentMode = mode
         currentDelegate = delegates[mode]
+        currentDelegate?.updateRoomPeers(currentRoomPeerIds)
         Log.i(TAG, "[setMode] Voice transport переключен mode=$mode reason=$reason delegateReused=${currentDelegate != null}")
     }
 
@@ -79,6 +81,15 @@ class SwitchableVoiceTransport(
     }
 
     /**
+     * Кэширует полный набор участников и обновляет уже созданный delegate без принудительной ленивой инициализации.
+     */
+    override fun updateRoomPeers(peerIds: Set<PeerId>) {
+        currentRoomPeerIds = peerIds.toSet()
+        currentDelegate?.updateRoomPeers(currentRoomPeerIds)
+        Log.i(TAG, "[updateRoomPeers] Индекс участников voice transport обновлен peerCount=${currentRoomPeerIds.size} mode=$currentMode")
+    }
+
+    /**
      * Проверяет готовность участников в текущем выбранном delegate.
      */
     override fun isReadyForPeers(peerIds: Set<PeerId>): Boolean {
@@ -98,11 +109,12 @@ class SwitchableVoiceTransport(
     }
 
     /**
-     * Создает delegate лениво и подписывает общий events-flow только на актуальный delegate.
+     * Создает delegate лениво, передает ему индекс участников и подписывает общий events-flow.
      */
     private fun delegateFor(mode: VoiceTransportMode): VoiceTransport {
         return delegates.getOrPut(mode) {
             createDelegate(mode).also { delegate ->
+                delegate.updateRoomPeers(currentRoomPeerIds)
                 externalScope.launch {
                     delegate.events.collect { event ->
                         if (delegate === currentDelegate) {

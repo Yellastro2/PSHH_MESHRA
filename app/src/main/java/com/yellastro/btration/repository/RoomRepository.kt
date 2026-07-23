@@ -7,14 +7,15 @@ import com.yellastro.btration.domain.model.RoomTransportMode
 import com.yellastro.btration.domain.runtime.RoomRuntime
 import com.yellastro.btration.domain.runtime.RoomRuntimeState
 import com.yellastro.btration.service.RoomServiceController
+import com.yellastro.btration.voice.VoiceAudioProfile
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
- * Фасад комнаты для ViewModel и foreground service: прокидывает discovery-циклы, команды комнаты,
- * чат, общее локальное состояние микрофона, mesh-connect статусы и ping-состояния в runtime.
+ * Фасад комнаты для ViewModel и foreground service: прокидывает discovery, создание с voice-профилем,
+ * команды комнаты, чат, состояние микрофона, mesh-connect статусы и ping в runtime.
  */
 class RoomRepository(
     private val roomRuntime: RoomRuntime,
@@ -106,11 +107,18 @@ class RoomRepository(
     }
 
     /**
-     * Создает комнату с выбранным типом room transport и поднимает foreground-обвязку для активного состояния.
+     * Создает комнату с выбранными room transport и voice-профилем и поднимает foreground-обвязку.
      */
-    suspend fun createRoom(name: String, roomTransportMode: RoomTransportMode) {
-        Log.i(TAG, "[createRoom] Создаем комнату через RoomRepository name=$name roomTransportMode=$roomTransportMode")
-        roomRuntime.createRoom(name, roomTransportMode)
+    suspend fun createRoom(
+        name: String,
+        roomTransportMode: RoomTransportMode,
+        voiceAudioProfile: VoiceAudioProfile,
+    ) {
+        Log.i(
+            TAG,
+            "[createRoom] Создаем комнату через RoomRepository name=$name roomTransportMode=$roomTransportMode frameMs=${voiceAudioProfile.frameDuration.millis}",
+        )
+        roomRuntime.createRoom(name, roomTransportMode, voiceAudioProfile)
         roomServiceController.startIfNeeded(roomRuntime.state.value.needsService())
         Log.i(TAG, "[createRoom] Создание комнаты обработано state=${roomRuntime.state.value.javaClass.simpleName}")
     }

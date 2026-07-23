@@ -25,7 +25,7 @@
 - `RoomTransport` сидит поверх `NeighborTransport`: кодирует/декодирует `WirePacket`, готовит/читает `NearbyRoomAdvertisement`, автоматически принимает нижнее connection request и публикует `RoomTransportEvent` для `RoomRuntime`.
 - `MeshTransport` тоже сидит поверх того же `NeighborTransport`: управляющие JSON payload-ы имеют сигнатуру `BTME1\n`, компактные бинарные MESHRA voice DATA-пакеты — двухбайтовую сигнатуру `MV`, а gateway-реклама — `BTM4`. В `AppContainer` прямой accept у `MeshTransport` выключен, чтобы не принимать один Nearby request двумя слоями; общий accept выполняет `RoomTransport`.
 - Ignore-list для MESHRA применяется к gateway из `BTM4`, а не к known host комнаты. `RoomTransport` получает predicate `shouldAcceptConnection(...)` и отклоняет входящий request, если endpointName распознается как реклама ignored gateway.
-- `NearbyVoiceTransport` сидит рядом с `RoomTransport` поверх того же `NeighborTransport`: он читает только BYTES с сигнатурой `BTVO`, а все room/control сообщения игнорирует.
+- `NearbyVoiceTransport` сидит рядом с `RoomTransport` поверх того же `NeighborTransport`: он читает только compact Star BYTES с сигнатурой `SV`, а все room/control сообщения игнорирует.
 - Ошибка отправки BYTES/STREAM возвращается callback-ом конкретному вызывающему слою, а не широковещательным event-ом: иначе voice send failure мог бы случайно превратиться в room packet failure.
 - Частые voice BYTES отправляются через `NeighborTransport.sendMessage(..., isRealtime=true)`: `NearbyPayloadTransport` не пишет `Log.i` на каждый успешный frame, а агрегирует успешные realtime-отправки примерно раз в секунду. Ошибки отправки realtime payload-а логируются сразу.
 - Nearby lifecycle callbacks считаются только нижним статусом физического endpoint-а. Для MESHRA этого мало: endpoint может числиться connected, пока Google Play services держит внутреннюю очередь payload-ов. Поэтому `MeshTransport` отдельно шлет четырехбайтовые heartbeat `PING/PONG` поверх BYTES и считает RTT/потери на app-level. Heartbeat запускается только для подтвержденных mesh link-ов: исходящих gateway-connect-ов или входящих link-ов, где уже пришел валидный mesh envelope.
@@ -37,11 +37,12 @@
 
 ## BYTES payload для MVP-голоса
 
-- Актуальный PTT-голос отправляется короткими `Payload.fromBytes(...)` фреймами формата `BTVO`.
+- Актуальный PTT-голос отправляется короткими `Payload.fromBytes(...)` пакетами `SV` через общий `CompactVoicePacketCodec`.
 - Nearby-реализация голоса изолирована в `NearbyVoiceTransport`, а `VoiceRuntime` работает через общий `VoiceTransport`.
 - В режиме `WIFI_DIRECT_UDP` Nearby больше не несет аудио, но продолжает передавать `JOIN_ACCEPTED` с полным `RoomInfo.host.peerId` и `VOICE_TRANSPORT_INFO` для запуска Wi-Fi Direct handshake.
 - Реальный Wi-Fi Direct `deviceAddress` не передается через Nearby: client находит host-а через DNS-SD TXT `hostPeerId=<RoomInfo.host.peerId>` и берет адрес из `srcDevice.deviceAddress`.
-- Один фрейм несет `originPeerId`, `sequence`, признак `isFinal` и Opus packet примерно на 40 ms речи.
+- Девятибайтовый header несет короткий `originNodeId`, `pttSessionId`, UInt16 `sequence`, `isFinal` и TTL; полный `PeerId` восстанавливается из актуального списка участников комнаты.
+- Один Opus packet содержит выбранные создателем комнаты `10`, `20` или `40 мс` речи. Профиль приходит в полном `RoomInfo`, поэтому короткую discovery-визитку расширять не нужно.
 - На говорящем устройстве `AudioRecord` дает PCM16 mono 16 kHz, затем `OpusVoiceEncoder` кодирует его в Opus.
 - На слушающем устройстве `OpusVoiceDecoder` декодирует Opus обратно в PCM16 перед `PcmVoicePlayer` / `AudioTrack`.
 - Host при получении frame проверяет, что `originPeerId == directPeerId`, ретранслирует сжатый Opus-frame остальным участникам без decode/re-encode, а для собственного динамика декодирует отдельной локальной веткой.

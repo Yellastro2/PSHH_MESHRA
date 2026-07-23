@@ -23,6 +23,7 @@ import com.yellastro.btration.domain.util.IdGenerator
 import com.yellastro.btration.repository.ProfileRepository
 import com.yellastro.btration.repository.VoiceSettingsRepository
 import com.yellastro.btration.voice.SwitchableVoiceTransport
+import com.yellastro.btration.voice.VoiceAudioProfile
 import com.yellastro.btration.voice.VoiceFrame
 import com.yellastro.btration.voice.VoiceTransportEvent
 import com.yellastro.btration.voice.VoiceRuntime
@@ -44,7 +45,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
- * Рабочая машина комнаты: ведет чередующийся lobby discovery, topology-aware Star/MESHRA connect, mesh-статусы, чат, PTT и media-plane.
+ * Рабочая машина комнаты: ведет discovery/connect, meta voice-профиля, Star/MESHRA, чат, PTT и media-plane.
  */
 class RoomRuntime(
     private val profileRepository: ProfileRepository,
@@ -205,10 +206,17 @@ class RoomRuntime(
     }
 
     /**
-     * Создает локальную комнату, фиксирует выбранный room transport и запускает room advertising.
+     * Создает локальную комнату с выбранным voice-профилем и запускает соответствующий transport.
      */
-    suspend fun createRoom(name: String, roomTransportMode: RoomTransportMode) {
-        Log.i(TAG, "[createRoom] Команда создать комнату name=$name roomTransportMode=$roomTransportMode currentState=${_state.value.javaClass.simpleName}")
+    suspend fun createRoom(
+        name: String,
+        roomTransportMode: RoomTransportMode,
+        voiceAudioProfile: VoiceAudioProfile,
+    ) {
+        Log.i(
+            TAG,
+            "[createRoom] Команда создать комнату name=$name roomTransportMode=$roomTransportMode frameMs=${voiceAudioProfile.frameDuration.millis} currentState=${_state.value.javaClass.simpleName}",
+        )
         when (_state.value) {
             is RoomRuntimeState.Hosting -> {
                 Log.w(TAG, "[createRoom] Создание отклонено, устройство уже хостит комнату")
@@ -231,7 +239,7 @@ class RoomRuntime(
         }
 
         if (roomTransportMode == RoomTransportMode.MESHRA) {
-            createMeshRoom(name)
+            createMeshRoom(name, voiceAudioProfile)
             return
         }
 
@@ -247,7 +255,9 @@ class RoomRuntime(
             createdAtMillis = now(),
             roomTransportMode = roomTransportMode,
             voiceTransportMode = voiceTransportMode,
+            voiceAudioProfile = voiceAudioProfile,
         )
+        configureVoiceSession(room, listOf(self))
         _messages.value = emptyList()
         _state.value = RoomRuntimeState.Hosting(room = room, members = listOf(self))
         voiceTransport.startSession(self.peerId, VoiceTransportSessionRole.HOST)
@@ -256,9 +266,9 @@ class RoomRuntime(
     }
 
     /**
-     * Создает MESHRA-комнату: локально публикует MEMBER_JOINED, запускает mesh-рекламу gateway и не поднимает voice media-plane.
+     * Создает MESHRA-комнату с voice-профилем, публикует MEMBER_JOINED и запускает gateway-рекламу.
      */
-    private fun createMeshRoom(name: String) {
+    private fun createMeshRoom(name: String, voiceAudioProfile: VoiceAudioProfile) {
         roomTransport.stopDiscovery()
         meshTransport.stopDiscovery()
         val self = profileRepository.getSelfPeer()
@@ -270,8 +280,10 @@ class RoomRuntime(
             createdAtMillis = now(),
             roomTransportMode = RoomTransportMode.MESHRA,
             voiceTransportMode = voiceTransportMode,
+            voiceAudioProfile = voiceAudioProfile,
             isDirectAudioReady = false,
         )
+        configureVoiceSession(room, listOf(self))
         activateRoomTransportMode(room.roomTransportMode, reason = "create_mesh_room")
         voiceRuntime.stopAll()
         voiceTransport.stopSession()
@@ -288,6 +300,7 @@ class RoomRuntime(
             member = self,
             roomTransportMode = room.roomTransportMode,
             voiceTransportMode = room.voiceTransportMode,
+            voiceAudioProfile = room.voiceAudioProfile,
             isDirectAudioReady = room.isDirectAudioReady,
         )
         advertiseMeshSnapshot(room.roomId, self)
@@ -1120,6 +1133,7 @@ class RoomRuntime(
         val self = profileRepository.getSelfPeer()
         val room = roomInfoFromMeshSnapshot(snapshot)
         val members = mergeMember(snapshot.members, self)
+        configureVoiceSession(room, members)
         _messages.value = snapshot.messages
         _state.value = RoomRuntimeState.Client(
             room = room,
@@ -1135,6 +1149,7 @@ class RoomRuntime(
             member = self,
             roomTransportMode = room.roomTransportMode,
             voiceTransportMode = room.voiceTransportMode,
+            voiceAudioProfile = room.voiceAudioProfile,
             isDirectAudioReady = room.isDirectAudioReady,
         )
         advertiseMeshSnapshot(room.roomId, self)
@@ -1154,6 +1169,7 @@ class RoomRuntime(
                 if (currentState.room.roomTransportMode != RoomTransportMode.MESHRA || currentState.room.roomId != roomId) {
                     return
                 }
+                configureVoiceSession(room, snapshot.members)
                 _messages.value = snapshot.messages
                 _state.value = currentState.copy(
                     room = room,
@@ -1170,6 +1186,7 @@ class RoomRuntime(
                 if (currentState.room.roomTransportMode != RoomTransportMode.MESHRA || currentState.room.roomId != roomId) {
                     return
                 }
+                configureVoiceSession(room, snapshot.members)
                 _messages.value = snapshot.messages
                 _state.value = currentState.copy(
                     room = room,
@@ -1558,6 +1575,7 @@ class RoomRuntime(
         when (val currentState = _state.value) {
             is RoomRuntimeState.Hosting -> {
                 val members = currentState.members.filterNot { it.peerId == peerId }
+                configureVoiceSession(currentState.room, members)
                 _state.value = currentState.copy(members = members)
                 Log.i(TAG, "[handleDisconnected] Host обновил список участников memberCount=${members.size}")
                 broadcastMemberList(currentState.room, members)
@@ -1648,6 +1666,7 @@ class RoomRuntime(
         }
 
         val members = mergeMember(currentState.members, joiningPeer)
+        configureVoiceSession(currentState.room, members)
         _state.value = currentState.copy(members = members)
         Log.i(TAG, "[handleJoinRequest] Участник принят peerId=${joiningPeer.peerId.value} roomId=${currentState.room.roomId.value} memberCount=${members.size}")
 
@@ -1696,7 +1715,9 @@ class RoomRuntime(
             return
         }
         replaceAdvertisedRoomMappingIfNeeded(advertisedRoom = currentState.room, realRoom = room)
-        _state.value = RoomRuntimeState.Client(room = room, members = listOf(room.host, profileRepository.getSelfPeer()))
+        val members = listOf(room.host, profileRepository.getSelfPeer())
+        configureVoiceSession(room, members)
+        _state.value = RoomRuntimeState.Client(room = room, members = members)
         clearConnectionRecovery()
         activateRoomTransportMode(room.roomTransportMode, reason = "join_accepted")
         voiceTransport.setMode(room.voiceTransportMode, reason = "join_accepted")
@@ -1749,6 +1770,7 @@ class RoomRuntime(
             return
         }
         val updatedRoom = packet.roomInfo ?: currentState.room
+        configureVoiceSession(updatedRoom, packet.members)
         _state.value = currentState.copy(room = updatedRoom, members = packet.members)
         Log.i(
             TAG,
@@ -1766,7 +1788,9 @@ class RoomRuntime(
             Log.w(TAG, "[handleMemberJoined] MEMBER_JOINED не для текущей комнаты packetRoomId=${packet.roomId?.value} currentRoomId=${currentState.room.roomId.value}")
             return
         }
-        _state.value = currentState.copy(members = mergeMember(currentState.members, peer))
+        val members = mergeMember(currentState.members, peer)
+        configureVoiceSession(currentState.room, members)
+        _state.value = currentState.copy(members = members)
         Log.i(TAG, "[handleMemberJoined] Участник добавлен peerId=${peer.peerId.value}")
     }
 
@@ -1783,6 +1807,7 @@ class RoomRuntime(
                     return
                 }
                 val members = currentState.members.filterNot { it.peerId == peerId }
+                configureVoiceSession(currentState.room, members)
                 _state.value = currentState.copy(members = members)
                 Log.i(TAG, "[handleMemberLeft] Host убрал участника peerId=${peerId.value} memberCount=${members.size}")
                 broadcastMemberList(currentState.room, members)
@@ -1793,7 +1818,9 @@ class RoomRuntime(
                     Log.w(TAG, "[handleMemberLeft] MEMBER_LEFT не для client-комнаты packetRoomId=${packet.roomId?.value} currentRoomId=${currentState.room.roomId.value}")
                     return
                 }
-                _state.value = currentState.copy(members = currentState.members.filterNot { it.peerId == peerId })
+                val members = currentState.members.filterNot { it.peerId == peerId }
+                configureVoiceSession(currentState.room, members)
+                _state.value = currentState.copy(members = members)
                 Log.i(TAG, "[handleMemberLeft] Client убрал участника peerId=${peerId.value}")
             }
 
@@ -2014,6 +2041,7 @@ class RoomRuntime(
             message = message,
             roomTransportMode = room.roomTransportMode,
             voiceTransportMode = room.voiceTransportMode,
+            voiceAudioProfile = room.voiceAudioProfile,
             isDirectAudioReady = room.isDirectAudioReady,
         )
         Log.i(TAG, "[sendMeshMessage] MESHRA-сообщение опубликовано roomId=${room.roomId.value} messageId=${message.messageId.value} textLength=${text.length}")
@@ -2030,6 +2058,7 @@ class RoomRuntime(
             member = peer,
             roomTransportMode = room.roomTransportMode,
             voiceTransportMode = room.voiceTransportMode,
+            voiceAudioProfile = room.voiceAudioProfile,
             isDirectAudioReady = room.isDirectAudioReady,
         )
         Log.i(TAG, "[publishMeshMemberLeft] MESHRA MEMBER_LEFT опубликован roomId=${room.roomId.value} peerId=${peer.peerId.value}")
@@ -2066,6 +2095,7 @@ class RoomRuntime(
             createdAtMillis = snapshot.updatedAtMillis,
             roomTransportMode = snapshot.roomTransportMode,
             voiceTransportMode = snapshot.voiceTransportMode,
+            voiceAudioProfile = snapshot.voiceAudioProfile,
             isDirectAudioReady = snapshot.isDirectAudioReady,
         )
     }
@@ -2210,6 +2240,7 @@ class RoomRuntime(
         _state.value = RoomRuntimeState.Idle
         voiceRuntime.stopAll()
         voiceTransport.stopSession()
+        voiceTransport.updateRoomPeers(emptySet())
         _messages.value = emptyList()
         _talkingPeerIds.value = emptySet()
         clearTalkingPeerTimeouts()
@@ -2273,6 +2304,23 @@ class RoomRuntime(
     private fun preferredVoiceTransportMode(): VoiceTransportMode {
         return voiceSettingsRepository.voiceTransportPreference.value.transportMode
             ?: VoiceTransportMode.WIFI_DIRECT_UDP
+    }
+
+    /**
+     * Применяет voice-профиль host-а и перестраивает compact node index из полной meta участников комнаты.
+     */
+    private fun configureVoiceSession(room: RoomInfo, members: List<Peer>) {
+        val peerIds = buildSet {
+            add(profileRepository.getOrCreatePeerId())
+            add(room.host.peerId)
+            members.forEach { peer -> add(peer.peerId) }
+        }
+        voiceRuntime.configure(room.voiceAudioProfile)
+        voiceTransport.updateRoomPeers(peerIds)
+        Log.i(
+            TAG,
+            "[configureVoiceSession] Voice-сессия настроена roomId=${room.roomId.value} frameMs=${room.voiceAudioProfile.frameDuration.millis} peerCount=${peerIds.size}",
+        )
     }
 
     /**

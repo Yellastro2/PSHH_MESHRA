@@ -23,6 +23,7 @@ Wi-Fi Direct transport занимается только голосом:
 - `app/src/main/java/com/yellastro/btration/voice/VoiceTransport.kt`
 - `app/src/main/java/com/yellastro/btration/voice/WifiDirectVoiceTransport.kt`
 - `app/src/main/java/com/yellastro/btration/voice/WifiDirectVoiceDatagramCodec.kt`
+- `app/src/main/java/com/yellastro/btration/voice/CompactVoicePacketCodec.kt`
 - `app/src/main/java/com/yellastro/btration/domain/model/VoiceTransportControlInfo.kt`
 - `app/src/main/java/com/yellastro/btration/domain/model/WirePacket.kt`
 
@@ -57,21 +58,23 @@ Wi-Fi Direct transport занимается только голосом:
 
 - magic `BTVU`;
 - type `HELLO`, `HELLO_ACK` или `FRAME`;
-- `senderPeerId`;
-- для `FRAME` внутри лежит бинарный `BTVO` из `VoiceFrameCodec`.
+- `HELLO/HELLO_ACK` несут длину и полный `senderPeerId`, чтобы один раз связать участника с подтвержденным UDP endpoint;
+- `FRAME` содержит общий compact Star packet `SV`: 9-байтовый header и Opus payload, без UUID/полного `PeerId` на каждом аудиофрейме.
 
-`VoiceFrame.originPeerId` остается исходным говорящим, а `senderPeerId` в UDP datagram — прямой сосед transport-а. Это важно для host relay:
+Прямой сосед определяется по endpoint-у, подтвержденному handshake, а `VoiceFrame.originPeerId` восстанавливается по короткому `originNodeId` из списка участников комнаты. Это важно для host relay:
 
-- client говорит: `senderPeerId=client`, `originPeerId=client`;
-- host ретранслирует: `senderPeerId=host`, `originPeerId=client`;
+- client говорит: UDP endpoint принадлежит client-у, `originNodeId` указывает на client-а;
+- host ретранслирует: UDP endpoint принадлежит host-у, `originNodeId` по-прежнему указывает на исходного client-а;
 - другой client принимает frame от прямого host-а, но UI подсвечивает исходного client-а.
+
+До Opus payload Direct FRAME имеет `5` байт `BTVU + type` и `9` байт compact header. Длина аудио `10/20/40 мс` не меняет header, только размер Opus payload и частоту datagram.
 
 ## Ограничения
 
 - Wi-Fi Direct поведение сильно зависит от прошивки и Google/Android Wi-Fi stack.
 - Рабочий commit `25683d76446f9189b0957475f42851221aed0713` использовал физический Nearby `P2P_STAR` одновременно с `WIFI_DIRECT_UDP`; переводить Direct-комнаты на `P2P_CLUSTER` без отдельного тестового основания нельзя.
 - Host отправляет `VOICE_TRANSPORT_INFO` клиентам без ожидания `RoomInfo.isDirectAudioReady`. Старое ограничение с ожиданием `createGroup()`/`isDirectAudioReady` устарело: оно может оставить client без данных для DNS-SD/connect, а фактическая возможность отправлять голос конкретному peer по-прежнему подтверждается отдельно через UDP `HELLO/HELLO_ACK`.
-- Host при `createRoom()` читает тип комнаты и voice-настройку из prefs, кладет выбранные `roomTransportMode` и `voiceTransportMode` в `RoomInfo` и запускает комнату с этим media-plane. Client после `JOIN_ACCEPTED` смотрит `RoomInfo.roomTransportMode` для выбора room transport комнаты, а затем `RoomInfo.voiceTransportMode` host-а и перед `startSession()` переключает свой локальный voice transport на тот же режим.
+- Host при `createRoom()` читает тип комнаты, voice transport и сохраненную для `Nearby Star` длину фрейма, кладет `roomTransportMode`, `voiceTransportMode` и `voiceAudioProfile` в `RoomInfo`. Client после `JOIN_ACCEPTED` применяет transport и `10/20/40 мс` профиль host-а до запуска голоса.
 - Если устройство не заявляет `PackageManager.FEATURE_WIFI_DIRECT` или не отдает `WifiP2pManager`, `AppContainer` включает `UnavailableVoiceTransport`, а UI показывает snackbar `Wi-Fi Direct не поддерживается на этом устройстве`.
 - Если client не видит DNS-SD service host-а, он не получит `srcDevice.deviceAddress` и не сможет подключиться.
 - Флаг `RoomInfo.isDirectAudioReady` ставится только после входящего UDP `HELLO`; создание group само по себе готовностью не считается.
@@ -87,7 +90,7 @@ Wi-Fi Direct transport занимается только голосом:
 - После `groupFormed` client дольше шлет UDP `HELLO`, чтобы host увидел endpoint даже после медленного первого pairing-а.
 - UDP final-frame может потеряться; `RoomRuntime` дополнительно гасит talking-индикатор по таймауту тишины и закрывает входящую frame-сессию.
 - Финальный voice frame может отправляться из UI callback отпускания PTT, поэтому Wi-Fi Direct transport переносит UDP send с main thread на IO.
-- В комнате есть UI-настройка voice transport, которая сохраняет выбранное значение в prefs. Новая host-комната применяет настройку при `createRoom()`, а уже активная комната на лету не переключается: после сохранения настройки нужно перезапустить комнату. Client в комнате видит выбранный host-ом transport в меню, но пункт read-only.
+- В диалоге создания есть настройки voice transport и длины фрейма. Длина запоминается отдельно для `Nearby Star` и `MESHRA`; активная комната профиль на лету не меняет. Client всегда использует профиль из meta host-а.
 
 ## Диагностика
 

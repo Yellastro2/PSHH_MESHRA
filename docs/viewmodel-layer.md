@@ -34,12 +34,12 @@ ViewModel-слой готовит состояние для XML-фрагмент
 
 - `onStartSearchClicked()`;
 - `onStopSearchClicked()`;
-- `onCreateRoomClicked(name, roomTransportMode, voiceTransportPreference)`;
+- `onCreateRoomClicked(name, roomTransportMode, voiceTransportPreference, voiceFrameDuration)`;
 - `onJoinRoomClicked(room)`;
 - `onIgnoreRoomClicked(room)`;
 - `onClearIgnoredPeersConfirmed()`.
 
-Диалог создания комнаты передает в `LobbyViewModel` имя комнаты, выбранный тип комнаты (`Nearby Star` / `MESHRA`) и выбранный voice transport. ViewModel сохраняет оба transport-выбора в prefs до вызова `RoomRepository.createRoom(...)`, чтобы host runtime положил эти режимы в meta комнаты.
+Диалог создания комнаты передает в `LobbyViewModel` имя, тип комнаты (`Nearby Star` / `MESHRA`), voice transport и длину Opus-фрейма `10/20/40 мс`. ViewModel сохраняет transport-ы и длительность отдельно для выбранного типа комнаты, затем передает `VoiceAudioProfile` в `RoomRepository.createRoom(...)`, чтобы host положил профиль в meta комнаты.
 
 Если выбран `MESHRA`, ViewModel не меняется: тот же `RoomRepository.createRoom(...)` приводит runtime в активную комнату, но внутри `RoomRuntime` выбирает `MeshTransport` вместо Nearby Star. Для UI это остается обычная комната с участниками и текстовым чатом.
 

@@ -6,11 +6,13 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 
 /**
- * Кодирует UDP-датаграммы Wi-Fi Direct voice transport: HELLO/ACK handshake и FRAME с Opus voice frame.
+ * Кодирует Wi-Fi Direct UDP: handshake несет полный PeerId один раз, а FRAME — только compact Star voice packet.
  */
-object WifiDirectVoiceDatagramCodec {
+class WifiDirectVoiceDatagramCodec(
+    private val voicePacketCodec: CompactVoicePacketCodec,
+) {
     /**
-     * Кодирует HELLO-датаграмму, по которой host узнает IP участника.
+     * Кодирует HELLO-датаграмму, по которой host узнает PeerId и UDP endpoint участника.
      */
     fun encodeHello(senderPeerId: PeerId): ByteArray {
         return encodeHandshake(senderPeerId, TYPE_HELLO)
@@ -24,19 +26,18 @@ object WifiDirectVoiceDatagramCodec {
     }
 
     /**
-     * Кодирует служебную handshake-датаграмму без voice payload.
+     * Кодирует handshake с полным PeerId; voice FRAME больше этот идентификатор не повторяет.
      */
     private fun encodeHandshake(senderPeerId: PeerId, type: Int): ByteArray {
         val senderBytes = senderPeerId.value.encodeToByteArray()
         require(senderBytes.isNotEmpty() && senderBytes.size <= MAX_PEER_ID_BYTES) {
-            "Некорректная длина PeerId Wi-Fi Direct HELLO: ${senderBytes.size}"
+            "Некорректная длина PeerId Wi-Fi Direct handshake: ${senderBytes.size}"
         }
-        return ByteArrayOutputStream(HEADER_BYTES + senderBytes.size).use { buffer ->
+        return ByteArrayOutputStream(HANDSHAKE_HEADER_BYTES + senderBytes.size).use { buffer ->
             DataOutputStream(buffer).use { output ->
                 output.writeInt(MAGIC)
                 output.writeByte(type)
                 output.writeShort(senderBytes.size)
-                output.writeInt(0)
                 output.write(senderBytes)
             }
             buffer.toByteArray()
@@ -44,24 +45,17 @@ object WifiDirectVoiceDatagramCodec {
     }
 
     /**
-     * Кодирует FRAME-датаграмму с PeerId прямого отправителя и бинарным BTVO-фреймом.
+     * Кодирует FRAME как пятибайтовую UDP-обертку и общий compact Star voice packet.
      */
-    fun encodeFrame(senderPeerId: PeerId, frame: VoiceFrame): ByteArray {
-        val senderBytes = senderPeerId.value.encodeToByteArray()
-        val frameBytes = VoiceFrameCodec.encode(frame)
-        require(senderBytes.isNotEmpty() && senderBytes.size <= MAX_PEER_ID_BYTES) {
-            "Некорректная длина PeerId Wi-Fi Direct FRAME: ${senderBytes.size}"
-        }
+    fun encodeFrame(packet: CompactVoicePacket): ByteArray {
+        val frameBytes = voicePacketCodec.encode(packet)
         require(frameBytes.size <= MAX_FRAME_BYTES) {
             "Слишком большая Wi-Fi Direct voice datagram: ${frameBytes.size}"
         }
-        return ByteArrayOutputStream(HEADER_BYTES + senderBytes.size + frameBytes.size).use { buffer ->
+        return ByteArrayOutputStream(FRAME_HEADER_BYTES + frameBytes.size).use { buffer ->
             DataOutputStream(buffer).use { output ->
                 output.writeInt(MAGIC)
                 output.writeByte(TYPE_FRAME)
-                output.writeShort(senderBytes.size)
-                output.writeInt(frameBytes.size)
-                output.write(senderBytes)
                 output.write(frameBytes)
             }
             buffer.toByteArray()
@@ -69,36 +63,28 @@ object WifiDirectVoiceDatagramCodec {
     }
 
     /**
-     * Декодирует входящую UDP-датаграмму Wi-Fi Direct voice transport.
+     * Декодирует handshake или compact FRAME из фактической длины входящей UDP-датаграммы.
      */
     fun decode(bytes: ByteArray, length: Int): WifiDirectVoiceDatagram {
+        require(length in FRAME_HEADER_BYTES..bytes.size) {
+            "Некорректная длина Wi-Fi Direct datagram: $length"
+        }
         DataInputStream(bytes.inputStream(0, length)).use { input ->
             val magic = input.readInt()
             require(magic == MAGIC) {
                 "Неизвестный Wi-Fi Direct voice magic=$magic"
             }
-            val type = input.readUnsignedByte()
-            val senderLength = input.readUnsignedShort()
-            val frameLength = input.readInt()
-            require(senderLength in 1..MAX_PEER_ID_BYTES) {
-                "Некорректная длина PeerId Wi-Fi Direct datagram: $senderLength"
-            }
-            require(frameLength in 0..MAX_FRAME_BYTES) {
-                "Некорректная длина Wi-Fi Direct voice frame: $frameLength"
-            }
-            val senderBytes = ByteArray(senderLength)
-            input.readFully(senderBytes)
-            val senderPeerId = PeerId(senderBytes.decodeToString())
-            return when (type) {
-                TYPE_HELLO -> WifiDirectVoiceDatagram.Hello(senderPeerId)
-                TYPE_HELLO_ACK -> WifiDirectVoiceDatagram.HelloAck(senderPeerId)
+            return when (val type = input.readUnsignedByte()) {
+                TYPE_HELLO -> WifiDirectVoiceDatagram.Hello(readHandshakePeerId(input))
+                TYPE_HELLO_ACK -> WifiDirectVoiceDatagram.HelloAck(readHandshakePeerId(input))
                 TYPE_FRAME -> {
+                    val frameLength = length - FRAME_HEADER_BYTES
+                    require(frameLength in CompactVoicePacketCodec.HEADER_SIZE..MAX_FRAME_BYTES) {
+                        "Некорректная длина Wi-Fi Direct voice frame: $frameLength"
+                    }
                     val frameBytes = ByteArray(frameLength)
                     input.readFully(frameBytes)
-                    WifiDirectVoiceDatagram.Frame(
-                        senderPeerId = senderPeerId,
-                        frame = VoiceFrameCodec.decode(frameBytes),
-                    )
+                    WifiDirectVoiceDatagram.Frame(voicePacketCodec.decode(frameBytes))
                 }
 
                 else -> error("Неизвестный тип Wi-Fi Direct voice datagram=$type")
@@ -106,17 +92,33 @@ object WifiDirectVoiceDatagramCodec {
         }
     }
 
-    private const val MAGIC = 0x42545655
-    private const val TYPE_HELLO = 1
-    private const val TYPE_FRAME = 2
-    private const val TYPE_HELLO_ACK = 3
-    private const val MAX_PEER_ID_BYTES = 512
-    private const val MAX_FRAME_BYTES = 8_192
-    private val HEADER_BYTES = Int.SIZE_BYTES + 1 + Short.SIZE_BYTES + Int.SIZE_BYTES
+    /**
+     * Читает и валидирует полный PeerId из HELLO/HELLO_ACK.
+     */
+    private fun readHandshakePeerId(input: DataInputStream): PeerId {
+        val senderLength = input.readUnsignedShort()
+        require(senderLength in 1..MAX_PEER_ID_BYTES) {
+            "Некорректная длина PeerId Wi-Fi Direct handshake: $senderLength"
+        }
+        val senderBytes = ByteArray(senderLength)
+        input.readFully(senderBytes)
+        return PeerId(senderBytes.decodeToString())
+    }
+
+    private companion object {
+        private const val MAGIC = 0x42545655
+        private const val TYPE_HELLO = 1
+        private const val TYPE_FRAME = 2
+        private const val TYPE_HELLO_ACK = 3
+        private const val MAX_PEER_ID_BYTES = 512
+        private const val MAX_FRAME_BYTES = 8_192
+        private const val FRAME_HEADER_BYTES = Int.SIZE_BYTES + 1
+        private const val HANDSHAKE_HEADER_BYTES = FRAME_HEADER_BYTES + Short.SIZE_BYTES
+    }
 }
 
 /**
- * Декодированная UDP-датаграмма Wi-Fi Direct voice transport.
+ * Декодированная Wi-Fi Direct datagram: handshake с PeerId или compact voice frame без повторного UUID.
  */
 sealed class WifiDirectVoiceDatagram {
     /**
@@ -134,10 +136,9 @@ sealed class WifiDirectVoiceDatagram {
     ) : WifiDirectVoiceDatagram()
 
     /**
-     * Voice frame от прямого участника.
+     * Compact voice packet, автор и прямой сосед которого разрешаются transport-ом по room index/UDP endpoint.
      */
     data class Frame(
-        val senderPeerId: PeerId,
-        val frame: VoiceFrame,
+        val packet: CompactVoicePacket,
     ) : WifiDirectVoiceDatagram()
 }

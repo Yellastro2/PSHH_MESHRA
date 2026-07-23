@@ -1,6 +1,6 @@
 <resources>
     <string name="app_name">PSHH MESHRA</string>
-    <string name="btratio_internal_code_version">\u0020в-184</string>
+    <string name="btratio_internal_code_version">\u0020в-185</string>
     <string name="ptt_lock_description">Закрепить голосовую передачу</string>
     <string name="ptt_locked_status">ПЕРЕДАЧА ЗАКРЕПЛЕНА</string>
     <string name="subt_onair">В ЭФИРЕ</string>

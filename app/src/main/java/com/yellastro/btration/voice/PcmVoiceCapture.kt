@@ -16,7 +16,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Захватывает микрофон в PCM16 mono из voice communication источника порциями из PcmVoiceConfig для STREAM или BYTES voice frames.
+ * Захватывает PCM16 mono из voice communication источника порциями выбранного room voice-профиля.
  */
 class PcmVoiceCapture(
     private val externalScope: CoroutineScope,
@@ -24,19 +24,20 @@ class PcmVoiceCapture(
     private var activeCapture: ActiveCapture? = null
 
     /**
-     * Запускает запись микрофона и возвращает InputStream, из которого Nearby будет читать PCM.
+     * Запускает legacy stream-запись с указанным профилем и возвращает PCM InputStream.
      */
     @SuppressLint("MissingPermission")
-    fun start(): InputStream {
+    fun start(profile: VoiceAudioProfile = VoiceAudioProfile()): InputStream {
         stop()
         val minBufferSize = AudioRecord.getMinBufferSize(
             PcmVoiceConfig.SAMPLE_RATE_HZ,
             AudioFormat.CHANNEL_IN_MONO,
             PcmVoiceConfig.AUDIO_FORMAT,
         )
-        val readChunkBytes = PcmVoiceConfig.FRAME_BYTES * READ_CHUNK_FRAME_COUNT
+        val readChunkBytes = PcmVoiceConfig.frameBytes(profile) * READ_CHUNK_FRAME_COUNT
         val audioRecordBufferSize = maxOf(minBufferSize, readChunkBytes)
-        val inputStream = PipedInputStream(PcmVoiceConfig.PIPE_BUFFER_BYTES)
+        val pipeBufferBytes = PcmVoiceConfig.pipeBufferBytes(profile)
+        val inputStream = PipedInputStream(pipeBufferBytes)
         val outputStream = PipedOutputStream(inputStream)
         val audioRecord = AudioRecord.Builder()
             .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
@@ -59,7 +60,7 @@ class PcmVoiceCapture(
                 audioRecord.startRecording()
                 Log.i(
                     TAG,
-                    "[start] Запись микрофона запущена source=VOICE_COMMUNICATION audioRecordBufferBytes=$audioRecordBufferSize readChunkBytes=$readChunkBytes pipeBufferBytes=${PcmVoiceConfig.PIPE_BUFFER_BYTES}",
+                    "[start] Запись микрофона запущена source=VOICE_COMMUNICATION frameMs=${profile.frameDuration.millis} audioRecordBufferBytes=$audioRecordBufferSize readChunkBytes=$readChunkBytes pipeBufferBytes=$pipeBufferBytes",
                 )
                 while (isActive) {
                     val readBytes = audioRecord.read(buffer, 0, buffer.size)
@@ -100,17 +101,17 @@ class PcmVoiceCapture(
     }
 
     /**
-     * Запускает запись микрофона и отдает каждый PCM-фрейм в callback для Nearby BYTES payload.
+     * Запускает запись и отдает PCM-фреймы выбранной длительности в callback compact voice pipeline.
      */
     @SuppressLint("MissingPermission")
-    fun startFrames(onFrame: (ByteArray) -> Unit) {
+    fun startFrames(profile: VoiceAudioProfile, onFrame: (ByteArray) -> Unit) {
         stop()
         val minBufferSize = AudioRecord.getMinBufferSize(
             PcmVoiceConfig.SAMPLE_RATE_HZ,
             AudioFormat.CHANNEL_IN_MONO,
             PcmVoiceConfig.AUDIO_FORMAT,
         )
-        val readChunkBytes = PcmVoiceConfig.FRAME_BYTES * READ_CHUNK_FRAME_COUNT
+        val readChunkBytes = PcmVoiceConfig.frameBytes(profile) * READ_CHUNK_FRAME_COUNT
         val audioRecordBufferSize = maxOf(minBufferSize, readChunkBytes)
         val audioRecord = AudioRecord.Builder()
             .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
@@ -126,13 +127,16 @@ class PcmVoiceCapture(
 
         val job = externalScope.launch(Dispatchers.IO) {
             val buffer = ByteArray(readChunkBytes)
+            val frameBytes = PcmVoiceConfig.frameBytes(profile)
+            val pendingFrame = ByteArray(frameBytes)
+            var pendingFrameBytes = 0
             val captureStartedAtMillis = System.currentTimeMillis()
             var firstReadLogged = false
             runCatching {
                 audioRecord.startRecording()
                 Log.i(
                     TAG,
-                    "[startFrames] Запись микрофона для voice frames запущена source=VOICE_COMMUNICATION audioRecordBufferBytes=$audioRecordBufferSize readChunkBytes=$readChunkBytes",
+                    "[startFrames] Запись микрофона для voice frames запущена source=VOICE_COMMUNICATION frameMs=${profile.frameDuration.millis} audioRecordBufferBytes=$audioRecordBufferSize readChunkBytes=$readChunkBytes",
                 )
                 while (isActive) {
                     val readBytes = audioRecord.read(buffer, 0, buffer.size)
@@ -144,7 +148,25 @@ class PcmVoiceCapture(
                                 "[startFrames] Первый read микрофона для voice frame readBytes=$readBytes elapsedMs=${System.currentTimeMillis() - captureStartedAtMillis}",
                             )
                         }
-                        onFrame(buffer.copyOf(readBytes))
+                        var sourceOffset = 0
+                        while (sourceOffset < readBytes) {
+                            val copiedBytes = minOf(
+                                frameBytes - pendingFrameBytes,
+                                readBytes - sourceOffset,
+                            )
+                            buffer.copyInto(
+                                destination = pendingFrame,
+                                destinationOffset = pendingFrameBytes,
+                                startIndex = sourceOffset,
+                                endIndex = sourceOffset + copiedBytes,
+                            )
+                            pendingFrameBytes += copiedBytes
+                            sourceOffset += copiedBytes
+                            if (pendingFrameBytes == frameBytes) {
+                                onFrame(pendingFrame.copyOf())
+                                pendingFrameBytes = 0
+                            }
+                        }
                     } else if (readBytes < 0) {
                         Log.w(TAG, "[startFrames] AudioRecord вернул ошибку readBytes=$readBytes")
                         break

@@ -9,6 +9,7 @@ Repository-слой — удобная дверь для будущих ViewMode
 - `app/src/main/java/com/yellastro/btration/repository/ProfileRepository.kt`
 - `app/src/main/java/com/yellastro/btration/repository/RoomRepository.kt`
 - `app/src/main/java/com/yellastro/btration/repository/RoomSettingsRepository.kt`
+- `app/src/main/java/com/yellastro/btration/repository/VoiceSettingsRepository.kt`
 - `app/src/main/java/com/yellastro/btration/repository/IgnoredNearbyRepository.kt`
 - `app/src/main/java/com/yellastro/btration/service/RoomServiceController.kt`
 
@@ -48,6 +49,10 @@ Repository-слой — удобная дверь для будущих ViewMode
 - `MESHRA` — будущий mesh-режим, выбранный по умолчанию.
 
 Значение сохраняется в общих app prefs и попадает в `RoomInfo.roomTransportMode` при создании комнаты.
+
+## VoiceSettingsRepository
+
+Хранит выбранный voice transport и две независимые настройки длины Opus-фрейма: одну для будущих `Nearby Star` комнат, вторую для `MESHRA`. Если значение еще не сохранено, используются defaults `10 мс` для Star и `20 мс` для MESHRA. При входе гость не использует локальный preference: `RoomRuntime` применяет `RoomInfo.voiceAudioProfile`, выбранный создателем комнаты.
 
 ## IgnoredNearbyRepository
 

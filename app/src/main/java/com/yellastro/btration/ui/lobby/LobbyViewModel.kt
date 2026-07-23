@@ -12,6 +12,8 @@ import com.yellastro.btration.repository.ProfileRepository
 import com.yellastro.btration.repository.RoomRepository
 import com.yellastro.btration.repository.RoomSettingsRepository
 import com.yellastro.btration.repository.VoiceSettingsRepository
+import com.yellastro.btration.voice.VoiceAudioProfile
+import com.yellastro.btration.voice.VoiceFrameDuration
 import com.yellastro.btration.voice.VoiceTransportPreference
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -24,7 +26,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * ViewModel лобби: редактирует локальное имя, держит discovery-циклы, создает комнаты и входит в них.
+ * ViewModel лобби: редактирует имя, держит discovery, сохраняет настройки комнаты/голоса и управляет входом.
  */
 class LobbyViewModel(
     private val roomRepository: RoomRepository,
@@ -147,12 +149,13 @@ class LobbyViewModel(
     }
 
     /**
-     * Сохраняет выбранные room/voice transport настройки и создает комнату с заданным именем.
+     * Сохраняет transport/voice-профиль выбранного типа комнаты и создает комнату с заданным именем.
      */
     fun onCreateRoomClicked(
         name: String,
         roomTransportMode: RoomTransportMode,
         voiceTransportPreference: VoiceTransportPreference,
+        voiceFrameDuration: VoiceFrameDuration,
     ) {
         viewModelScope.launch {
             val cleanName = name.trim()
@@ -160,7 +163,12 @@ class LobbyViewModel(
             if (!voiceSettingsRepository.setVoiceTransportPreference(voiceTransportPreference)) {
                 return@launch
             }
-            roomRepository.createRoom(cleanName, roomTransportMode)
+            voiceSettingsRepository.setVoiceFrameDuration(roomTransportMode, voiceFrameDuration)
+            roomRepository.createRoom(
+                name = cleanName,
+                roomTransportMode = roomTransportMode,
+                voiceAudioProfile = VoiceAudioProfile(frameDuration = voiceFrameDuration),
+            )
             profileRepository.setLastRoomName(cleanName)
         }
     }
@@ -184,6 +192,13 @@ class LobbyViewModel(
      */
     fun voiceTransportPreferenceForDialog(): VoiceTransportPreference {
         return voiceSettingsRepository.voiceTransportPreference.value
+    }
+
+    /**
+     * Возвращает сохраненную длительность voice frame для указанного типа создаваемой комнаты.
+     */
+    fun voiceFrameDurationForDialog(roomTransportMode: RoomTransportMode): VoiceFrameDuration {
+        return voiceSettingsRepository.voiceFrameDuration(roomTransportMode)
     }
 
     /**

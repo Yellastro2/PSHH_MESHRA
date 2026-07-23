@@ -1,11 +1,29 @@
-package com.yellastro.btration.domain.mesh
+package com.yellastro.btration.voice
 
+import com.yellastro.btration.domain.model.PeerId
 import java.util.zip.CRC32
 
 /**
- * Компактный ephemeral voice-пакет MESHRA с девятибайтовым заголовком и Opus payload без JSON-обертки.
+ * Назначение компактного voice-пакета на общем NeighborTransport с отдельным magic для Star и Mesh.
  */
-data class MeshVoicePacket(
+enum class CompactVoicePacketKind(
+    internal val magicFirst: Byte,
+    internal val magicSecond: Byte,
+) {
+    STAR(
+        magicFirst = 0x53,
+        magicSecond = 0x56,
+    ),
+    MESH(
+        magicFirst = 0x4D,
+        magicSecond = 0x56,
+    ),
+}
+
+/**
+ * Компактный voice wire-packet с UInt16 адресацией, PTT-сессией, sequence, flags/TTL и Opus payload.
+ */
+data class CompactVoicePacket(
     val originNodeId: Int,
     val pttSessionId: Int,
     val sequence: Int,
@@ -15,30 +33,31 @@ data class MeshVoicePacket(
 )
 
 /**
- * Кодирует и декодирует бинарный MESHRA voice wire-format `MV + control + origin + session + sequence + Opus`.
+ * Кодирует и декодирует общий девятибайтовый Star/Mesh voice wire-format.
  *
- * В control byte старший бит хранит версию 1, следующие два бита зарезервированы под тип пакета,
- * бит final завершает PTT, а младшие четыре бита содержат hop TTL от 0 до 15.
+ * Формат: `magic[2] + control[1] + origin[2] + session[2] + sequence[2] + Opus`.
  */
-class MeshVoicePacketCodec {
+class CompactVoicePacketCodec(
+    private val kind: CompactVoicePacketKind,
+) {
     /**
-     * Возвращает true, если payload имеет magic, версию и тип текущего MESHRA voice DATA-пакета.
+     * Возвращает true, если payload имеет magic, версию и DATA-тип выбранного voice packet kind.
      */
     fun isVoicePacket(bytes: ByteArray): Boolean {
         if (bytes.size < HEADER_SIZE) {
             return false
         }
         val control = bytes[CONTROL_OFFSET].toInt() and UNSIGNED_BYTE_MASK
-        return bytes[MAGIC_FIRST_OFFSET] == MAGIC_FIRST &&
-            bytes[MAGIC_SECOND_OFFSET] == MAGIC_SECOND &&
+        return bytes[MAGIC_FIRST_OFFSET] == kind.magicFirst &&
+            bytes[MAGIC_SECOND_OFFSET] == kind.magicSecond &&
             (control and VERSION_MASK) == VERSION_BITS &&
             (control and TYPE_MASK) == DATA_TYPE_BITS
     }
 
     /**
-     * Кодирует DATA-пакет и проверяет, что короткие поля и Opus payload помещаются в wire-format.
+     * Кодирует компактный packet и проверяет границы всех коротких полей.
      */
-    fun encode(packet: MeshVoicePacket): ByteArray {
+    fun encode(packet: CompactVoicePacket): ByteArray {
         require(packet.originNodeId in UNSIGNED_SHORT_RANGE) { "originNodeId должен помещаться в UInt16" }
         require(packet.pttSessionId in UNSIGNED_SHORT_RANGE) { "pttSessionId должен помещаться в UInt16" }
         require(packet.sequence in UNSIGNED_SHORT_RANGE) { "sequence должен помещаться в UInt16" }
@@ -46,8 +65,8 @@ class MeshVoicePacketCodec {
         require(packet.encodedBytes.size <= MAX_OPUS_PAYLOAD_SIZE) { "Opus payload слишком большой" }
 
         val bytes = ByteArray(HEADER_SIZE + packet.encodedBytes.size)
-        bytes[MAGIC_FIRST_OFFSET] = MAGIC_FIRST
-        bytes[MAGIC_SECOND_OFFSET] = MAGIC_SECOND
+        bytes[MAGIC_FIRST_OFFSET] = kind.magicFirst
+        bytes[MAGIC_SECOND_OFFSET] = kind.magicSecond
         bytes[CONTROL_OFFSET] = (
             VERSION_BITS or
                 DATA_TYPE_BITS or
@@ -62,13 +81,13 @@ class MeshVoicePacketCodec {
     }
 
     /**
-     * Декодирует проверенный MESHRA voice DATA-пакет и возвращает независимую копию Opus payload.
+     * Декодирует проверенный compact voice packet и возвращает независимую копию Opus payload.
      */
-    fun decode(bytes: ByteArray): MeshVoicePacket {
-        require(isVoicePacket(bytes)) { "Payload не является поддерживаемым MESHRA voice-пакетом" }
+    fun decode(bytes: ByteArray): CompactVoicePacket {
+        require(isVoicePacket(bytes)) { "Payload не является поддерживаемым compact voice packet kind=$kind" }
         require(bytes.size <= HEADER_SIZE + MAX_OPUS_PAYLOAD_SIZE) { "Opus payload слишком большой" }
         val control = bytes[CONTROL_OFFSET].toInt() and UNSIGNED_BYTE_MASK
-        return MeshVoicePacket(
+        return CompactVoicePacket(
             originNodeId = readUnsignedShort(bytes, ORIGIN_OFFSET),
             pttSessionId = readUnsignedShort(bytes, SESSION_OFFSET),
             sequence = readUnsignedShort(bytes, SEQUENCE_OFFSET),
@@ -113,19 +132,15 @@ class MeshVoicePacketCodec {
         private const val MAX_OPUS_PAYLOAD_SIZE = 4_096
         private val UNSIGNED_SHORT_RANGE = 0..0xFFFF
         private val TTL_RANGE = 0..TTL_MASK
-        private const val MAGIC_FIRST: Byte = 0x4D
-        private const val MAGIC_SECOND: Byte = 0x56
     }
 }
 
 /**
- * Получает стабильный локально вычисляемый UInt16 node id из полного PeerId для компактного voice-заголовка.
- *
- * Полный PeerId остается в snapshot комнаты; при приеме короткий id обязан однозначно разрешиться среди участников.
+ * Строит короткий UInt16 node id из стабильного PeerId одинаково для Star и Mesh.
  */
-object MeshVoiceNodeId {
+object CompactVoiceNodeId {
     /**
-     * Считает CRC32 UTF-8 представления PeerId и берет младшие 16 бит; коллизии проверяет MeshTransport.
+     * Считает CRC32 UTF-8 представления PeerId и берет младшие 16 бит.
      */
     fun fromPeerIdValue(peerIdValue: String): Int {
         val checksum = CRC32()
@@ -134,4 +149,47 @@ object MeshVoiceNodeId {
     }
 
     private const val UNSIGNED_SHORT_MASK = 0xFFFFL
+}
+
+/**
+ * Потокобезопасно хранит вынесенную из voice-пакетов таблицу UInt16 node id -> PeerId и отмечает коллизии.
+ */
+class CompactVoicePeerIndex {
+    @Volatile
+    private var peerIdsByNodeId: Map<Int, PeerId?> = emptyMap()
+
+    /**
+     * Полностью заменяет таблицу актуальными участниками и возвращает найденные collision node id.
+     */
+    fun replacePeers(peerIds: Set<PeerId>): Set<Int> {
+        val nextIndex = mutableMapOf<Int, PeerId?>()
+        val collisions = mutableSetOf<Int>()
+        peerIds.forEach { peerId ->
+            val nodeId = CompactVoiceNodeId.fromPeerIdValue(peerId.value)
+            val previousPeerId = nextIndex[nodeId]
+            if (nodeId !in nextIndex) {
+                nextIndex[nodeId] = peerId
+            } else if (previousPeerId != peerId) {
+                nextIndex[nodeId] = null
+                collisions += nodeId
+            }
+        }
+        peerIdsByNodeId = nextIndex.toMap()
+        return collisions
+    }
+
+    /**
+     * Возвращает короткий node id только если PeerId однозначно присутствует в текущей таблице.
+     */
+    fun nodeIdFor(peerId: PeerId): Int? {
+        val nodeId = CompactVoiceNodeId.fromPeerIdValue(peerId.value)
+        return nodeId.takeIf { peerIdsByNodeId[nodeId] == peerId }
+    }
+
+    /**
+     * Возвращает PeerId только для известного node id без коллизии.
+     */
+    fun peerIdFor(nodeId: Int): PeerId? {
+        return peerIdsByNodeId[nodeId]
+    }
 }

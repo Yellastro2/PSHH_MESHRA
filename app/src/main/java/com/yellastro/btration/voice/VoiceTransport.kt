@@ -23,7 +23,7 @@ enum class VoiceTransportSessionRole {
 }
 
 /**
- * Минимальный контракт media-plane для отправки и приема уже закодированных voice frames независимо от конкретного транспорта.
+ * Контракт media-plane для compact voice frames с актуальным индексом участников независимо от транспорта.
  */
 interface VoiceTransport {
     /**
@@ -50,6 +50,11 @@ interface VoiceTransport {
      * Передает transport-специфичную служебную информацию от другого участника.
      */
     fun handleControlInfo(fromPeerId: PeerId, info: VoiceTransportControlInfo)
+
+    /**
+     * Обновляет набор участников, по которому compact originNodeId разрешается в полный PeerId.
+     */
+    fun updateRoomPeers(peerIds: Set<PeerId>)
 
     /**
      * Проверяет, завершен ли media-plane handshake со всеми указанными получателями.

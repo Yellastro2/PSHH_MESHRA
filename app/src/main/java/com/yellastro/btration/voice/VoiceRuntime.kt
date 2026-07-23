@@ -8,11 +8,12 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 
 /**
- * Управляет MVP-голосом комнаты: кодирует локальный PCM в Opus frames, отдает их VoiceTransport и декодирует входящий Opus для playback.
+ * Управляет per-room voice-профилем: capture/Opus encode, compact PTT session frames, decode и low-latency playback.
  */
 class VoiceRuntime(
     private val voiceTransport: VoiceTransport,
@@ -32,10 +33,26 @@ class VoiceRuntime(
     private var activeTalkingTargetPeerIds: Set<PeerId> = emptySet()
     private var activeFrameSender: VoiceFrameSender? = null
     private var activeOutgoingEncoder: OpusVoiceEncoder? = null
+    private var activeOutgoingSessionId: Int? = null
+    private var nextOutgoingSessionId = 0
     private var outgoingVoiceSequence = 0L
+    @Volatile
+    private var currentProfile = VoiceAudioProfile()
     private val activeFrameSessions = ConcurrentHashMap<PeerId, ActiveFrameSession>()
     private val frameSessionLock = Any()
     private val outgoingEncoderLock = Any()
+
+    /**
+     * Применяет неизменяемый voice-профиль новой комнаты и останавливает старые audio-сессии при реальной смене.
+     */
+    fun configure(profile: VoiceAudioProfile) {
+        if (profile == currentProfile) {
+            return
+        }
+        stopAll()
+        currentProfile = profile
+        Log.i(TAG, "[configure] Voice-профиль комнаты применен frameMs=${profile.frameDuration.millis}")
+    }
 
     /**
      * Начинает передачу микрофона от исходного участника выбранным адресатам через текущий VoiceTransport.
@@ -66,14 +83,17 @@ class VoiceRuntime(
         }
 
         val startedAtMillis = System.currentTimeMillis()
-        val encoder = runCatching { OpusVoiceEncoder() }
+        val profile = currentProfile
+        val encoder = runCatching { OpusVoiceEncoder(profile) }
             .onFailure { cause ->
                 Log.w(TAG, "[startTalking] Не удалось создать Opus encoder: ${cause.message}", cause)
             }
             .getOrNull()
             ?: return false
-        Log.i(TAG, "[startTalking] Начинаем запуск голосовой передачи opus-frame-mode targetCount=${targetPeerIds.size}")
+        Log.i(TAG, "[startTalking] Начинаем голосовую передачу targetCount=${targetPeerIds.size} frameMs=${profile.frameDuration.millis}")
         outgoingVoiceSequence = 0L
+        activeOutgoingSessionId = nextOutgoingSessionId
+        nextOutgoingSessionId = (nextOutgoingSessionId + 1) and UNSIGNED_SHORT_MASK
         activeTalkingOriginPeerId = originPeerId
         activeTalkingTargetPeerIds = targetPeerIds
         activeFrameSender = object : VoiceFrameSender {
@@ -90,7 +110,7 @@ class VoiceRuntime(
         }
         isTalking = true
         val started = runCatching {
-            voiceCapture.startFrames { pcmBytes ->
+            voiceCapture.startFrames(profile) { pcmBytes ->
                 sendLocalVoiceFrame(originPeerId, targetPeerIds, pcmBytes, isFinal = false)
             }
         }
@@ -103,6 +123,7 @@ class VoiceRuntime(
             activeTalkingOriginPeerId = null
             activeTalkingTargetPeerIds = emptySet()
             activeFrameSender = null
+            activeOutgoingSessionId = null
             synchronized(outgoingEncoderLock) {
                 if (activeOutgoingEncoder === encoder) {
                     activeOutgoingEncoder = null
@@ -111,7 +132,7 @@ class VoiceRuntime(
             }
             return false
         }
-        Log.i(TAG, "[startTalking] Передача голоса opus-frame-mode запущена targetCount=${targetPeerIds.size} elapsedMs=${System.currentTimeMillis() - startedAtMillis}")
+        Log.i(TAG, "[startTalking] Передача голоса запущена targetCount=${targetPeerIds.size} frameMs=${profile.frameDuration.millis} elapsedMs=${System.currentTimeMillis() - startedAtMillis}")
         return true
     }
 
@@ -137,6 +158,7 @@ class VoiceRuntime(
         activeTalkingOriginPeerId = null
         activeTalkingTargetPeerIds = emptySet()
         activeFrameSender = null
+        activeOutgoingSessionId = null
         Log.i(TAG, "[stopTalking] Передача голоса opus-frame-mode остановлена")
     }
 
@@ -164,7 +186,7 @@ class VoiceRuntime(
         }
 
         if (frame.isFinal) {
-            finishFrameSession(frame.originPeerId)
+            finishFrameSession(frame.originPeerId, expectedSessionId = frame.sessionId)
             return
         }
         if (frame.encodedBytes.isEmpty()) {
@@ -172,9 +194,18 @@ class VoiceRuntime(
         }
 
         val session = synchronized(frameSessionLock) {
+            val existing = activeFrameSessions[frame.originPeerId]
+            if (existing != null && existing.sessionId != frame.sessionId) {
+                activeFrameSessions.remove(frame.originPeerId)
+                existing.cancel()
+                Log.i(
+                    TAG,
+                    "[playIncomingFrame] Входящая PTT-сессия заменена originPeerId=${frame.originPeerId.value} oldSessionId=${existing.sessionId} newSessionId=${frame.sessionId}",
+                )
+            }
             activeFrameSessions[frame.originPeerId]
-                ?: startFrameSession(frame.originPeerId, onStarted, onFinished)
-                    .also { session -> activeFrameSessions[frame.originPeerId] = session }
+                ?: startFrameSession(frame.originPeerId, frame.sessionId, onStarted, onFinished)
+                    .also { newSession -> activeFrameSessions[frame.originPeerId] = newSession }
         }
         if (!session.enqueue(frame.encodedBytes)) {
             synchronized(frameSessionLock) {
@@ -206,7 +237,7 @@ class VoiceRuntime(
      * Завершает входящую frame-сессию участника, если final-frame потерялся в UDP media-plane.
      */
     fun finishIncomingFrameSession(originPeerId: PeerId) {
-        finishFrameSession(originPeerId)
+        finishFrameSession(originPeerId, expectedSessionId = null)
     }
 
     /**
@@ -236,7 +267,13 @@ class VoiceRuntime(
         isFinal: Boolean,
         frameSender: VoiceFrameSender,
     ) {
-        val sequence = outgoingVoiceSequence++
+        val sequence = outgoingVoiceSequence
+        outgoingVoiceSequence = (outgoingVoiceSequence + 1L) and UNSIGNED_SHORT_MASK.toLong()
+        val sessionId = activeOutgoingSessionId
+        if (sessionId == null) {
+            Log.w(TAG, "[sendLocalVoiceFrame] Нет активного PTT session id sequence=$sequence")
+            return
+        }
         val encodedBytes = if (isFinal) {
             ByteArray(0)
         } else {
@@ -251,6 +288,7 @@ class VoiceRuntime(
             targetPeerIds,
             VoiceFrame(
                 originPeerId = originPeerId,
+                sessionId = sessionId,
                 sequence = sequence,
                 encodedBytes = encodedBytes,
                 isFinal = isFinal,
@@ -259,56 +297,83 @@ class VoiceRuntime(
         if (sequence == FIRST_VOICE_FRAME_SEQUENCE || isFinal) {
             Log.i(
                 TAG,
-                "[sendLocalVoiceFrame] Opus voice frame отправлен originPeerId=${originPeerId.value} targetCount=${targetPeerIds.size} sequence=$sequence pcmBytes=${pcmBytes.size} encodedBytes=${encodedBytes.size} final=$isFinal",
+                "[sendLocalVoiceFrame] Opus voice frame отправлен originPeerId=${originPeerId.value} sessionId=$sessionId targetCount=${targetPeerIds.size} sequence=$sequence pcmBytes=${pcmBytes.size} encodedBytes=${encodedBytes.size} final=$isFinal",
             )
         }
     }
 
     /**
-     * Создает pipe-сессию для входящих Opus voice frames одного originPeerId и запускает AudioTrack player.
+     * Создает короткую pipe/queue-сессию конкретного PTT session id и запускает player с room profile.
      */
     private fun startFrameSession(
         originPeerId: PeerId,
+        sessionId: Int,
         onStarted: (PeerId) -> Unit,
         onFinished: (PeerId) -> Unit,
     ): ActiveFrameSession {
-        val inputStream = PipedInputStream(PcmVoiceConfig.PIPE_BUFFER_BYTES)
+        val profile = currentProfile
+        val inputStream = PipedInputStream(PcmVoiceConfig.pipeBufferBytes(profile))
         val outputStream = PipedOutputStream(inputStream)
         val session = ActiveFrameSession(
             originPeerId = originPeerId,
+            sessionId = sessionId,
             outputStream = outputStream,
             decoder = OpusVoiceDecoder(),
+            queueCapacity = encodedFrameQueueCapacity(profile),
             externalScope = externalScope,
         )
         onStarted(originPeerId)
-        voicePlayer.play(originPeerId, inputStream) { finishedPeerId ->
-            activeFrameSessions.remove(finishedPeerId)
-            onFinished(finishedPeerId)
+        voicePlayer.play(originPeerId, inputStream, profile) { finishedPeerId ->
+            if (activeFrameSessions.remove(finishedPeerId, session)) {
+                onFinished(finishedPeerId)
+            }
         }
-        Log.i(TAG, "[startFrameSession] Входящая frame-сессия запущена originPeerId=${originPeerId.value}")
+        Log.i(TAG, "[startFrameSession] Входящая frame-сессия запущена originPeerId=${originPeerId.value} sessionId=$sessionId frameMs=${profile.frameDuration.millis}")
         return session
     }
 
     /**
-     * Закрывает входящую Opus frame-сессию, чтобы player доиграл PCM-хвост и вызвал onFinished.
+     * Закрывает ожидаемую входящую PTT-сессию; поздний final старой session не закрывает новую.
      */
-    private fun finishFrameSession(originPeerId: PeerId) {
-        synchronized(frameSessionLock) {
-            activeFrameSessions.remove(originPeerId)
-        }?.close()
-        Log.i(TAG, "[finishFrameSession] Входящая frame-сессия завершена originPeerId=${originPeerId.value}")
+    private fun finishFrameSession(originPeerId: PeerId, expectedSessionId: Int?) {
+        val session = synchronized(frameSessionLock) {
+            val activeSession = activeFrameSessions[originPeerId]
+            if (expectedSessionId != null && activeSession?.sessionId != expectedSessionId) {
+                null
+            } else {
+                activeFrameSessions.remove(originPeerId)
+            }
+        }
+        if (session == null) {
+            Log.i(TAG, "[finishFrameSession] Входящая session уже отсутствует или заменена originPeerId=${originPeerId.value} expectedSessionId=$expectedSessionId")
+            return
+        }
+        session.close()
+        Log.i(TAG, "[finishFrameSession] Входящая frame-сессия завершена originPeerId=${originPeerId.value} sessionId=${session.sessionId}")
     }
 
     /**
-     * Активная pipe-сессия входящих Opus voice frames одного участника.
+     * Ограничивает очередь примерно 80 мс аудио независимо от выбранной длительности фрейма.
+     */
+    private fun encodedFrameQueueCapacity(profile: VoiceAudioProfile): Int {
+        return (MAX_ENCODED_QUEUE_MILLIS / profile.frameDuration.millis).coerceAtLeast(MIN_ENCODED_QUEUE_FRAMES)
+    }
+
+    /**
+     * Активная bounded queue/pipe-сессия одного участника и одного PTT session id.
      */
     private class ActiveFrameSession(
         private val originPeerId: PeerId,
+        val sessionId: Int,
         private val outputStream: PipedOutputStream,
         private val decoder: OpusVoiceDecoder,
+        queueCapacity: Int,
         externalScope: CoroutineScope,
     ) {
-        private val encodedFrames = Channel<ByteArray>(Channel.BUFFERED)
+        private val encodedFrames = Channel<ByteArray>(
+            capacity = queueCapacity,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        )
         private val job = externalScope.launch(Dispatchers.IO) {
             runCatching {
                 for (encodedBytes in encodedFrames) {
@@ -358,5 +423,8 @@ class VoiceRuntime(
     private companion object {
         private const val TAG = "VoiceRuntime"
         private const val FIRST_VOICE_FRAME_SEQUENCE = 0L
+        private const val UNSIGNED_SHORT_MASK = 0xFFFF
+        private const val MAX_ENCODED_QUEUE_MILLIS = 80
+        private const val MIN_ENCODED_QUEUE_FRAMES = 2
     }
 }

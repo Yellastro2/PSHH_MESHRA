@@ -11,7 +11,8 @@
 
 - `app/src/main/java/com/yellastro/btration/domain/mesh/MeshModels.kt`
 - `app/src/main/java/com/yellastro/btration/domain/mesh/MeshCodec.kt`
-- `app/src/main/java/com/yellastro/btration/domain/mesh/MeshVoicePacketCodec.kt`
+- `app/src/main/java/com/yellastro/btration/voice/CompactVoicePacketCodec.kt`
+- `app/src/main/java/com/yellastro/btration/voice/VoiceAudioProfile.kt`
 - `app/src/main/java/com/yellastro/btration/domain/mesh/MeshRoomAdvertisement.kt`
 - `app/src/main/java/com/yellastro/btration/domain/mesh/MeshTransport.kt`
 
@@ -51,11 +52,15 @@ MESHRA voice DATA — отдельный бинарный payload с magic `MV` 
 - byte `7..8`: sequence внутри PTT как UInt16;
 - остальные bytes: Opus packet без Base64, JSON, UUID, полного `PeerId`, `roomId`, времени и `previousHopPeerId`.
 
+Этот layout реализует общий `CompactVoicePacketCodec`; Star использует тот же layout с magic `SV`, а правила TTL, дедупликации и маршрутизации остаются в соответствующем transport-е.
+
 `originNodeId` вычисляется как младшие 16 бит CRC32 от полного `PeerId`. Полные идентификаторы уже находятся в snapshot комнаты; при изменении списка участников `MeshTransport` заранее перестраивает таблицу `UInt16 -> PeerId`, поэтому полный список и CRC не перебираются на каждом audio frame-е. При приеме короткий id обязан разрешиться однозначно. Если обнаружена коллизия или неизвестный id, frame отбрасывается с диагностическим логом, чтобы не приписать голос чужому участнику.
 
 `pttSessionId` назначается один раз на нажатие PTT и меняется при следующем нажатии. Составной ключ `originNodeId + pttSessionId + sequence` заменяет отдельный UUID каждого frame-а и хранится в ограниченном dedup-cache на `4096` ключей. Voice flood стартует с TTL `8`; ошибки отдельных realtime frames логируются, но не роняют комнату. Отправки помечаются `isRealtime=true`, поэтому успешные Nearby-отправки логируются агрегированно, а не по строке на каждый audio frame.
 
 `roomId` вынесен из каждого voice frame-а в состояние физического link-а. Link привязывается к комнате при отправке или приеме `ROOM_SNAPSHOT`/`ROOM_EVENT`; voice до такой привязки не принимается. Текущий компактный формат предполагает одну активную mesh-комнату на физический link.
+
+`MeshRoomSnapshot` и каждое durable room event несут `voiceAudioProfile`. Создатель выбирает `10/20/40 мс`, а все вошедшие участники настраивают capture, Opus и playback по профилю из snapshot-а; старые snapshot-ы без поля означают `40 мс`.
 
 ## Advertising / discovery
 
@@ -123,6 +128,6 @@ Heartbeat ping/pong — realtime bytes payload размером 4 байта. Е
 
 - Нет криптографических подписей событий.
 - Голос идет через flooding без jitter buffer и без отдельной политики приоритетов маршрута.
-- UInt16 sequence ограничивает одно непрерывное нажатие PTT `65536` frame-ами; при превышении новые frame-ы этого PTT отбрасываются.
+- UInt16 sequence циклически переносится после `65535`; отдельный `pttSessionId` не дает смешать соседние нажатия PTT.
 - UInt16 `originNodeId` допускает коллизии; сейчас они обнаруживаются по snapshot и блокируют неоднозначный голос, но отдельного согласования коротких id через hello еще нет.
 - Нет политик доступа, rename, ban и других фич вне текущего текстового MVP.

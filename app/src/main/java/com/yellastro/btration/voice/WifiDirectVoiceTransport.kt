@@ -43,17 +43,19 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Wi-Fi Direct voice transport с Network-bound UDP-сокетом, HELLO/ACK, резервным UDP-punch через Nearby и Opus frames.
+ * Wi-Fi Direct voice transport с UDP handshake и compact Star frames без повторения UUID в каждом аудиопакете.
  */
 class WifiDirectVoiceTransport(
     context: Context,
     private val externalScope: CoroutineScope,
+    private val datagramCodec: WifiDirectVoiceDatagramCodec,
 ) : VoiceTransport {
     private val applicationContext = context.applicationContext
     private val wifiP2pManager = applicationContext.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
     private val connectivityManager = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     private val channel = wifiP2pManager.initialize(applicationContext, Looper.getMainLooper(), null)
     private val _events = MutableSharedFlow<VoiceTransportEvent>(extraBufferCapacity = EVENT_BUFFER_CAPACITY)
+    private val peerIndex = CompactVoicePeerIndex()
     private val peerUdpEndpoints = ConcurrentHashMap<PeerId, InetSocketAddress>()
     private val signaledControlInfos = ConcurrentHashMap<PeerId, VoiceTransportControlInfo>()
     private val signaledUdpEndpoints = ConcurrentHashMap<PeerId, InetSocketAddress>()
@@ -185,6 +187,18 @@ class WifiDirectVoiceTransport(
     }
 
     /**
+     * Перестраивает compact origin index из актуального списка участников Star-комнаты.
+     */
+    override fun updateRoomPeers(peerIds: Set<PeerId>) {
+        val collisions = peerIndex.replacePeers(peerIds)
+        if (collisions.isNotEmpty()) {
+            Log.e(TAG, "[updateRoomPeers] Обнаружены коллизии compact voice node id nodeIds=$collisions peerCount=${peerIds.size}")
+        } else {
+            Log.i(TAG, "[updateRoomPeers] Compact Direct voice peer index обновлен peerCount=${peerIds.size}")
+        }
+    }
+
+    /**
      * Считает peer готовым только после получения HELLO от него либо HELLO_ACK хоста.
      */
     override fun isReadyForPeers(peerIds: Set<PeerId>): Boolean {
@@ -192,19 +206,39 @@ class WifiDirectVoiceTransport(
     }
 
     /**
-     * Отправляет Opus voice frame через UDP: client шлет group owner-у, host шлет известным client endpoint-ам.
+     * Отправляет compact Opus frame через UDP без UUID: client шлет owner-у, host — известным client endpoint-ам.
      */
     override fun sendFrameToPeers(peerIds: Set<PeerId>, frame: VoiceFrame) {
         val socket = udpSocket
-        val senderPeerId = selfPeerId
-        if (socket == null || senderPeerId == null) {
+        if (socket == null) {
             if (!socketUnavailableReported) {
                 socketUnavailableReported = true
                 Log.w(TAG, "[sendFrameToPeers] UDP socket еще не готов peerCount=${peerIds.size}")
             }
             return
         }
-        val payload = WifiDirectVoiceDatagramCodec.encodeFrame(senderPeerId, frame)
+        val originNodeId = peerIndex.nodeIdFor(frame.originPeerId)
+        if (originNodeId == null) {
+            val cause = IllegalStateException("Origin voice node id неизвестен или имеет коллизию")
+            Log.e(TAG, "[sendFrameToPeers] Compact Direct origin не разрешен originPeerId=${frame.originPeerId.value}")
+            emitEvent(VoiceTransportEvent.FrameSendFailed(peerIds = peerIds, cause = cause))
+            return
+        }
+        val payload = runCatching {
+            datagramCodec.encodeFrame(
+                CompactVoicePacket(
+                    originNodeId = originNodeId,
+                    pttSessionId = frame.sessionId,
+                    sequence = frame.sequence.toInt(),
+                    encodedBytes = frame.encodedBytes,
+                    isFinal = frame.isFinal,
+                    ttl = STAR_VOICE_TTL,
+                ),
+            )
+        }.onFailure { cause ->
+            Log.w(TAG, "[sendFrameToPeers] Не удалось закодировать compact Direct voice frame sequence=${frame.sequence}: ${cause.message}", cause)
+            emitEvent(VoiceTransportEvent.FrameSendFailed(peerIds = peerIds, cause = cause))
+        }.getOrNull() ?: return
         peerIds.forEach { peerId ->
             val endpoint = resolveUdpEndpoint(peerId)
             if (endpoint == null) {
@@ -397,12 +431,16 @@ class WifiDirectVoiceTransport(
     }
 
     /**
-     * Обрабатывает UDP handshake: client становится готов только по ACK на свой HELLO, host — по HELLO либо ACK.
+     * Обрабатывает handshake и принимает FRAME только от уже подтвержденного UDP endpoint.
      */
     private fun handleUdpPacket(packet: DatagramPacket) {
         val endpoint = InetSocketAddress(packet.address, packet.port)
-        when (val datagram = WifiDirectVoiceDatagramCodec.decode(packet.data, packet.length)) {
+        when (val datagram = datagramCodec.decode(packet.data, packet.length)) {
             is WifiDirectVoiceDatagram.Hello -> {
+                if (!isKnownRoomPeer(datagram.senderPeerId)) {
+                    Log.w(TAG, "[handleUdpPacket] HELLO неизвестного комнате peer отклонен peerId=${datagram.senderPeerId.value} endpoint=$endpoint")
+                    return
+                }
                 if (sessionRole == VoiceTransportSessionRole.HOST) {
                     val wasReady = peerUdpEndpoints.put(datagram.senderPeerId, endpoint) != null
                     warnedMissingPeerIds.remove(datagram.senderPeerId)
@@ -415,6 +453,10 @@ class WifiDirectVoiceTransport(
             }
 
             is WifiDirectVoiceDatagram.HelloAck -> {
+                if (!isKnownRoomPeer(datagram.senderPeerId)) {
+                    Log.w(TAG, "[handleUdpPacket] HELLO_ACK неизвестного комнате peer отклонен peerId=${datagram.senderPeerId.value} endpoint=$endpoint")
+                    return
+                }
                 val wasReady = peerUdpEndpoints.put(datagram.senderPeerId, endpoint) != null
                 warnedMissingPeerIds.remove(datagram.senderPeerId)
                 helloJob?.cancel()
@@ -426,17 +468,39 @@ class WifiDirectVoiceTransport(
             }
 
             is WifiDirectVoiceDatagram.Frame -> {
-                peerUdpEndpoints[datagram.senderPeerId] = endpoint
-                warnedMissingPeerIds.remove(datagram.senderPeerId)
+                val transportPeerId = peerIdForUdpEndpoint(endpoint)
+                if (transportPeerId == null) {
+                    Log.w(TAG, "[handleUdpPacket] Compact Direct frame от неизвестного UDP endpoint отклонен endpoint=$endpoint")
+                    return
+                }
+                val originPeerId = peerIndex.peerIdFor(datagram.packet.originNodeId)
+                if (originPeerId == null) {
+                    Log.w(TAG, "[handleUdpPacket] Compact Direct origin неизвестен или имеет коллизию nodeId=${datagram.packet.originNodeId} endpoint=$endpoint")
+                    return
+                }
+                warnedMissingPeerIds.remove(transportPeerId)
                 emitEvent(
                     VoiceTransportEvent.FrameReceived(
-                        transportPeerId = datagram.senderPeerId,
-                        frame = datagram.frame,
+                        transportPeerId = transportPeerId,
+                        frame = VoiceFrame(
+                            originPeerId = originPeerId,
+                            sessionId = datagram.packet.pttSessionId,
+                            sequence = datagram.packet.sequence.toLong(),
+                            encodedBytes = datagram.packet.encodedBytes,
+                            isFinal = datagram.packet.isFinal,
+                        ),
                         transportEndpointId = endpoint.toString(),
                     ),
                 )
             }
         }
+    }
+
+    /**
+     * Проверяет полный PeerId handshake-а по актуальному compact-индексу участников комнаты.
+     */
+    private fun isKnownRoomPeer(peerId: PeerId): Boolean {
+        return peerIndex.nodeIdFor(peerId) != null
     }
 
     /**
@@ -469,12 +533,19 @@ class WifiDirectVoiceTransport(
     }
 
     /**
+     * Восстанавливает прямого transport peer-а по endpoint, подтвержденному предыдущим HELLO/ACK.
+     */
+    private fun peerIdForUdpEndpoint(endpoint: InetSocketAddress): PeerId? {
+        return peerUdpEndpoints.entries.firstOrNull { entry -> entry.value == endpoint }?.key
+    }
+
+    /**
      * Подтверждает HELLO, чтобы client знал о двусторонней UDP-доступности.
      */
     private fun sendHelloAck(endpoint: InetSocketAddress, clientPeerId: PeerId) {
         val socket = udpSocket ?: return
         val peerId = selfPeerId ?: return
-        val payload = WifiDirectVoiceDatagramCodec.encodeHelloAck(peerId)
+        val payload = datagramCodec.encodeHelloAck(peerId)
         sendDatagram(socket, endpoint, payload, clientPeerId)
         Log.i(TAG, "[sendHelloAck] HELLO_ACK отправлен peerId=${clientPeerId.value} endpoint=$endpoint")
     }
@@ -541,7 +612,7 @@ class WifiDirectVoiceTransport(
                 val socket = udpSocket ?: return@launch
                 val self = selfPeerId ?: return@launch
                 val endpoint = signaledUdpEndpoints[peerId] ?: return@launch
-                sendDatagram(socket, endpoint, WifiDirectVoiceDatagramCodec.encodeHello(self), peerId)
+                sendDatagram(socket, endpoint, datagramCodec.encodeHello(self), peerId)
                 Log.i(TAG, "[scheduleFallbackPunch] Резервный UDP HELLO отправлен peerId=${peerId.value} endpoint=$endpoint index=$index")
                 delay(FALLBACK_PUNCH_REPEAT_DELAY_MILLIS)
             }
@@ -1148,7 +1219,7 @@ class WifiDirectVoiceTransport(
         val socket = udpSocket ?: return
         val peerId = selfPeerId ?: return
         val ownerAddress = groupOwnerAddress ?: return
-        val payload = WifiDirectVoiceDatagramCodec.encodeHello(peerId)
+        val payload = datagramCodec.encodeHello(peerId)
         sendDatagram(socket, InetSocketAddress(ownerAddress, UDP_PORT), payload, peerId)
     }
 
@@ -1308,6 +1379,7 @@ class WifiDirectVoiceTransport(
         private const val MODE = "WIFI_DIRECT_UDP"
         private const val UDP_PORT = 48982
         private const val MAX_DATAGRAM_BYTES = 16_384
+        private const val STAR_VOICE_TTL = 0
         private const val EVENT_BUFFER_CAPACITY = 64
         private const val NETWORK_LOOKUP_ATTEMPTS = 20
         private const val NETWORK_LOOKUP_DELAY_MILLIS = 250L

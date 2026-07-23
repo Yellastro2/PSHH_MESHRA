@@ -5,6 +5,7 @@ import com.yellastro.btration.domain.model.Peer
 import com.yellastro.btration.domain.model.PeerId
 import com.yellastro.btration.domain.model.RoomId
 import com.yellastro.btration.domain.model.RoomTransportMode
+import com.yellastro.btration.voice.VoiceAudioProfile
 import com.yellastro.btration.voice.VoiceTransportMode
 import kotlinx.serialization.Serializable
 
@@ -27,7 +28,7 @@ enum class MeshRoomEventType {
 }
 
 /**
- * Durable-событие комнаты для текстового mesh MVP: мета комнаты, вступление, выход/разрыв и сообщение общего канала.
+ * Durable-событие комнаты для mesh MVP: мета комнаты и голоса, вступление, выход/разрыв или сообщение общего канала.
  */
 @Serializable
 data class MeshRoomEvent(
@@ -40,13 +41,14 @@ data class MeshRoomEvent(
     val createdAtMillis: Long,
     val roomTransportMode: RoomTransportMode = RoomTransportMode.MESHRA,
     val voiceTransportMode: VoiceTransportMode = VoiceTransportMode.WIFI_DIRECT_UDP,
+    val voiceAudioProfile: VoiceAudioProfile = VoiceAudioProfile(),
     val isDirectAudioReady: Boolean = false,
     val peer: Peer? = null,
     val message: ChatMessage? = null,
 )
 
 /**
- * Текущий snapshot комнаты с метой transport-ов, участниками, сообщениями и списком известных событий.
+ * Текущий snapshot комнаты с transport/voice-метой, участниками, сообщениями и списком известных событий.
  */
 @Serializable
 data class MeshRoomSnapshot(
@@ -55,6 +57,7 @@ data class MeshRoomSnapshot(
     val knownHost: Peer,
     val roomTransportMode: RoomTransportMode = RoomTransportMode.MESHRA,
     val voiceTransportMode: VoiceTransportMode = VoiceTransportMode.WIFI_DIRECT_UDP,
+    val voiceAudioProfile: VoiceAudioProfile = VoiceAudioProfile(),
     val isDirectAudioReady: Boolean = false,
     val members: List<Peer> = emptyList(),
     val messages: List<ChatMessage> = emptyList(),
@@ -76,7 +79,7 @@ enum class MeshPayloadKind {
  * Транспортная обертка mesh-слоя без собственного envelopeId.
  *
  * Room-события дедупятся по eventId, snapshot не flood-ится, а PEER_HELLO используется для live-мапы linkId -> PeerId.
- * Ephemeral голос передается отдельно через компактный бинарный MeshVoicePacket и в этот JSON envelope не входит.
+ * Ephemeral голос передается отдельно через общий CompactVoicePacket с magic `MV` и в JSON envelope не входит.
  */
 @Serializable
 data class MeshEnvelope(

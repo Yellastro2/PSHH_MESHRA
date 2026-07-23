@@ -19,6 +19,8 @@
 - `app/src/main/java/com/yellastro/btration/repository/ProfileRepository.kt`
 - `app/src/main/java/com/yellastro/btration/domain/util/IdGenerator.kt`
 - `app/src/main/java/com/yellastro/btration/voice/VoiceRuntime.kt`
+- `app/src/main/java/com/yellastro/btration/voice/VoiceAudioProfile.kt`
+- `app/src/main/java/com/yellastro/btration/voice/CompactVoicePacketCodec.kt`
 - `app/src/main/java/com/yellastro/btration/voice/VoiceTransport.kt`
 - `app/src/main/java/com/yellastro/btration/voice/NearbyVoiceTransport.kt`
 - `app/src/main/java/com/yellastro/btration/voice/WifiDirectVoiceTransport.kt`
@@ -34,7 +36,7 @@ RoomTransport.events + MeshTransport.events + VoiceTransport.events
 `RoomRuntime` получает `CoroutineScope` снаружи, например из application-level контейнера, и в `init` подписывается на события room signaling из `RoomTransport.events` и media-события `VoiceTransport.events`.
 
 `RoomTransport` держит Nearby Star room-level протокол поверх `NeighborTransport`: декодирует/кодирует `WirePacket`, разбирает короткую визитку комнаты, ведет связь `PeerId <-> linkId` и прячет детали конкретного нижнего транспорта от `RoomRuntime`.
-Так как `RoomTransport` и `MeshTransport` слушают один общий `NeighborTransport`, `AppContainer.shouldIgnoreMessage` обязан отфильтровывать не-room payload-ы до JSON decode: `BTVO`, `BTME1`, MESHRA voice `MV` и MESHRA heartbeat `H`.
+Так как `RoomTransport` и `MeshTransport` слушают один общий `NeighborTransport`, `AppContainer.shouldIgnoreMessage` обязан отфильтровывать не-room payload-ы до JSON decode: Star voice `SV`, `BTME1`, MESHRA voice `MV` и MESHRA heartbeat `H`.
 
 Нижний `NearbyTransport` динамически выбирает физическую topology: общее лобби попеременно сканирует `P2P_STAR` и `P2P_CLUSTER`, реклама/подключение `NEARBY_STAR` фиксируется на Star, а MESHRA gateway/healing — на Cluster. При выборе карточки `RoomTransportMode`, уже полученный из рекламы, передается в connect; если карточка была найдена в прошлой фазе, transport сначала повторно обнаруживает endpoint в требуемой topology.
 
@@ -58,7 +60,7 @@ Host:
 
 - создает `RoomInfo`;
 - перед созданием комнаты получает тип комнаты из диалога создания, сохраняет его в prefs и кладет `roomTransportMode` в `RoomInfo`;
-- перед созданием комнаты получает voice-настройку из диалога создания, сохраняет ее в prefs, выбирает `voiceTransportMode` и кладет его в `RoomInfo`;
+- перед созданием комнаты получает voice transport и длину Opus-фрейма `10/20/40 мс`, сохраняет длительность отдельно для `Nearby Star` и `MESHRA`, а `voiceTransportMode` и `voiceAudioProfile` кладет в `RoomInfo`;
 - фиксирует выбранный room transport через `activateRoomTransportMode(...)`;
 - для `Nearby Star` запускает обычный `RoomTransport.startAdvertising(room)`;
 - для `MESHRA` публикует локальный `MEMBER_JOINED`, применяет mesh snapshot и запускает `MeshTransport.startAdvertising(snapshot, self)` как gateway;
@@ -90,8 +92,8 @@ Client:
 - кладет текущий discovery `endpointId` в `RoomInfo.discoveryEndpointId`, чтобы лобби могло показать, через какой физический endpoint/gateway будет вход;
 - по `joinRoom(roomId)` подключается к endpoint;
 - после успешного connection отправляет `JOIN_REQUEST` без реального `roomId`;
-- для `Nearby Star` после `JOIN_ACCEPTED` получает настоящий `RoomInfo`, берет `RoomInfo.roomTransportMode` как режим room transport комнаты, берет `RoomInfo.voiceTransportMode`, переключает локальный voice transport на режим host-а, берет `RoomInfo.host.peerId` для Wi-Fi Direct DNS-SD matching, заменяет временный `RoomId -> endpointId` на реальный `RoomId -> endpointId` и переходит в `Client`;
-- для `MESHRA` после подключения к gateway ждет `ROOM_SNAPSHOT`, заменяет временный `mesh_room_<token>` на настоящий `RoomInfo`, публикует свой `MEMBER_JOINED` и тоже начинает рекламировать комнату как gateway;
+- для `Nearby Star` после `JOIN_ACCEPTED` получает настоящий `RoomInfo`, берет `RoomInfo.roomTransportMode`, `RoomInfo.voiceTransportMode` и `RoomInfo.voiceAudioProfile`, настраивает локальные transport/Opus/capture/playback под meta host-а, заменяет временный `RoomId -> endpointId` на реальный и переходит в `Client`;
+- для `MESHRA` после подключения к gateway ждет `ROOM_SNAPSHOT`, читает из него тот же `voiceAudioProfile`, заменяет временный `mesh_room_<token>` на настоящий `RoomInfo`, публикует свой `MEMBER_JOINED` и тоже начинает рекламировать комнату как gateway;
 - MESHRA gateway-кандидаты в discovery имеют разные временные `RoomId`, но общий `discoveryGroupId`, чтобы ignore одного gateway не скрывал ту же комнату через другой gateway;
 - на экране комнаты MESHRA-создатель выходит обычной командой выхода, а не через диалог закрытия комнаты для всех;
 - на экране комнаты видит выбранный host-ом voice transport как read-only пункт меню настроек; host видит такой же read-only пункт, потому что активный transport комнаты после старта не переключается;
@@ -121,6 +123,8 @@ Client:
 - Если готовых адресатов нет, `RoomRuntime.startTalking()` сохраняет `DirectAudioStatus.Unavailable("Прямой аудиоканал не установлен")`, и UI отключает повторный PTT до переподключения.
 - `RoomRuntime.stopTalking()` убирает локальный `PeerId` из `talkingPeerIds`.
 - При `VoiceTransportEvent.FrameReceived` runtime добавляет `originPeerId` отправителя в `talkingPeerIds`, передает Opus frame в `VoiceRuntime.playIncomingFrame(...)` и снимает индикатор через callback после final-frame/EOF.
+- `VoiceRuntime` собирает из `AudioRecord` ровно один PCM-фрейм выбранной длительности, кодирует его одним Opus packet и держит playback-очередь примерно на `80 мс` независимо от выбора `10/20/40 мс`.
+- Star и MESHRA используют общий `CompactVoicePacketCodec`: 9 байт `magic/control/originNodeId/pttSessionId/sequence`, после которых идет Opus. Magic `SV` принадлежит Star, `MV` — MESHRA; UInt16 sequence циклически переносится внутри одной долгой PTT-сессии.
 - Для UDP media-plane есть fallback: каждый non-final voice frame продлевает таймер говорящего, а если final-frame потерялся, runtime гасит индикатор и закрывает входящую frame-сессию по таймауту тишины.
 - Для MESHRA media-plane `VoiceRuntime` кодирует Opus frames через callback, а `RoomRuntime` публикует их в `MeshTransport.publishVoiceFrame(...)`. `MeshTransport` упаковывает их в бинарный заголовок `MV` размером 9 байт; входящие `MeshTransportEvent.VoiceFrameReceived` проигрываются через `VoiceRuntime` без старого host relay, потому что relay уже сделан mesh flooding-ом.
 - MESHRA link health измеряется отдельными heartbeat-пакетами размером 4 байта: `magic=0x48`, `kind/flags`, `sequence UInt16`. `PING` отправляется примерно раз в секунду по каждому активному прямому link-у, `PONG` возвращает тот же sequence, а RTT считается локально по таблице отправленных sequence. После 10 секунд без живого heartbeat link получает `LOST`; peer пропадает из `directMeshPeerIds`, link исключается из room/event/voice отправки и перестает считаться достаточной связностью для healing. Принудительный disconnect/reconnect пока не запускается: heartbeat продолжает ходить по старому link-у, а runtime включает discovery, чтобы найти замену.
@@ -143,3 +147,4 @@ Client:
 - MESHRA сейчас покрывает вступление, выход/разрыв, текстовый чат и Opus voice frames через ephemeral mesh payload.
 - MESHRA уже измеряет здоровье прямых link-ов через Nearby lifecycle и собственные heartbeat; `LOST` гасит UI connect-dot через `directMeshPeerIds`, запрещает отправку room/event/voice payload-ов в этот link и включает healing discovery, но пока не делает принудительный disconnect/reconnect.
 - Nearby Star voice использует `VoiceTransport`; MESHRA voice идет через `MeshTransport` как ephemeral payload. Дефолтный режим в настройках — `WIFI_DIRECT_UDP`, при этом реальный delegate создается только после применения режима конкретной комнаты.
+- Старые room meta без `voiceAudioProfile` декодируются как `40 мс`, но новый compact voice wire-format не совместим со старыми сборками, ожидающими `BTVO`.

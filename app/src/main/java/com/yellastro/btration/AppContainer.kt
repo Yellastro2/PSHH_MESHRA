@@ -14,7 +14,6 @@ import com.yellastro.btration.domain.mesh.MeshCodec
 import com.yellastro.btration.domain.mesh.MeshHeartbeatCodec
 import com.yellastro.btration.domain.mesh.MeshRoomAdvertisement
 import com.yellastro.btration.domain.mesh.MeshTransport
-import com.yellastro.btration.domain.mesh.MeshVoicePacketCodec
 import com.yellastro.btration.domain.runtime.RoomTransport
 import com.yellastro.btration.domain.runtime.RoomRuntime
 import com.yellastro.btration.domain.util.IdGenerator
@@ -27,23 +26,25 @@ import com.yellastro.btration.service.RoomServiceController
 import com.yellastro.btration.ui.lobby.LobbyViewModel
 import com.yellastro.btration.ui.profile.ProfileViewModel
 import com.yellastro.btration.ui.room.RoomViewModel
+import com.yellastro.btration.voice.CompactVoicePacketCodec
+import com.yellastro.btration.voice.CompactVoicePacketKind
 import com.yellastro.btration.voice.NearbyVoiceTransport
 import com.yellastro.btration.voice.PcmVoiceCapture
 import com.yellastro.btration.voice.PcmVoicePlayer
 import com.yellastro.btration.voice.SwitchableVoiceTransport
 import com.yellastro.btration.voice.UnavailableVoiceTransport
-import com.yellastro.btration.voice.VoiceFrameCodec
 import com.yellastro.btration.voice.VoiceRuntime
 import com.yellastro.btration.voice.VoiceTransport
 import com.yellastro.btration.voice.VoiceTransportMode
 import com.yellastro.btration.voice.WifiDirectVoiceTransport
+import com.yellastro.btration.voice.WifiDirectVoiceDatagramCodec
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.serialization.json.Json
 
 /**
- * Ручной composition root приложения: собирает prefs, Nearby transport, room/mesh/voice кодеки, runtime и repository.
+ * Ручной composition root: собирает prefs, transport-ы, общий compact voice codec, runtime и repository.
  */
 class AppContainer(context: Context) {
     private val applicationContext = context.applicationContext
@@ -55,7 +56,8 @@ class AppContainer(context: Context) {
     private val wireCodec = WireCodec(json)
     private val meshCodec = MeshCodec(json)
     private val meshHeartbeatCodec = MeshHeartbeatCodec()
-    private val meshVoicePacketCodec = MeshVoicePacketCodec()
+    private val starVoicePacketCodec = CompactVoicePacketCodec(CompactVoicePacketKind.STAR)
+    private val meshVoicePacketCodec = CompactVoicePacketCodec(CompactVoicePacketKind.MESH)
     private val idGenerator = IdGenerator()
     private val prefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     /**
@@ -76,7 +78,7 @@ class AppContainer(context: Context) {
         wireCodec = wireCodec,
         externalScope = applicationScope,
         shouldIgnoreMessage = { bytes ->
-            VoiceFrameCodec.isVoiceFrame(bytes) ||
+            starVoicePacketCodec.isVoicePacket(bytes) ||
                 meshCodec.isMeshEnvelope(bytes) ||
                 meshHeartbeatCodec.isHeartbeatPacket(bytes) ||
                 meshVoicePacketCodec.isVoicePacket(bytes)
@@ -204,6 +206,7 @@ class AppContainer(context: Context) {
             VoiceTransportMode.NEARBY_BYTES -> NearbyVoiceTransport(
                 neighborTransport = nearbyTransport,
                 peerLinkResolver = roomTransport,
+                voicePacketCodec = starVoicePacketCodec,
                 externalScope = applicationScope,
             )
             VoiceTransportMode.WIFI_DIRECT_UDP -> createWifiDirectVoiceTransport()
@@ -222,6 +225,7 @@ class AppContainer(context: Context) {
         return WifiDirectVoiceTransport(
             context = applicationContext,
             externalScope = applicationScope,
+            datagramCodec = WifiDirectVoiceDatagramCodec(starVoicePacketCodec),
         )
     }
 
